@@ -219,6 +219,20 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
         [tenantA, workspaceA, tenantA],
       ),
     ).rejects.toThrow(/permission denied/);
+    await expect(
+      store.withServerScope(scope, undefined, (tx) =>
+        tx.query("UPDATE workspaces SET name = 'Capability update' WHERE id = $1", [workspaceA]),
+      ),
+    ).resolves.toMatchObject({ rowCount: 1 });
+    await expect(
+      store.withServerScope(scope, undefined, (tx) =>
+        tx.query(
+          `INSERT INTO workspaces(id,tenant_id,name)
+           VALUES ('019a0000-0000-7000-8000-000000000303',$1,'Cross-tenant')`,
+          [tenantB],
+        ),
+      ),
+    ).rejects.toThrow();
   } finally {
     await fresh.close();
   }

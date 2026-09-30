@@ -8,6 +8,12 @@ export interface RowResult<T> {
   readonly rows: T[];
   readonly rowCount: number;
 }
+export interface ScopedTransaction {
+  query<T extends Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<RowResult<T>>;
+}
 
 /** Statements a scoped query may start with; everything else (DO, COPY, SET, DDL, ...) is refused. */
 const ALLOWED_LEADING = /^\s*(SELECT|INSERT|UPDATE|DELETE|WITH)\b/i;
@@ -44,6 +50,37 @@ export class LocalScopedStore {
       if (role.rows[0]?.current_user !== 'xyra_app') throw new Error('Local app role not active');
       const result = await tx.query<T>(sql, params);
       return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length };
+    });
+  }
+
+  /**
+   * Run code-owned capability writes as the non-login server role in one tenant/workspace-scoped
+   * transaction. `xyra_server` is never available through LocalScopedStore.query or client SQL.
+   */
+  async withServerScope<T>(
+    scope: Scope,
+    hlc: string | undefined,
+    work: (tx: ScopedTransaction) => Promise<T>,
+  ): Promise<T> {
+    if (!/^[0-9a-f-]{36}$/i.test(scope.tenantId) || !/^[0-9a-f-]{36}$/i.test(scope.workspaceId)) {
+      throw new Error('Invalid query scope');
+    }
+    if (hlc !== undefined && !/^\d{13}-[0-9a-f]{4}-[a-z0-9]{1,32}$/.test(hlc)) {
+      throw new Error('Invalid workspace HLC');
+    }
+    return this.db.transaction(async (tx) => {
+      await tx.exec('SET LOCAL ROLE xyra_server');
+      await tx.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
+      await tx.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
+      await tx.query("SELECT set_config('app.hlc', $1, true)", [hlc ?? '']);
+      const client: ScopedTransaction = {
+        query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+          assertScopedStatement(sql);
+          const result = await tx.query<T>(sql, params);
+          return { rows: result.rows, rowCount: result.affectedRows ?? result.rows.length };
+        },
+      };
+      return work(client);
     });
   }
 }
