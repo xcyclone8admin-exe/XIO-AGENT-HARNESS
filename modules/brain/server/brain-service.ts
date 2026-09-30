@@ -176,8 +176,9 @@ export class BrainService {
   async requestSourceErasure(scope: Scope, actorId: string, approvalRequestId: string | undefined, input: unknown) {
     const request = ErasureRequestInput.parse(input);
     if (!approvalRequestId) throw new Error('ERASURE_APPROVAL_REQUIRED');
+    // The CapabilityBus verifies exact capability/input/scope approval before invoking the handler.
+    // approvalRequestId is retained as evidence; the app role cannot read the protected approval tables.
     const inputHash = await sha256Hex(canonicalJson(request));
-    await this.assertErasureApproval(scope, approvalRequestId, request, 'brain.sources.erase');
     const source = await this.store.query<Record<string, unknown> & { id: string; retention: string; external_blob_refs: string[] }>(scope,
       'SELECT id,retention,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, request.sourceId]);
     const row = source.rows[0];
@@ -197,8 +198,10 @@ export class BrainService {
   }
 
   /** Retry is explicit and bounded. This records the dependency blocker; it never deletes a shared object itself. */
-  async retrySourceErasure(scope: Scope, actorId: string, input: unknown) {
-    const { erasureId, approvalRequestId } = ErasureRetryInput.parse(input);
+  /** Call only after CapabilityBus has independently verified the retry capability approval. */
+  async retrySourceErasure(scope: Scope, actorId: string, approvalRequestId: string | undefined, input: unknown) {
+    if (!approvalRequestId) throw new Error('ERASURE_APPROVAL_REQUIRED');
+    const { erasureId } = ErasureRetryInput.parse(input);
     const old = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
       'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, erasureId]);
     const row = old.rows[0];
@@ -206,7 +209,6 @@ export class BrainService {
     if (row.status === 'complete') return erasureView(row);
     if (Number(row.attempts) >= 5) throw new Error('ERASURE_RETRY_LIMIT');
     if (row.status !== 'waiting_cloud') throw new Error('ERASURE_PRIVILEGED_WORKFLOW_REQUIRED');
-    await this.assertErasureApproval(scope, approvalRequestId, { erasureId, attempt: Number(row.attempts) + 1 }, 'brain.sources.erase.retry');
     const attempts = Number(row.attempts) + 1;
     await this.store.query(scope, `INSERT INTO brain_source_erasure_attempts(id,tenant_id,workspace_id,erasure_id,actor_id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,error_code)
       VALUES ($1,$2,$3,$4,$5,'waiting_cloud','[]'::jsonb,'[]'::jsonb,$6,'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE')`, [uuid(), scope.tenantId, scope.workspaceId, erasureId, actorId, row.retention_policy]);
@@ -227,17 +229,6 @@ export class BrainService {
     const items = attempts.rows.slice(0, limit);
     const last = items.at(-1);
     return { ...erasureView(result.rows[0]), audit: { items, nextCursor: hasMore && last ? { occurredAt: new Date(last.occurred_at).toISOString(), id: last.id } : null } };
-  }
-
-  private async assertErasureApproval(scope: Scope, approvalRequestId: string, input: unknown, capabilityId: string) {
-    const inputHash = await sha256Hex(canonicalJson(input));
-    const result = await this.store.query<IdRow>(scope, `SELECT r.id FROM approval_requests r JOIN approval_decisions d
-      ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.request_id=r.id
-      WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.id=$3 AND r.capability_id=$4
-        AND r.input_hash=$5 AND r.expires_at>now() AND d.decision='approved' AND d.valid=true
-        AND (r.capability_id<>'brain.sources.erase.retry' OR d.decided_by<>r.requested_by) LIMIT 1`,
-    [scope.tenantId, scope.workspaceId, approvalRequestId, capabilityId, inputHash]);
-    if (!result.rows.length) throw new Error('ERASURE_APPROVAL_INVALID');
   }
 
   async listMemories(scope: Scope, input: unknown = {}) {
