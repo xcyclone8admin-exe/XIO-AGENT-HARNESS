@@ -37,6 +37,7 @@ export const SPEC_TEMPLATES = [
 export type SpecTemplate = (typeof SPEC_TEMPLATES)[number];
 
 export const ContextElementType = z.enum(['objective', 'requirement', 'architecture', 'decision', 'dependency', 'source', 'constraint', 'acceptance', 'prior-evidence']);
+export type ContextElementType = z.infer<typeof ContextElementType>;
 export const ContextCandidate = z.object({
   id: z.string().min(1).max(256), type: ContextElementType, text: z.string().min(1).max(100_000),
   source: z.string().min(1).max(500), authority: z.enum(['user', 'contract', 'architecture', 'system', 'reference']),
@@ -56,6 +57,7 @@ export const Discovery = z.object({ id: UUID, workspaceId: UUID, ticketId: UUID,
 export const REVIEW_ROLES = ['architect', 'security', 'data', 'compliance', 'ai-safety', 'accessibility', 'performance', 'license-provenance', 'adversarial-user'] as const;
 export const ReviewRole = z.enum(REVIEW_ROLES);
 export const Finding = z.object({ id: UUID, workspaceId: UUID, role: ReviewRole, state: FindingState, severity: z.enum(['critical', 'high', 'medium', 'low', 'info']), title: z.string().min(1).max(500), evidenceIds: z.array(UUID).min(1), affectedRequirements: z.array(z.string()), confidence: z.number().min(0).max(1), reproduction: z.string().min(1).max(8000), remediation: z.string().min(1).max(8000), revalidation: z.string().min(1).max(8000), createdAt: z.iso.datetime({ offset: true }) });
+export type Finding = z.infer<typeof Finding>;
 export const ChaosRequest = z.object({ target: z.enum(['sandbox', 'staging', 'develop', 'main', 'production']), authorizedTargets: z.array(z.enum(['sandbox', 'staging', 'develop', 'main', 'production'])) });
 export const Evidence = z.object({ id: UUID, workspaceId: UUID, requirementId: z.string().min(1), kind: z.enum(['test', 'review', 'artifact', 'approval', 'migration', 'performance', 'security']), source: z.string().min(1).max(1000), sha256: z.string().regex(/^[0-9a-f]{64}$/), verifiedAt: z.iso.datetime({ offset: true }), deterministic: z.boolean(), result: z.enum(['pass', 'fail', 'partial']) });
 export const Gate = z.object({ id: z.string(), requirementId: z.string(), kind: z.enum(['deterministic', 'human', 'ai-judgment']), evidenceIds: z.array(UUID), status: z.enum(['pass', 'fail', 'pending', 'blocked']), hard: z.boolean() });
@@ -65,7 +67,6 @@ export const Promotion = z.object({ id: UUID, workspaceId: UUID, commitSha: z.st
 export const AdapterConfig = z.object({ id: z.string().min(1), enabled: z.literal(false), endpoint: z.string().nullable(), lastStatus: z.enum(['disabled', 'unavailable']) });
 
 export const forgeCapabilities = {
-  hierarchy: defineCapability({ id: 'forge.hierarchy.list', title: 'List project hierarchy', description: 'List hierarchy items for current workspace', kind: 'read', permission: 'forge:project:read', input: z.object({ projectId: UUID }), output: z.array(HierarchyNode) }),
   schedule: defineCapability({ id: 'forge.schedule.plan', title: 'Plan bounded schedule', description: 'Compute a read-only runnable ticket plan; never starts host processes', kind: 'write', permission: 'forge:schedule:approve', input: ScheduleRequest, output: ScheduleResult }),
   gates: defineCapability({ id: 'forge.gates.evaluate', title: 'Evaluate evidence gates', description: 'Evaluate deterministic evidence before reviewer judgment', kind: 'read', permission: 'forge:gate:read', input: z.object({ gates: z.array(Gate), riskAcceptances: z.array(RiskAcceptance) }), output: GateEvaluation }),
   promotion: defineCapability({ id: 'forge.promotions.request', title: 'Request promotion', description: 'Record evidence-gated promotion intent without deploying or promoting refs', kind: 'consequential', permission: 'forge:promotion:request', approvalPolicy: 'forge.promotion', input: z.object({ promotion: Promotion, gates: z.array(Gate), productionApproval: ApprovalRecord.nullable() }), output: Promotion }),

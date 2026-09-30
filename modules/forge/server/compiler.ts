@@ -22,8 +22,9 @@ export function compileSpecCorpus(input: SpecInput) {
     const supersedes = [...new Set(input.supersedes ?? [])].sort();
     const body = `# ${input.title}\n\nTemplate: ${template}\n\n## Requirements\n${requirements.map((r) => `- ${r.id}: ${r.statement}`).join('\n') || '- No requirements supplied'}\n\n## Dependencies\n${dependencies.map((d) => `- ${d}`).join('\n') || '- None declared'}\n\n## Supersedes\n${supersedes.map((d) => `- ${d}`).join('\n') || '- Nothing superseded'}\n\n## Content\nDraft required details for this ${template.replaceAll('-', ' ')} document.\n`;
     const metadata = { id, template, version: 1, title: input.title, status: 'draft', authority: 'user', dependencies, supersedes, requirementIds: requirements.map((r) => r.id) };
+    const frontmatter = { ...metadata };
     const contentHash = createHash('sha256').update(JSON.stringify({ metadata, body }) ?? 'null').digest('hex');
-    return SpecDocument.parse({ ...metadata, body, contentHash });
+    return SpecDocument.parse({ ...metadata, frontmatter, body, contentHash });
   }).sort((a, b) => a.id.localeCompare(b.id));
   const index = new Map(documents.map((doc) => [doc.id, doc]));
   for (const doc of documents) for (const dependency of doc.dependencies) {

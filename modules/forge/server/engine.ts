@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { uuidv7 } from '@xyra/core';
 import {
   ApprovalRecord, ChaosRequest, Evidence, Gate, GateEvaluation, HierarchyNode, Promotion, RiskAcceptance,
-  ScheduleRequest, ScheduleResult, type Finding as FindingType, type HierarchyNode as NodeType,
+  ScheduleRequest, type Finding as FindingType, type HierarchyNode as NodeType, type ScheduleResult,
 } from '../contracts';
 
 const now = () => new Date().toISOString();

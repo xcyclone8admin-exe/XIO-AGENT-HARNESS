@@ -29,4 +29,4 @@ Statuses below describe this isolated branch. No candidate commit test output or
 
 ## Verification
 
-The task requires `npm.cmd run verify`. The command could not begin: `npm.cmd ci --no-audit --no-fund` reports that `package.json` and `package-lock.json` are out of sync because the existing shared lockfile does not include `@xyra/mod-forge`. The task contract prohibits editing root `package-lock.json`. `node tools/gen-module-registry.mjs` did succeed and registered `[core, swarm, forge, ops]`.
+The lead's lock-only workspace-registration commit `840b2f6` was cherry-picked as `3bfbba2`, after which `npm.cmd ci --no-audit --no-fund` installed the locked dependencies outside OneDrive. `npm.cmd run verify` then passed on the follow-up Forge candidate: typecheck and lint succeeded; Vitest passed **133 tests in 17 files**; repository checks passed (**174 files scanned**). Module registry generation registered `[core, swarm, forge, ops]`. The final commit SHA and exact-candidate rerun result are recorded in the handoff.

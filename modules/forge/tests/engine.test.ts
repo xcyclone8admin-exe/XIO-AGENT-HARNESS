@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AdapterConfig, ContextCandidate, type ContextElementType, REVIEW_ROLES, SPEC_TEMPLATES } from '../contracts';
+import { AdapterConfig, ContextCandidate, HierarchyNode, type ContextElementType, REVIEW_ROLES, SPEC_TEMPLATES } from '../contracts';
 import { compileContext, compileSpecCorpus } from '../server/compiler';
 import { authorizeChaosTarget, classifyDiscovery, createEvidence, evaluateGates, planSchedule, requestPromotion, rollbackPromotion } from '../server/engine';
 import { renderAllGoldenBriefs } from '../server/specs';
@@ -15,11 +15,11 @@ const evidenceId = '019a0000-0000-7000-8000-000000000061';
 const approvalId = '019a0000-0000-7000-8000-000000000071';
 const time = new Date(Date.now() - 1000).toISOString();
 const future = new Date(Date.now() + 60_000).toISOString();
-const ticket = {
+const ticket = HierarchyNode.parse({
   id: ticketId, tenantId, workspaceId, projectId, parentId: epicId, kind: 'ticket', title: 'Test Forge', description: '',
   state: 'ready', priority: 'normal', dependencies: [], requirements: [{ id: 'XIO-REQ-FRG-008', statement: 'evidence' }],
   acceptanceCriteria: ['deterministic'], ownerId: null, createdBy: userId, createdAt: time, updatedAt: time,
-};
+});
 const approval = { id: approvalId, epicId, workspaceId, scopeHash: 'a'.repeat(64), status: 'approved', approvedBy: userId, createdAt: time, expiresAt: future };
 const goodGate = { id: 'unit-tests', requirementId: 'XIO-REQ-FRG-008', kind: 'deterministic', evidenceIds: [evidenceId], status: 'pass', hard: true };
 const evidence = { id: evidenceId, workspaceId, requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest', sha256: 'b'.repeat(64), verifiedAt: time, deterministic: true, result: 'pass' };
