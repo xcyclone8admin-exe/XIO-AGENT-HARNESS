@@ -13,15 +13,30 @@ export function migration(id: string, sql: string): Migration {
   return { id, sql, checksum: createHash('sha256').update(sql).digest('hex') };
 }
 
-function assertOrdered(migrations: readonly Migration[]): void {
-  let previous = '';
+/**
+ * The list is `platform/*` first, then each module's migrations as one contiguous block in the
+ * generator's dependency order (ADR-0016). Module blocks are not lexically ordered, so ordering is
+ * checked per module: gap-free sequence numbers from 0001, each module block appearing once.
+ */
+export function assertOrdered(migrations: readonly Migration[]): void {
+  const lastSeq = new Map<string, number>();
+  let current = '';
   for (const item of migrations) {
-    if (!/^[a-z][a-z0-9-]*\/\d{4}_[a-z0-9_]+$/.test(item.id) || item.id <= previous) {
-      throw new Error(`Migration order or id invalid: ${item.id}`);
+    const match = /^([a-z][a-z0-9-]*)\/(\d{4})_[a-z0-9_]+$/.exec(item.id);
+    if (!match || match[1] === undefined || match[2] === undefined)
+      throw new Error(`Migration id invalid: ${item.id}`);
+    const [, owner, seqText] = match;
+    if (owner !== current) {
+      if (lastSeq.has(owner)) throw new Error(`Migration block for ${owner} is not contiguous: ${item.id}`);
+      if (lastSeq.size === 0 && owner !== 'platform')
+        throw new Error(`Platform migrations must come first: ${item.id}`);
+      current = owner;
     }
+    const seq = Number(seqText);
+    if (seq !== (lastSeq.get(owner) ?? 0) + 1) throw new Error(`Migration sequence invalid: ${item.id}`);
+    lastSeq.set(owner, seq);
     if (migration(item.id, item.sql).checksum !== item.checksum)
       throw new Error(`Migration checksum invalid: ${item.id}`);
-    previous = item.id;
   }
 }
 
