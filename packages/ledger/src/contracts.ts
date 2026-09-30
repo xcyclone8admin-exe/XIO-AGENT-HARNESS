@@ -631,6 +631,15 @@ export const LEDGER_PERMISSIONS = [
 ] as const;
 
 export const ledgerCapabilities = {
+  ensureAssets: defineCapability({
+    id: 'money.ledger.ensure-assets',
+    title: 'Register ledger assets',
+    description: 'Register workspace assets and their immutable decimal scales',
+    kind: 'write',
+    permission: 'money:ledger:admin',
+    input: z.object({ assets: z.array(Asset).min(1).max(100) }),
+    output: z.void(),
+  }),
   assets: defineCapability({
     id: 'money.ledger.assets',
     title: 'Ledger assets',

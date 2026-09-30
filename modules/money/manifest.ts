@@ -18,6 +18,11 @@ export default defineModule({
     viewer: ['money:ledger:read'],
     auditor: ['money:ledger:read'],
   },
+  nav: [
+    { path: '', title: 'Overview', keywords: ['finance', 'balances', 'revenue'] },
+    { path: 'ledger', title: 'Ledger', keywords: ['accounts', 'transactions', 'journal'] },
+    { path: 'reconciliation', title: 'Reconciliation', keywords: ['discrepancies', 'audit'] },
+  ],
   dependsOn: [],
   tables: [...LEDGER_TABLES],
 });

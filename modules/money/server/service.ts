@@ -34,6 +34,10 @@ export class MoneyService {
     const actor = (call: CapabilityCall) => call.principal.delegatedBy ?? call.principal.id;
     const reg = (descriptor: AnyCapability, handler: CapabilityHandler) => bus.register(moduleManifest, descriptor, handler);
 
+    reg(capabilities.ensureAssets, (raw, call) => {
+      const { assets } = capabilities.ensureAssets.input.parse(raw);
+      return this.ledger.ensureAssets(scope(call, true), actor(call), assets);
+    });
     reg(capabilities.assets, (_input, call) => this.ledger.assets(scope(call)));
     reg(capabilities.books, (raw, call) => {
       const input = capabilities.books.input.parse(raw);
