@@ -45,6 +45,13 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
   });
 
   app.get('/api/health', (c) => c.json({ status: 'ok' }));
+  app.get('/api/v1/session', async (c) => {
+    const principal = await options.resolvePrincipal();
+    return c.json({
+      user: { id: principal.id, displayName: principal.displayName ?? 'Local user' },
+      workspaces: principal.workspaces,
+    });
+  });
   app.get('/api/v1/catalog', async (c) => {
     const workspace = z.uuid().safeParse(c.req.query('workspaceId'));
     if (!workspace.success) return c.json({ code: 'INVALID_WORKSPACE' }, 400);

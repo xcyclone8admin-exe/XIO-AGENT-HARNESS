@@ -76,15 +76,63 @@ export const DataClassification = z.enum([
   'secret-reference',
 ]);
 
+/** Immutable baseline plus actor stamps the Worker sets itself; never device-writable. */
+export const SERVER_STAMPED_FIELDS: readonly string[] = [
+  'id',
+  'tenant_id',
+  'workspace_id',
+  'created_by',
+  'created_at',
+];
+
 /** The sync Worker rejects writes to server-authority and guarded fields (ADR-0003 A1). */
-export const TableDecl = z.object({
-  name: z.string().regex(/^[a-z][a-z0-9_]*$/),
-  class: z.enum(['lww', 'append', 'local']),
-  authority: z.enum(['server', 'synced', 'append', 'local']),
-  mergeGroups: z.array(z.array(z.string().min(1)).min(2)).default([]),
-  children: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).default([]),
-  guardedColumns: z.array(z.string().min(1)).default([]),
-});
+export const TableDecl = z
+  .object({
+    name: z.string().regex(/^[a-z][a-z0-9_]*$/),
+    class: z.enum(['lww', 'append', 'local']),
+    authority: z.enum(['server', 'synced', 'append', 'local']),
+    mergeGroups: z.array(z.array(z.string().min(1)).min(2)).default([]),
+    children: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).default([]),
+    guardedColumns: z.array(z.string().min(1)).default([]),
+    /**
+     * Device-writable fields for `synced`/`append` tables. Absent means the Worker
+     * rejects every field change (fail closed). Never lists server-stamped fields.
+     */
+    allowedFields: z.array(z.string().min(1)).optional(),
+    /** Column the Worker stamps with the verified principal on insert (e.g. `created_by`, `actor_id`). */
+    actorField: z
+      .string()
+      .regex(/^[a-z][a-z0-9_]*$/)
+      .optional(),
+    /** Permission a device change needs; absent on writable tables means any non-read-only role. */
+    writePermission: z.string().min(1).optional(),
+  })
+  .superRefine((table, ctx) => {
+    const writable = table.authority === 'synced' || table.authority === 'append';
+    if (!writable && (table.allowedFields || table.actorField || table.writePermission)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['authority'],
+        message: 'allowedFields/actorField/writePermission apply only to synced or append tables',
+      });
+    }
+    for (const field of table.allowedFields ?? []) {
+      if (SERVER_STAMPED_FIELDS.includes(field) || field === table.actorField) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['allowedFields'],
+          message: `${field} is server-stamped and cannot be device-writable`,
+        });
+      }
+      if (table.guardedColumns.includes(field)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['allowedFields'],
+          message: `${field} is guarded and only writable through a capability`,
+        });
+      }
+    }
+  });
 export type TableDecl = z.infer<typeof TableDecl>;
 
 export const ModuleManifest = z.object({
