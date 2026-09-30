@@ -1,7 +1,20 @@
 import { z } from 'zod';
-import { PERMISSION_RE } from './identity';
+import { PERMISSION_RE, WorkspaceRole } from './identity';
 
-export const PILLARS = ['COMMAND', 'BRAIN', 'SWARM', 'FORGE', 'FLOW', 'CONNECT', 'DATA', 'GROWTH', 'STUDIO', 'INTEL', 'MONEY', 'PLATFORM'] as const;
+export const PILLARS = [
+  'COMMAND',
+  'BRAIN',
+  'SWARM',
+  'FORGE',
+  'FLOW',
+  'CONNECT',
+  'DATA',
+  'GROWTH',
+  'STUDIO',
+  'INTEL',
+  'MONEY',
+  'PLATFORM',
+] as const;
 export const Pillar = z.enum(PILLARS);
 export type Pillar = z.infer<typeof Pillar>;
 
@@ -20,7 +33,9 @@ export const PILLAR_LABELS: Record<Pillar, string> = {
   PLATFORM: 'Settings',
 };
 
-const NavPath = z.string().regex(/^([a-z0-9-]+(\/[a-z0-9-]+)*)?$/, 'lowercase path segments, "" for module root');
+const NavPath = z
+  .string()
+  .regex(/^([a-z0-9-]+(\/[a-z0-9-]+)*)?$/, 'lowercase path segments, "" for module root');
 
 export const NavEntry = z.object({
   path: NavPath,
@@ -52,7 +67,25 @@ export const WidgetDecl = z.object({
 });
 export type WidgetDecl = z.infer<typeof WidgetDecl>;
 
-export const DataClassification = z.enum(['public', 'internal', 'confidential', 'confidential-financial', 'personal', 'secret-reference']);
+export const DataClassification = z.enum([
+  'public',
+  'internal',
+  'confidential',
+  'confidential-financial',
+  'personal',
+  'secret-reference',
+]);
+
+/** The sync Worker rejects writes to server-authority and guarded fields (ADR-0003 A1). */
+export const TableDecl = z.object({
+  name: z.string().regex(/^[a-z][a-z0-9_]*$/),
+  class: z.enum(['lww', 'append', 'local']),
+  authority: z.enum(['server', 'synced', 'append', 'local']),
+  mergeGroups: z.array(z.array(z.string().min(1)).min(2)).default([]),
+  children: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).default([]),
+  guardedColumns: z.array(z.string().min(1)).default([]),
+});
+export type TableDecl = z.infer<typeof TableDecl>;
 
 export const ModuleManifest = z.object({
   id: z.string().regex(/^[a-z][a-z0-9-]*$/),
@@ -69,8 +102,12 @@ export const ModuleManifest = z.object({
   nav: z.array(NavEntry).default([]),
   commands: z.array(PaletteCommand).default([]),
   widgets: z.array(WidgetDecl).default([]),
-  events: z.object({ emits: z.array(z.string()).default([]), consumes: z.array(z.string()).default([]) }).default({ emits: [], consumes: [] }),
+  events: z
+    .object({ emits: z.array(z.string()).default([]), consumes: z.array(z.string()).default([]) })
+    .default({ emits: [], consumes: [] }),
   dependsOn: z.array(z.string()).default([]),
+  roleGrants: z.partialRecord(WorkspaceRole, z.array(z.string().regex(PERMISSION_RE))).default({}),
+  tables: z.array(TableDecl).default([]),
   dataClassification: DataClassification.default('internal'),
   /** Source provenance for ported code (THIRD_PARTY_NOTICES). */
   portedFrom: z.array(z.string()).default([]),
@@ -81,7 +118,20 @@ export type ModuleManifestInput = z.input<typeof ModuleManifest>;
 export function defineModule(m: ModuleManifestInput): ModuleManifest {
   const parsed = ModuleManifest.parse(m);
   for (const p of parsed.permissions) {
-    if (!p.startsWith(parsed.id + ':')) throw new Error(`Module ${parsed.id}: permission "${p}" must be prefixed "${parsed.id}:"`);
+    if (!p.startsWith(parsed.id + ':'))
+      throw new Error(`Module ${parsed.id}: permission "${p}" must be prefixed "${parsed.id}:"`);
+  }
+  for (const [role, permissions] of Object.entries(parsed.roleGrants)) {
+    for (const permission of permissions) {
+      if (!parsed.permissions.includes(permission))
+        throw new Error(`Module ${parsed.id}: ${role} grant "${permission}" is undeclared`);
+    }
+  }
+  for (const table of parsed.tables) {
+    if (table.authority === 'append' && table.class !== 'append')
+      throw new Error(`Module ${parsed.id}: append authority requires append class`);
+    if (table.authority === 'local' && table.class !== 'local')
+      throw new Error(`Module ${parsed.id}: local authority requires local class`);
   }
   const paths = new Set<string>();
   for (const n of parsed.nav) {
