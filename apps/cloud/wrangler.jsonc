@@ -1,0 +1,17 @@
+{
+  // Local emulation only. Staging/production bindings come from the orchestrator's
+  // EXTERNAL_RESOURCES manifest and require approval before any deployment.
+  "name": "xyra-agent-os-cloud",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "xyra-agent-os-local-blobs" }],
+  "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
+  "queues": {
+    "producers": [{ "binding": "JOBS", "queue": "xyra-agent-os-local-jobs" }],
+    "consumers": [{ "queue": "xyra-agent-os-local-jobs", "max_batch_size": 10 }],
+  },
+  "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "WorkspaceHub" }] },
+  "exports": { "WorkspaceHub": { "type": "durable-object", "storage": "sqlite" } },
+  "triggers": { "crons": ["*/15 * * * *"] },
+}

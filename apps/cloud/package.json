@@ -1,0 +1,19 @@
+{
+  "name": "@xyra/cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "@xyra/contracts": "0.1.0",
+    "@xyra/policy": "0.1.0",
+    "hono": "4.12.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260930.2",
+    "wrangler": "4.145.0"
+  }
+}
