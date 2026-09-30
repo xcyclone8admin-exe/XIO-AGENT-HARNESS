@@ -1,3 +1,5 @@
+'use client';
+
 /**
  * Mandatory state primitives (ADR-0007). Every page renders exactly one of these whenever it is not
  * showing real data: no blank screens, no fabricated content (REQ-008, REQ-012).

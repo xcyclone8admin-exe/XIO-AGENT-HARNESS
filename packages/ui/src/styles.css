@@ -4,6 +4,9 @@
  * exposed to Tailwind v4 through @theme so utilities like bg-surface / text-fg / border-line work.
  * Theme: <html data-theme="light|dark"> (absent = follow system). Density: <html data-density="compact">.
  */
+@import 'tailwindcss';
+@source '../../../packages/ui/src';
+@source '../../../modules';
 @import '@fontsource/ibm-plex-sans/400.css';
 @import '@fontsource/ibm-plex-sans/500.css';
 @import '@fontsource/ibm-plex-sans/600.css';
