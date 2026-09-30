@@ -464,6 +464,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     // Assets are immutable once registered: a scale never changes under existing entries.
     name: 'ledger_assets',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'append',
     authority: 'append',
     actorField: 'created_by',
@@ -482,6 +483,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   },
   {
     name: 'ledger_books',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'lww',
     authority: 'synced',
     guardedColumns: ['environment', 'owner_module', 'base_asset'],
@@ -507,6 +509,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   },
   {
     name: 'ledger_accounts',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'lww',
     authority: 'synced',
     guardedColumns: ['book_id', 'environment', 'type'],
@@ -532,6 +535,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     // One transaction and all its entries form one atomic sync unit (LEDGER_SYNC_UNITS).
     name: 'ledger_transactions',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'append',
     authority: 'append',
     actorField: 'posted_by',
@@ -561,6 +565,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   },
   {
     name: 'ledger_entries',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'append',
     authority: 'append',
     actorField: 'created_by',
@@ -593,15 +598,17 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
     },
   },
   // Projection maintained in the posting transaction on every store; never synced (recomputed per side).
-  { name: 'ledger_balances', class: 'local', authority: 'local', readPermission: 'money:ledger:read' },
+  { name: 'ledger_balances', class: 'local', authority: 'local', serverWriteCapabilities: ['money_ledger'], readPermission: 'money:ledger:read' },
   {
     name: 'ledger_reconciliation_runs',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'append',
     authority: 'server',
     readPermission: 'money:ledger:read',
   },
   {
     name: 'ledger_discrepancies',
+    serverWriteCapabilities: ['money_ledger'],
     class: 'lww',
     authority: 'server',
     guardedColumns: ['status', 'owner_id'],
