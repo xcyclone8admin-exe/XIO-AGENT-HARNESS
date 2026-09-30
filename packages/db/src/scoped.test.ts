@@ -182,6 +182,31 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
     await expect(
       store.query(scope, "UPDATE ops_projects SET status = 'paused' WHERE id = $1", [project]),
     ).rejects.toThrow(/permission denied/);
+    await expect(
+      store.query(scope, "UPDATE workspaces SET name = 'Changed' WHERE id = $1", [workspaceA]),
+    ).rejects.toThrow(/permission denied/);
+    await expect(
+      store.query(
+        scope,
+        `INSERT INTO memberships(id,tenant_id,workspace_id,user_id,role)
+         VALUES ('019a0000-0000-7000-8000-000000000302',$1,$2,$3,'owner')`,
+        [tenantA, workspaceA, tenantA],
+      ),
+    ).rejects.toThrow(/permission denied/);
+    await expect(
+      store.withServerScope(scope, undefined, (tx) =>
+        tx.query("UPDATE workspaces SET name = 'Capability update' WHERE id = $1", [workspaceA]),
+      ),
+    ).resolves.toMatchObject({ rowCount: 1 });
+    await expect(
+      store.withServerScope(scope, undefined, (tx) =>
+        tx.query(
+          `INSERT INTO workspaces(id,tenant_id,name)
+           VALUES ('019a0000-0000-7000-8000-000000000303',$1,'Cross-tenant')`,
+          [tenantB],
+        ),
+      ),
+    ).rejects.toThrow();
   } finally {
     await fresh.close();
   }
