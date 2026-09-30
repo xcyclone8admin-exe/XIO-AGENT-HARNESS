@@ -121,3 +121,68 @@ test('swarm tables isolate tenants and keep run records append-only', async () =
   ).rejects.toThrow();
   await expect(db.query('DELETE FROM swarm_runs WHERE id = $1', [runA])).rejects.toThrow(/append-only/);
 });
+
+test('the scoped guard refuses role, session and non-DML statements (ADR-0005 A1 §C)', async () => {
+  const scope = { tenantId: tenantA, workspaceId: workspaceA };
+  for (const sql of [
+    'SET ROLE postgres',
+    'RESET ROLE',
+    'SELECT set_config($1, $2, false)',
+    'SET SESSION AUTHORIZATION postgres',
+    'DO $$ BEGIN PERFORM 1; END $$',
+    'COPY tenants TO STDOUT',
+    'CREATE TABLE intruder (id int)',
+    'ALTER TABLE tenants DISABLE ROW LEVEL SECURITY',
+    'DROP TABLE tenants',
+    'GRANT ALL ON tenants TO xyra_app',
+  ]) {
+    await expect(scoped.query(scope, sql), sql).rejects.toThrow(/Scoped query/);
+  }
+  await expect(
+    scoped.query(
+      scope,
+      'INSERT INTO ops_projects(id) SELECT id FROM ops_projects WHERE false ON CONFLICT DO NOTHING',
+    ),
+  ).resolves.toBeDefined();
+});
+
+test('privileged columns get a column-listed UPDATE grant without them (SWM-R-003)', async () => {
+  const fresh = await openLocalStore();
+  try {
+    const dir = fileURLToPath(new URL('../migrations/', import.meta.url));
+    const files = readdirSync(dir)
+      .filter((name) => name.endsWith('.sql'))
+      .sort();
+    await applyPGliteMigrations(
+      fresh,
+      files.map((name) => migration(`platform/${name.slice(0, -4)}`, readFileSync(`${dir}${name}`, 'utf8'))),
+    );
+    await prepareLocalAppRole(fresh, [
+      { name: 'tenants', class: 'lww' },
+      { name: 'workspaces', class: 'lww' },
+      { name: 'ops_projects', class: 'lww', privilegedColumns: ['status'] },
+    ]);
+    await fresh.query('INSERT INTO tenants(id,name) VALUES ($1,$2)', [tenantA, 'A']);
+    await fresh.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)', [
+      workspaceA,
+      tenantA,
+      'A',
+    ]);
+    const store = new LocalScopedStore(fresh);
+    const scope = { tenantId: tenantA, workspaceId: workspaceA };
+    const project = '019a0000-0000-7000-8000-000000000301';
+    await store.query(
+      scope,
+      'INSERT INTO ops_projects(id,tenant_id,workspace_id,name,created_by) VALUES ($1,$2,$3,$4,$5)',
+      [project, tenantA, workspaceA, 'P', tenantA],
+    );
+    await expect(
+      store.query(scope, "UPDATE ops_projects SET name = 'Q' WHERE id = $1", [project]),
+    ).resolves.toBeDefined();
+    await expect(
+      store.query(scope, "UPDATE ops_projects SET status = 'paused' WHERE id = $1", [project]),
+    ).rejects.toThrow(/permission denied/);
+  } finally {
+    await fresh.close();
+  }
+}, 60_000);
