@@ -47,7 +47,8 @@ export function topoSort(mods) {
     const m = byId.get(id);
     if (!m) throw new Error(`Unknown module dependency "${id}" (from ${trail.at(-1)})`);
     state.set(id, 'visiting');
-    for (const d of m.dependsOn) visit(d, [...trail, id]);
+    // Sorted so the order depends only on the module set, never on declaration order (ADR-0016).
+    for (const d of [...m.dependsOn].sort()) visit(d, [...trail, id]);
     state.set(id, 'done');
     order.push(m);
   };

@@ -5,6 +5,7 @@ import { openLocalStore } from '@xyra/db/pglite';
 import { bootstrapLocalIdentity, CoreService } from '@xyra/mod-core/server';
 import { OpsService } from '@xyra/mod-ops/server';
 import { MIGRATIONS } from './generated/migrations';
+import { MANIFESTS } from './generated/modules';
 import { CapabilityBus } from './bus';
 import { DurableBusAudit, DurableBusIdempotency } from './durable';
 import { registerFoundationCapabilities } from './foundation';
@@ -34,7 +35,10 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
   const db = await openLocalStore(options.dataDir);
   try {
     await applyPGliteMigrations(db, MIGRATIONS);
-    await prepareLocalAppRole(db);
+    await prepareLocalAppRole(
+      db,
+      MANIFESTS.flatMap((manifest) => manifest.tables),
+    );
     const principal = await bootstrapLocalIdentity(db, options.osSubject, options.displayName);
     const scoped = new LocalScopedStore(db);
     const bus = new CapabilityBus(

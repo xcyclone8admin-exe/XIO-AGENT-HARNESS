@@ -35,19 +35,46 @@ export class LocalScopedStore {
   }
 }
 
-/** The trusted sidecar calls this after migrations; PGlite's login remains a superuser. */
-export async function prepareLocalAppRole(db: PGlite): Promise<void> {
+/** Structural subset of a manifest TableDecl (packages/db does not depend on contracts). */
+export interface GrantedTable {
+  readonly name: string;
+  readonly class: 'lww' | 'append' | 'local';
+}
+
+/** Platform bookkeeping relations that no module manifest declares. */
+const PLATFORM_TABLES = ['sync_outbox', 'sync_conflicts', 'sync_cursors', 'capability_idempotency'];
+/** Platform-migrated tables whose owning module is not yet integrated on every branch. */
+const PLATFORM_APPEND_TABLES = [
+  'swarm_runs',
+  'swarm_run_journal',
+  'swarm_model_evals',
+  'swarm_prompt_versions',
+];
+const PLATFORM_MUTABLE_TABLES = ['swarm_agent_profiles'];
+
+/**
+ * The trusted sidecar calls this after migrations; PGlite's login remains a superuser.
+ * Grants derive from manifest table declarations: append tables get SELECT/INSERT only,
+ * everything else SELECT/INSERT/UPDATE. No table gets DELETE.
+ */
+export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTable[] = []): Promise<void> {
+  const append = new Set(PLATFORM_APPEND_TABLES);
+  const mutable = new Set([...PLATFORM_TABLES, ...PLATFORM_MUTABLE_TABLES]);
+  for (const table of tables) {
+    if (!/^[a-z][a-z0-9_]*$/.test(table.name)) throw new Error(`Invalid table name ${table.name}`);
+    if (table.class === 'append') {
+      append.add(table.name);
+      mutable.delete(table.name);
+    } else if (!append.has(table.name)) {
+      mutable.add(table.name);
+    }
+  }
   await db.exec(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='xyra_app') THEN
       CREATE ROLE xyra_app NOLOGIN;
     END IF;
   END $$;
   GRANT USAGE ON SCHEMA public TO xyra_app;
-  GRANT SELECT, INSERT, UPDATE ON tenants, workspaces, users, memberships,
-    approval_requests, approval_decisions, audit_events, domain_events,
-    sync_outbox, sync_conflicts, sync_cursors,
-    workspace_settings, ops_projects, ops_tasks, capability_idempotency,
-    swarm_agent_profiles TO xyra_app;
-  GRANT SELECT, INSERT ON swarm_runs, swarm_run_journal, swarm_model_evals,
-    swarm_prompt_versions TO xyra_app`);
+  GRANT SELECT, INSERT, UPDATE ON ${[...mutable].join(', ')} TO xyra_app;
+  GRANT SELECT, INSERT ON ${[...append].join(', ')} TO xyra_app`);
 }
