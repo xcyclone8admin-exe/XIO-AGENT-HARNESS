@@ -17,7 +17,7 @@
 import { defineCapability, type ModuleManifestInput } from '@xyra/contracts';
 import { z } from 'zod';
 
-export const LEDGER_CONTRACT_VERSION = '1.1.0';
+export const LEDGER_CONTRACT_VERSION = '1.2.0';
 
 // ---------------------------------------------------------------------------------------------
 // Scalars
