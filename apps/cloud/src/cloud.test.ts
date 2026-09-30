@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import type { RowChange } from '@xyra/contracts';
+import { compareHlc as coreCompareHlc } from '@xyra/core';
+import {
+  SYNC_PROTOCOL_VERSION,
+  SYNC_SCHEMA_VERSION,
+  type PushRequest,
+  type RowChange,
+} from '@xyra/contracts';
 import { verifyAccessToken } from './auth';
 import { signBlobAccess, tenantWorkspaceKey, verifyBlobAccess } from './blobs';
 import { acquireLease, emptyLeaseBook, renewLease, type LeaseBook } from './leases';
 import type { ActivePrincipal, CurrentMembership } from './model';
-import { IDEMPOTENCY_RETENTION_MS, SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from './model';
+import { IDEMPOTENCY_RETENTION_MS } from './model';
 import { TABLE_RULES, forbiddenField } from './tables';
-import { IdempotencyKeyReusedError, SyncAuthorityEngine, parseSyncPush } from './sync';
+import { IdempotencyKeyReusedError, SyncAuthorityEngine, compareHlc, parseSyncPush } from './sync';
 
 const T1 = '11111111-1111-4111-8111-111111111111';
 const T2 = '22222222-2222-4222-8222-222222222222';
@@ -140,7 +146,7 @@ const change = (over: Partial<RowChange> = {}): RowChange => ({
   ...over,
 });
 let keyN = 0;
-const push = (changes: RowChange[], key = `idem-key-${String(++keyN).padStart(8, '0')}`) => ({
+const push = (changes: RowChange[], key = `idem-key-${String(++keyN).padStart(8, '0')}`): PushRequest => ({
   protocolVersion: SYNC_PROTOCOL_VERSION,
   schemaVersion: SYNC_SCHEMA_VERSION,
   nodeId: 'nodea',
@@ -387,6 +393,18 @@ describe('sync push authority', () => {
     expect(first?.more).toBe(true);
     expect(e.conflictPage(first?.items.at(-1)?.id ?? 0, 2)?.more).toBe(false);
     expect(e.conflictPage(-1, 2)).toBeNull();
+  });
+});
+
+describe('HLC ordering parity with devices', () => {
+  it('matches packages/core compareHlc for mixed digit/letter node ids and equal ms/counter', () => {
+    const nodes = ['a', 'b0', 'b', '0', '9', 'a9', 'a10', 'z', 'node1', 'node10', 'node2'];
+    const stamps = nodes.flatMap((node) => [hlc(NOW, 0, node), hlc(NOW, 1, node), hlc(NOW + 1, 0, node)]);
+    for (const left of stamps) {
+      for (const right of stamps) {
+        expect(Math.sign(compareHlc(left, right))).toBe(coreCompareHlc(left, right));
+      }
+    }
   });
 });
 

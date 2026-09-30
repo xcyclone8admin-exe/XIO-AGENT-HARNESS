@@ -1,13 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
-import type { KillSwitchState, RowChange } from '@xyra/contracts';
+import type { ConflictRecord, KillSwitchState, RowChange, SequencedChange } from '@xyra/contracts';
 import { acquireLease, renewLease, type LeaseBook } from './leases';
-import type {
-  CandidateClaims,
-  ConflictRecord,
-  CurrentMembership,
-  LeaseRecord,
-  SequencedChange,
-} from './model';
+import type { CandidateClaims, CurrentMembership, LeaseRecord } from './model';
 import type { IdempotencyEntry, StoredConflict, StoredRow, SyncStorePort } from './store';
 import { IdempotencyKeyReusedError, SyncAuthorityEngine, hashRequest, parseSyncPush } from './sync';
 import { hasPermission } from './tables';

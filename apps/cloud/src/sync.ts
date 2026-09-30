@@ -1,19 +1,16 @@
-import { PushRequest as PushRequestSchema } from '@xyra/contracts';
-import type { RowChange } from '@xyra/contracts';
 import {
-  IDEMPOTENCY_RETENTION_MS,
   MAX_HLC_DRIFT_MS,
   MAX_PULL_ROWS,
   MAX_PUSH_BYTES,
-  SYNC_PROTOCOL_VERSION,
-  SYNC_SCHEMA_VERSION,
-  type ActivePrincipal,
+  PushRequest as PushRequestSchema,
   type ConflictRecord,
-  type RejectionCode,
-  type SyncPullResponse,
-  type SyncPushRequest,
-  type SyncPushResponse,
-} from './model';
+  type PullResponse,
+  type PushRequest,
+  type PushResponse,
+  type RowChange,
+  type SyncRejectionCode,
+} from '@xyra/contracts';
+import { IDEMPOTENCY_RETENTION_MS, type ActivePrincipal } from './model';
 import { MemorySyncStore, type FieldWrite, type StoredConflict, type SyncStorePort } from './store';
 import { TABLE_RULES, forbiddenField, hasPermission, type TableRule } from './tables';
 
@@ -37,7 +34,7 @@ function parseHlc(value: string): ParsedHlc | null {
   return { physical: Number(match[1]), logical: parseInt(match[2], 16), node: match[3] };
 }
 
-function compareHlc(left: string, right: string): number {
+export function compareHlc(left: string, right: string): number {
   const a = parseHlc(left);
   const b = parseHlc(right);
   if (!a || !b) throw new Error('invalid HLC passed to comparator');
@@ -48,7 +45,7 @@ function keyFor(change: RowChange): string {
   return `${change.table}:${change.id}`;
 }
 
-function idempotencyKey(principal: ActivePrincipal, request: SyncPushRequest): string {
+function idempotencyKey(principal: ActivePrincipal, request: PushRequest): string {
   return `${principal.tenantId}:${principal.activeWorkspaceId}:${principal.principalId}:${request.nodeId}:${request.idempotencyKey}`;
 }
 
@@ -64,14 +61,14 @@ function canonical(value: unknown): string {
 }
 
 /** SHA-256 (hex) of the canonical request body, excluding the idempotency key itself. */
-export async function hashRequest(request: SyncPushRequest): Promise<string> {
+export async function hashRequest(request: PushRequest): Promise<string> {
   const { idempotencyKey: _key, ...body } = request;
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(body)));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 /** Synchronous stand-in used when a caller has no precomputed hash (in-memory tests). */
-function fallbackHash(request: SyncPushRequest): string {
+function fallbackHash(request: PushRequest): string {
   const { idempotencyKey: _key, ...body } = request;
   return canonical(body);
 }
@@ -94,40 +91,21 @@ function decodeCursor(cursor: string | undefined): bigint | null {
   }
 }
 
-function requestSize(request: SyncPushRequest): number {
+function requestSize(request: PushRequest): number {
   return new TextEncoder().encode(JSON.stringify(request)).byteLength;
 }
 
-export function parseSyncPush(input: unknown): SyncPushRequest | null {
-  if (!input || typeof input !== 'object') return null;
-  const candidate = input as Record<string, unknown>;
-  if (
-    candidate['protocolVersion'] !== SYNC_PROTOCOL_VERSION ||
-    candidate['schemaVersion'] !== SYNC_SCHEMA_VERSION ||
-    typeof candidate['nodeId'] !== 'string' ||
-    !/^[A-Za-z0-9._-]{1,128}$/.test(candidate['nodeId']) ||
-    typeof candidate['idempotencyKey'] !== 'string' ||
-    !/^[A-Za-z0-9._-]{16,256}$/.test(candidate['idempotencyKey'])
-  ) {
-    return null;
-  }
-  const parsed = PushRequestSchema.safeParse({ nodeId: candidate['nodeId'], changes: candidate['changes'] });
+export function parseSyncPush(input: unknown): PushRequest | null {
+  const parsed = PushRequestSchema.safeParse(input);
   if (!parsed.success) return null;
-  const request: SyncPushRequest = {
-    protocolVersion: candidate['protocolVersion'],
-    schemaVersion: candidate['schemaVersion'],
-    nodeId: candidate['nodeId'],
-    idempotencyKey: candidate['idempotencyKey'],
-    changes: parsed.data.changes,
-  };
-  return requestSize(request) <= MAX_PUSH_BYTES ? request : null;
+  return requestSize(parsed.data) <= MAX_PUSH_BYTES ? parsed.data : null;
 }
 
 function validateChange(
   principal: ActivePrincipal,
   change: RowChange,
   nowMs: number,
-): { rule: TableRule } | { code: RejectionCode } {
+): { rule: TableRule } | { code: SyncRejectionCode } {
   if (change.tenantId !== principal.tenantId || change.workspaceId !== principal.activeWorkspaceId)
     return { code: 'AUTH_SCOPE_MISMATCH' };
   const rule = TABLE_RULES[change.table];
@@ -175,10 +153,10 @@ export class SyncAuthorityEngine {
 
   push(
     principal: ActivePrincipal,
-    request: SyncPushRequest,
+    request: PushRequest,
     nowMs = Date.now(),
     requestHash = fallbackHash(request),
-  ): SyncPushResponse {
+  ): PushResponse {
     const store = this.store;
     const replayKey = idempotencyKey(principal, request);
     store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
@@ -188,7 +166,7 @@ export class SyncAuthorityEngine {
       return { ...previous.response, replayed: true };
     }
 
-    const rejected: { index: number; changeId: string; code: RejectionCode }[] = [];
+    const rejected: { index: number; changeId: string; code: SyncRejectionCode }[] = [];
     const conflicts: ConflictRecord[] = [];
     let accepted = 0;
     for (const [index, change] of request.changes.entries()) {
@@ -256,7 +234,7 @@ export class SyncAuthorityEngine {
         accepted += 1;
       }
     }
-    const response: SyncPushResponse = {
+    const response: PushResponse = {
       accepted,
       conflicts: conflicts.length,
       serverSeq: store.serverSeq().toString(10),
@@ -268,7 +246,7 @@ export class SyncAuthorityEngine {
     return response;
   }
 
-  pull(cursor: string | undefined, pageSize = MAX_PULL_ROWS): SyncPullResponse | null {
+  pull(cursor: string | undefined, pageSize = MAX_PULL_ROWS): PullResponse | null {
     const after = decodeCursor(cursor);
     if (after === null || pageSize < 1 || pageSize > MAX_PULL_ROWS) return null;
     const fetched = this.store.readLog(after, pageSize + 1);

@@ -1,5 +1,4 @@
-import type { RowChange } from '@xyra/contracts';
-import type { ConflictRecord, SequencedChange, SyncPushResponse } from './model';
+import type { ConflictRecord, PushResponse, RowChange, SequencedChange } from '@xyra/contracts';
 
 export type FieldWrite = RowChange['fields'][string];
 
@@ -10,7 +9,7 @@ export interface StoredRow {
 
 export interface IdempotencyEntry {
   readonly hash: string;
-  readonly response: SyncPushResponse;
+  readonly response: PushResponse;
   readonly atMs: number;
 }
 
