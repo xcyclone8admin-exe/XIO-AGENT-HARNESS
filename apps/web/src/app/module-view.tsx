@@ -4,8 +4,10 @@ import { useEffect, useState, type ComponentType } from 'react';
 import type { ModulePageProps } from '@xyra/sdk/module-ui';
 import { AppShell, ErrorState, LoadingState } from '@xyra/ui';
 import { MANIFESTS, UI_LOADERS } from '../generated/modules';
+import { useLocal } from './local-provider';
 
 export function ModuleView({ module, route }: { module: string; route: string }) {
+  const local = useLocal();
   const [Page, setPage] = useState<ComponentType<ModulePageProps> | null>(null);
   const [error, setError] = useState<Error | null>(null);
   useEffect(() => {
@@ -28,11 +30,18 @@ export function ModuleView({ module, route }: { module: string; route: string })
     };
   }, [module, route]);
   return (
-    <AppShell manifests={MANIFESTS} activePath={`/${module}${route ? '/' + route : ''}/`}>
+    <AppShell
+      manifests={MANIFESTS}
+      activePath={`/${module}${route ? '/' + route : ''}/`}
+      workspaceLabel={local.workspaces.find((w) => w.id === local.workspaceId)?.name}
+      workspaces={local.workspaces}
+      activeWorkspaceId={local.workspaceId}
+      onSelectWorkspace={local.selectWorkspace}
+    >
       {error ? (
         <ErrorState error={error} />
       ) : Page ? (
-        <Page workspaceId={null} />
+        <Page workspaceId={local.workspaceId} api={local.api} />
       ) : (
         <LoadingState label="Loading module" />
       )}
