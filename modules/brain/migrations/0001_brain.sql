@@ -80,7 +80,8 @@ CREATE TABLE brain_memories (
   FOREIGN KEY (tenant_id,workspace_id) REFERENCES workspaces(tenant_id,id) ON DELETE RESTRICT,
   FOREIGN KEY (tenant_id,workspace_id,source_id) REFERENCES brain_sources(tenant_id,workspace_id,id) ON DELETE RESTRICT,
   FOREIGN KEY (tenant_id,workspace_id,source_version_id) REFERENCES brain_source_versions(tenant_id,workspace_id,id) ON DELETE RESTRICT,
-  FOREIGN KEY (tenant_id,workspace_id,supersedes_id) REFERENCES brain_memories(tenant_id,workspace_id,id) ON DELETE RESTRICT
+  FOREIGN KEY (tenant_id,workspace_id,supersedes_id) REFERENCES brain_memories(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  UNIQUE (tenant_id,workspace_id,id)
 );
 CREATE TABLE brain_procedures (
   id uuid PRIMARY KEY, tenant_id uuid NOT NULL, workspace_id uuid NOT NULL, procedure_id uuid NOT NULL, version integer NOT NULL CHECK(version>0),

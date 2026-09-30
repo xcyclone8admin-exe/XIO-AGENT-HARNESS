@@ -100,6 +100,7 @@ describe('governed truth lifecycle', () => {
   }
 
   it('requires matching promotion provenance; agent cannot insert Facts directly', async () => {
+    await db.query('TRUNCATE brain_contradictions,brain_facts,brain_promotions,brain_claims,brain_signals,brain_chunks,brain_source_versions,brain_sources CASCADE');
     const c = await claim('Avery');
     await expect(brain.promoteClaim(scopeA, actor, c.id, { type: 'reviewer', reference: 'review-1', reason: 'verified', reviewerId: '019a0000-0000-7000-8000-000000000099', authorized: true })).rejects.toThrow('REVIEWER_MISMATCH');
     await expect(store.query(scopeA, `INSERT INTO brain_facts(id,tenant_id,workspace_id,claim_id,subject,predicate,object,confidence,effective_from,promotion_id,created_by)
@@ -111,11 +112,12 @@ describe('governed truth lifecycle', () => {
   });
 
   it('records contradictions and preserves superseded truth for deterministic as-of dates', async () => {
+    await db.query('TRUNCATE brain_contradictions,brain_facts,brain_promotions,brain_claims,brain_signals,brain_chunks,brain_source_versions,brain_sources CASCADE');
     const oldClaim = await claim('Avery', '2025-01-01T00:00:00.000Z');
     const old = await brain.promoteClaim(scopeA, actor, oldClaim.id, { type: 'policy', reference: 'policy:verified-import', reason: 'Approved policy import', authorized: true });
     const newClaim = await claim('Jordan', '2026-01-01T00:00:00.000Z');
     expect(newClaim.contradictions).toEqual([old.factId]);
-    const next = await brain.promoteClaim(scopeA, actor, newClaim.id, { type: 'reviewer', reference: 'review-change', reason: 'New reviewed evidence', reviewerId: actor, authorized: true });
+    const next = await brain.promoteClaim(scopeA, actor, newClaim.id, { type: 'reviewer', reference: 'review-change', reason: 'New reviewed evidence', reviewerId: actor, authorized: true }, old.factId);
     expect(next.supersedesId).toBe(old.factId);
     expect((await brain.factsAsOf(scopeA, '2025-08-01T00:00:00Z')).map(row => row.object)).toContain('Avery');
     expect((await brain.factsAsOf(scopeA, '2026-08-01T00:00:00Z')).map(row => row.object)).toContain('Jordan');
