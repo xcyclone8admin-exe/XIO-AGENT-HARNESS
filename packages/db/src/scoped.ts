@@ -1,17 +1,28 @@
 import type { PGlite } from '@electric-sql/pglite';
 
-export interface Scope { readonly tenantId: string; readonly workspaceId: string }
-export interface RowResult<T> { readonly rows: T[]; readonly rowCount: number }
+export interface Scope {
+  readonly tenantId: string;
+  readonly workspaceId: string;
+}
+export interface RowResult<T> {
+  readonly rows: T[];
+  readonly rowCount: number;
+}
 
 /** SQL here is code-owned and parameterized; no user or agent supplied SQL enters this API. */
 export class LocalScopedStore {
   constructor(private readonly db: PGlite) {}
 
-  async query<T extends Record<string, unknown>>(scope: Scope, sql: string, params: unknown[] = []): Promise<RowResult<T>> {
+  async query<T extends Record<string, unknown>>(
+    scope: Scope,
+    sql: string,
+    params: unknown[] = [],
+  ): Promise<RowResult<T>> {
     if (!/^[0-9a-f-]{36}$/i.test(scope.tenantId) || !/^[0-9a-f-]{36}$/i.test(scope.workspaceId)) {
       throw new Error('Invalid query scope');
     }
-    if (sql.includes(';') || /\/\*|--/.test(sql)) throw new Error('Scoped query must be one code-owned statement');
+    if (sql.includes(';') || /\/\*|--/.test(sql))
+      throw new Error('Scoped query must be one code-owned statement');
     return this.db.transaction(async (tx) => {
       await tx.exec('SET LOCAL ROLE xyra_app');
       await tx.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
@@ -35,5 +46,8 @@ export async function prepareLocalAppRole(db: PGlite): Promise<void> {
   GRANT SELECT, INSERT, UPDATE ON tenants, workspaces, users, memberships,
     approval_requests, approval_decisions, audit_events, domain_events,
     sync_outbox, sync_conflicts, sync_cursors,
-    workspace_settings, ops_projects, ops_tasks, capability_idempotency TO xyra_app`);
+    workspace_settings, ops_projects, ops_tasks, capability_idempotency,
+    swarm_agent_profiles TO xyra_app;
+  GRANT SELECT, INSERT ON swarm_runs, swarm_run_journal, swarm_model_evals,
+    swarm_prompt_versions TO xyra_app`);
 }

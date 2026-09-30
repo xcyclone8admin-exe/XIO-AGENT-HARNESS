@@ -11,7 +11,11 @@ export const ApprovalRecord = z.object({
   reason: z.string(),
   scopeHash: z.string().length(64),
   inputPreview: z.unknown(),
-  requestedBy: z.object({ kind: z.enum(['user', 'agent', 'system']), id: z.uuid(), runId: z.uuid().optional() }),
+  requestedBy: z.object({
+    kind: z.enum(['user', 'agent', 'system']),
+    id: z.uuid(),
+    runId: z.uuid().optional(),
+  }),
   status: ApprovalStatus,
   decidedBy: z.uuid().nullable(),
   decidedAt: z.iso.datetime({ offset: true }).nullable(),
@@ -47,23 +51,6 @@ export const KillSwitchState = z.object({
   changedAt: z.iso.datetime({ offset: true }).nullable(),
 });
 export type KillSwitchState = z.infer<typeof KillSwitchState>;
-
-/** Sync wire format (ADR-0003). One field write carries its HLC and the HLC it was based on. */
-export const FieldWrite = z.object({ value: z.unknown(), hlc: z.string(), baseHlc: z.string().nullable() });
-export const RowChange = z.object({
-  table: z.string().regex(/^[a-z][a-z0-9_]*$/),
-  id: z.uuid(),
-  tenantId: z.uuid(),
-  workspaceId: z.uuid().nullable(),
-  /** lww: per-field writes; append: full immutable row; delete: tombstone. */
-  op: z.enum(['upsert', 'append', 'delete']),
-  fields: z.record(z.string(), FieldWrite),
-  hlc: z.string(),
-});
-export type RowChange = z.infer<typeof RowChange>;
-export const PushRequest = z.object({ nodeId: z.string(), changes: z.array(RowChange).max(500) });
-export const PushResponse = z.object({ accepted: z.number().int(), conflicts: z.number().int(), serverSeq: z.string() });
-export const PullResponse = z.object({ changes: z.array(RowChange), cursor: z.string(), more: z.boolean() });
 
 export const SyncState = z.enum(['local-only', 'pending', 'synced', 'conflict', 'failed', 'offline']);
 export type SyncState = z.infer<typeof SyncState>;
