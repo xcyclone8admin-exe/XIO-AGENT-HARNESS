@@ -3,8 +3,10 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole, type Migration } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
+import { canonicalJson, sha256Hex } from '@xyra/core';
 import manifest from '../manifest';
 import { BrainService } from './brain-service';
+import { GOLDEN_RETRIEVAL } from '../tests/golden-retrieval';
 
 const tenantA = '019a0000-0000-7000-8000-000000000001';
 const tenantB = '019a0000-0000-7000-8000-000000000002';
@@ -51,6 +53,28 @@ describe('BRAIN schema and provenance', () => {
     expect(hits[0]?.content).toContain('retention');
   });
 
+  it('measures Recall@10 against the independent labeled golden corpus', async () => {
+    const relevantSources = new Map<string, string>();
+    for (let distractor = 0; distractor < 20; distractor++) {
+      await brain.ingest(scopeA, actor, { source: { sourceType: 'golden-distractor', title: `Unrelated operational note ${distractor}` }, content: `Quarterly operational planning note ${distractor} discusses office seating and building access, with no policy values or procedures.`, contentType: 'text/plain' });
+    }
+    for (const item of GOLDEN_RETRIEVAL) {
+      const result = await brain.ingest(scopeA, actor, { source: { sourceType: 'golden-corpus', title: item.title, trustLevel: 'reviewed' }, content: item.content, contentType: 'text/plain' });
+      relevantSources.set(item.id, result.sourceId);
+    }
+    let retrievedRelevant = 0;
+    let totalRelevant = 0;
+    for (const item of GOLDEN_RETRIEVAL) {
+      const labeled = new Set([relevantSources.get(item.id)!]);
+      totalRelevant += labeled.size;
+      const hits = await brain.search(scopeA, { query: item.query, limit: 10 });
+      retrievedRelevant += new Set(hits.map(hit => hit.sourceId).filter(id => labeled.has(id))).size;
+    }
+    const recallAt10 = retrievedRelevant / totalRelevant;
+    expect({ recallAt10, retrievedRelevant, totalRelevant }).toMatchObject({ retrievedRelevant: 12, totalRelevant: 12 });
+    expect(recallAt10).toBeGreaterThanOrEqual(0.8);
+  });
+
   it('filters by tenant/workspace inside SQL candidates before retrieval scoring', async () => {
     await brain.ingest(scopeB, actor, { source: { sourceType: 'document', title: 'Private plan', trustLevel: 'user' }, content: 'Secret cobalt project owl codeword is confidential.', contentType: 'text/plain' });
     await brain.ingest(scopeC, actor, { source: { sourceType: 'document', title: 'Near duplicate', trustLevel: 'user' }, content: 'Secret cobalt project owl codeword is confidential.', contentType: 'text/plain' });
@@ -69,10 +93,10 @@ describe('BRAIN schema and provenance', () => {
 });
 
 describe('governed truth lifecycle', () => {
-  async function claim(object: string, start = '2026-01-01T00:00:00.000Z') {
+  async function claim(object: string, start = '2026-01-01T00:00:00.000Z', predicate = 'lead', end?: string) {
     const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'record', title: 'Truth evidence', trustLevel: 'reviewed' }, content: `The project lead is ${object}.`, contentType: 'text/plain' });
     const signal = await brain.createSignal(scopeA, actor, source.sourceId, source.versionId, source.chunkIds[0] ?? null, 'extracted');
-    return brain.createClaim(scopeA, actor, { signalId: signal, subject: 'project', predicate: 'lead', object, confidence: 0.9, effectiveFrom: start });
+    return brain.createClaim(scopeA, actor, { signalId: signal.signalId, subject: 'project', predicate, object, confidence: 0.9, effectiveFrom: start, effectiveTo: end ?? null });
   }
 
   it('requires matching promotion provenance; agent cannot insert Facts directly', async () => {
@@ -96,6 +120,26 @@ describe('governed truth lifecycle', () => {
     expect((await brain.factsAsOf(scopeA, '2025-08-01T00:00:00Z')).map(row => row.object)).toContain('Avery');
     expect((await brain.factsAsOf(scopeA, '2026-08-01T00:00:00Z')).map(row => row.object)).toContain('Jordan');
   });
+
+  it('finds conflicting older facts when a newer co-predicate fact never superseded them', async () => {
+    const oldClaim = await claim('Taylor', '2024-01-01T00:00:00.000Z', 'account_owner');
+    const old = await brain.promoteClaim(scopeA, actor, oldClaim.id, { type: 'policy', reference: 'policy:owner-history', reason: 'Imported historical record', authorized: true });
+    const laterClaim = await claim('Casey', '2025-01-01T00:00:00.000Z', 'account_owner');
+    const later = await brain.promoteClaim(scopeA, actor, laterClaim.id, { type: 'policy', reference: 'policy:owner-later', reason: 'Later record did not explicitly supersede', authorized: true });
+    expect(later.supersedesId).toBeNull();
+    const newClaim = await claim('Morgan', '2026-01-01T00:00:00.000Z', 'account_owner');
+    expect(newClaim.contradictions).toContain(old.factId);
+    expect(newClaim.contradictions).toContain(later.factId);
+  });
+
+  it('restores a predecessor when its temporary superseding fact expires', async () => {
+    const oldClaim = await claim('Avery', '2025-01-01T00:00:00.000Z', 'project_lead');
+    const old = await brain.promoteClaim(scopeA, actor, oldClaim.id, { type: 'policy', reference: 'policy:project-lead', reason: 'Approved policy import', authorized: true });
+    const temporary = await claim('Jordan', '2026-01-01T00:00:00.000Z', 'project_lead', '2026-03-01T00:00:00.000Z');
+    await brain.promoteClaim(scopeA, actor, temporary.id, { type: 'reviewer', reference: 'review:temporary-lead', reason: 'Temporary assignment', reviewerId: actor, authorized: true }, old.factId);
+    const afterExpiry = await brain.factsAsOf(scopeA, '2026-08-01T00:00:00.000Z');
+    expect(afterExpiry.filter(row => row.predicate === 'project_lead').map(row => row.object)).toEqual(['Avery']);
+  });
 });
 
 describe('scoped memories and reviewed procedures', () => {
@@ -104,18 +148,59 @@ describe('scoped memories and reviewed procedures', () => {
       await brain.addMemory(scopeA, actor, { memoryType, title: memoryType, content: `Workspace A ${memoryType}` });
     }
     await brain.addMemory(scopeB, actor, { memoryType: 'decision', title: 'Secret', content: 'Workspace B private content' });
-    expect(await brain.listMemories(scopeA)).toHaveLength(7);
-    expect((await brain.listMemories(scopeA)).some(row => row.content === 'Workspace B private content')).toBe(false);
+    expect((await brain.listMemories(scopeA)).items).toHaveLength(7);
+    expect((await brain.listMemories(scopeA)).items.some(row => row.content === 'Workspace B private content')).toBe(false);
+    const first = await brain.listMemories(scopeA, { limit: 3, memoryType: 'decision' });
+    expect(first.items).toHaveLength(1);
+    expect(first.nextCursor).toBeNull();
+    const pageOne = await brain.listMemories(scopeA, { limit: 3 });
+    const pageTwo = await brain.listMemories(scopeA, { limit: 3, cursor: pageOne.nextCursor ?? undefined });
+    expect(pageOne.items.length).toBe(3);
+    expect(pageTwo.items.length).toBe(3);
+    expect(pageOne.items.map(row => row.id).filter(id => pageTwo.items.some(next => next.id === id))).toEqual([]);
   });
 
   it('keeps workflow patterns as candidates until a reviewer appends an approved version', async () => {
     await expect(brain.proposeProcedure(scopeA, actor, { title: 'Pattern', type: 'xyra_pattern', body: 'Steps' })).rejects.toThrow('SUCCESSFUL_RUN_REQUIRED');
     const candidate = await brain.proposeProcedure(scopeA, actor, { title: 'Pattern', type: 'xyra_pattern', body: 'Steps', successfulRunId: '019a0000-0000-7000-8000-000000000088' });
     await expect(brain.reviewProcedure(scopeA, actor, '019a0000-0000-7000-8000-000000000099', 'approved')).rejects.toThrow('PROCEDURE_CANDIDATE_NOT_FOUND');
-    const approved = await brain.reviewProcedure(scopeA, actor, candidate, 'approved');
-    const rows = await store.query<Record<string, unknown>>(scopeA, 'SELECT version,status,reviewed_by FROM brain_procedures WHERE procedure_id=(SELECT procedure_id FROM brain_procedures WHERE id=$1) ORDER BY version', [candidate]);
+    const approved = await brain.reviewProcedure(scopeA, actor, candidate.procedureId, 'approved');
+    const rows = await store.query<Record<string, unknown>>(scopeA, 'SELECT version,status,reviewed_by FROM brain_procedures WHERE procedure_id=(SELECT procedure_id FROM brain_procedures WHERE id=$1) ORDER BY version', [candidate.procedureId]);
     expect(rows.rows).toEqual([expect.objectContaining({ version: 1, status: 'candidate', reviewed_by: null }), expect.objectContaining({ version: 2, status: 'approved', reviewed_by: actor })]);
-    await expect(store.query(scopeA, 'UPDATE brain_procedures SET status=$1 WHERE id=$2', ['approved', candidate])).rejects.toThrow();
-    expect(approved).toMatch(/[0-9a-f-]{36}/);
+    await expect(store.query(scopeA, 'UPDATE brain_procedures SET status=$1 WHERE id=$2', ['approved', candidate.procedureId])).rejects.toThrow();
+    expect(approved.procedureId).toMatch(/[0-9a-f-]{36}/);
+  });
+});
+
+describe('source erasure coordination and retention evidence', () => {
+  it('requires a valid scoped approval and leaves data pending while CLOUD cannot reference-check blobs', async () => {
+    const blobRef = '019a0000-0000-7000-8000-000000000091';
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Erase request fixture', trustLevel: 'user', retention: 'seven_years', externalBlobRefs: [blobRef] }, content: 'Source text stays until coordinated erase approval.', contentType: 'text/plain' });
+    const requestId = '019a0000-0000-7000-8000-000000000092';
+    const inputHash = await sha256Hex(canonicalJson({ sourceId: source.sourceId }));
+    await db.query(`INSERT INTO approval_requests(id,tenant_id,workspace_id,capability_id,input_hash,requested_by,reason,expires_at)
+      VALUES ($1,$2,$3,'brain.sources.erase',$4,$5,'authorized test erase',now()+interval '1 hour')`, [requestId, tenantA, workspaceA, inputHash, actor]);
+    await db.query(`INSERT INTO approval_decisions(id,tenant_id,workspace_id,request_id,decided_by,decision,reason)
+      VALUES (gen_random_uuid(),$1,$2,$3,$4,'approved','reviewed')`, [tenantA, workspaceA, requestId, actor]);
+    await expect(brain.requestSourceErasure(scopeA, actor, '019a0000-0000-7000-8000-000000000093', { sourceId: source.sourceId })).rejects.toThrow('ERASURE_APPROVAL_INVALID');
+    const job = await brain.requestSourceErasure(scopeA, actor, requestId, { sourceId: source.sourceId });
+    expect(job).toMatchObject({ status: 'waiting_cloud', attempts: 0, retentionPolicy: 'seven_years', externalBlobRefs: [blobRef], lastErrorCode: 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE' });
+    expect(await brain.requestSourceErasure(scopeA, actor, requestId, { sourceId: source.sourceId })).toMatchObject({ id: job.id, attempts: 0 });
+    expect((await brain.search(scopeA, { query: 'coordinated erase approval' })).length).toBeGreaterThan(0);
+    const retryInput = { erasureId: job.id, attempt: 1 };
+    const retryApprovalId = '019a0000-0000-7000-8000-000000000094';
+    await db.query(`INSERT INTO approval_requests(id,tenant_id,workspace_id,capability_id,input_hash,requested_by,reason,expires_at)
+      VALUES ($1,$2,$3,'brain.sources.erase.retry',$4,$5,'authorized retry',now()+interval '1 hour')`, [retryApprovalId, tenantA, workspaceA, await sha256Hex(canonicalJson(retryInput)), actor]);
+    await db.query(`INSERT INTO approval_decisions(id,tenant_id,workspace_id,request_id,decided_by,decision,reason)
+      VALUES (gen_random_uuid(),$1,$2,$3,$4,'approved','reviewed')`, [tenantA, workspaceA, retryApprovalId, actor]);
+    const retried = await brain.retrySourceErasure(scopeA, actor, { ...retryInput, approvalRequestId: retryApprovalId });
+    expect(retried).toMatchObject({ status: 'waiting_cloud', attempts: 1 });
+    await expect(brain.retrySourceErasure(scopeA, actor, { ...retryInput, approvalRequestId: retryApprovalId })).rejects.toThrow('ERASURE_APPROVAL_INVALID');
+    const attempts = await store.query<Record<string, unknown>>(scopeA, 'SELECT outcome,retention_policy,error_code,deleted_blob_refs FROM brain_source_erasure_attempts WHERE erasure_id=$1 ORDER BY occurred_at,id', [job.id]);
+    expect(attempts.rows).toHaveLength(2);
+    expect(attempts.rows.every(row => row.outcome === 'waiting_cloud' && row.retention_policy === 'seven_years' && row.error_code === 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE' && JSON.stringify(row.deleted_blob_refs) === '[]')).toBe(true);
+    expect(await brain.sourceErasureStatus(scopeA, { erasureId: job.id })).toMatchObject({ status: 'waiting_cloud', attempts: 1, audit: { items: expect.any(Array) } });
+    await expect(store.query(scopeA, "UPDATE brain_source_erasures SET status='complete' WHERE id=$1", [job.id])).rejects.toThrow();
+    await expect(brain.retrySourceErasure(scopeB, actor, { ...retryInput, approvalRequestId: retryApprovalId })).rejects.toThrow('ERASURE_NOT_FOUND');
   });
 });

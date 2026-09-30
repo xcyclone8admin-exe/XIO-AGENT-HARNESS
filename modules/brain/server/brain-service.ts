@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { uuidv7 } from '@xyra/core';
+import { canonicalJson, sha256Hex, uuidv7 } from '@xyra/core';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ClaimDraft, IngestDraft, MemoryDraft, SearchInput, type MemoryType } from '../contracts';
+import { ClaimDraft, ErasureRequestInput, ErasureRetryInput, ErasureStatusInput, IngestDraft, MemoryDraft, MemoryListInput, ProcedureListInput, SearchInput, type MemoryType } from '../contracts';
 
 type IdRow = Record<string, unknown> & { id: string };
 type SearchRow = Record<string, unknown> & { source_id: string; source_version_id: string; chunk_id: string; content_text: string; rank: number };
@@ -22,8 +22,8 @@ export class BrainService {
     const dimension = draft.embeddings?.[0]?.length;
     if (draft.embeddings?.some((vector) => vector.length !== dimension)) throw new Error('EMBEDDING_DIMENSION_MISMATCH');
     const chunkIds = chunks.map(() => uuid());
-    await this.store.query(scope, `INSERT INTO brain_sources(id,tenant_id,workspace_id,source_type,title,uri,trust_level,retention,created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [sourceId, scope.tenantId, scope.workspaceId, draft.source.sourceType, draft.source.title, draft.source.uri ?? null, draft.source.trustLevel, draft.source.retention, actorId]);
+    await this.store.query(scope, `INSERT INTO brain_sources(id,tenant_id,workspace_id,source_type,title,uri,trust_level,retention,external_blob_refs,created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)`, [sourceId, scope.tenantId, scope.workspaceId, draft.source.sourceType, draft.source.title, draft.source.uri ?? null, draft.source.trustLevel, draft.source.retention, JSON.stringify(draft.source.externalBlobRefs), actorId]);
     await this.store.query(scope, `INSERT INTO brain_source_versions(id,tenant_id,workspace_id,source_id,version,content_hash,content_type,content_text,captured_at,created_by)
       VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9)`, [versionId, scope.tenantId, scope.workspaceId, sourceId, hash, draft.contentType, draft.content, now, actorId]);
     for (let i = 0; i < chunks.length; i++) {
@@ -85,7 +85,7 @@ export class BrainService {
     const id = uuid();
     await this.store.query(scope, `INSERT INTO brain_signals(id,tenant_id,workspace_id,source_id,source_version_id,chunk_id,signal_type,payload,created_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [id, scope.tenantId, scope.workspaceId, sourceId, versionId, chunkId, signalType, JSON.stringify(payload), actorId]);
-    return id;
+    return { signalId: id };
   }
 
   async createClaim(scope: Scope, actorId: string, input: unknown) {
@@ -94,7 +94,9 @@ export class BrainService {
     await this.store.query(scope, `INSERT INTO brain_claims(id,tenant_id,workspace_id,signal_id,subject,predicate,object,confidence,effective_from,effective_to,created_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [id, scope.tenantId, scope.workspaceId, d.signalId, d.subject, d.predicate, d.object, d.confidence, d.effectiveFrom, d.effectiveTo ?? null, actorId]);
     const conflicts = await this.store.query<IdRow>(scope, `SELECT f.id FROM brain_facts f WHERE f.tenant_id=$1 AND f.workspace_id=$2 AND f.subject=$3 AND f.predicate=$4
-      AND (f.effective_to IS NULL OR f.effective_to > $5) AND ($6::timestamptz IS NULL OR f.effective_from < $6) AND f.object<>$7`,
+      AND f.effective_from < COALESCE($6::timestamptz, 'infinity'::timestamptz) AND COALESCE(f.effective_to, 'infinity'::timestamptz) > $5 AND f.object<>$7
+      AND NOT EXISTS (SELECT 1 FROM brain_facts superseder WHERE superseder.tenant_id=f.tenant_id AND superseder.workspace_id=f.workspace_id
+        AND superseder.supersedes_id=f.id AND superseder.effective_from<=$5 AND (superseder.effective_to IS NULL OR superseder.effective_to>$5))`,
     [scope.tenantId, scope.workspaceId, d.subject, d.predicate, d.effectiveFrom, d.effectiveTo ?? null, d.object]);
     for (const conflict of conflicts.rows) await this.store.query(scope, `INSERT INTO brain_contradictions(id,tenant_id,workspace_id,claim_id,fact_id,status,created_by) VALUES ($1,$2,$3,$4,$5,'open',$6) ON CONFLICT DO NOTHING`, [uuid(), scope.tenantId, scope.workspaceId, id, conflict.id, actorId]);
     return { id, contradictions: conflicts.rows.map(({ id: factId }) => factId) };
@@ -130,7 +132,7 @@ export class BrainService {
     const result = await this.store.query(scope, `SELECT f.id,f.claim_id,f.subject,f.predicate,f.object,f.confidence,f.effective_from,f.effective_to,f.supersedes_id,p.authority_type,p.authority_ref
       FROM brain_facts f JOIN brain_promotions p ON (p.tenant_id,p.workspace_id,p.id)=(f.tenant_id,f.workspace_id,f.promotion_id)
       WHERE f.tenant_id=$1 AND f.workspace_id=$2 AND f.effective_from<=$3 AND (f.effective_to IS NULL OR f.effective_to>$3)
-        AND NOT EXISTS(SELECT 1 FROM brain_facts newer WHERE newer.tenant_id=f.tenant_id AND newer.workspace_id=f.workspace_id AND newer.supersedes_id=f.id AND newer.effective_from<=$3)
+        AND NOT EXISTS(SELECT 1 FROM brain_facts newer WHERE newer.tenant_id=f.tenant_id AND newer.workspace_id=f.workspace_id AND newer.supersedes_id=f.id AND newer.effective_from<=$3 AND (newer.effective_to IS NULL OR newer.effective_to>$3))
       ORDER BY f.subject,f.predicate,f.effective_from DESC,f.id`, [scope.tenantId, scope.workspaceId, at.toISOString()]);
     return result.rows;
   }
@@ -149,7 +151,7 @@ export class BrainService {
     const id = uuid();
     await this.store.query(scope, `INSERT INTO brain_procedures(id,tenant_id,workspace_id,procedure_id,version,title,procedure_type,body,status,source_run_id,created_by)
       VALUES ($1,$2,$3,$4,1,$5,$6,$7,'candidate',$8,$9)`, [id, scope.tenantId, scope.workspaceId, uuid(), parsed.title, parsed.type, parsed.body, parsed.successfulRunId ?? null, actorId]);
-    return id;
+    return { procedureId: id };
   }
 
   async reviewProcedure(scope: Scope, reviewerId: string, procedureId: string, decision: 'approved' | 'rejected') {
@@ -160,11 +162,95 @@ export class BrainService {
     const id = uuid();
     await this.store.query(scope, `INSERT INTO brain_procedures(id,tenant_id,workspace_id,procedure_id,version,title,procedure_type,body,status,source_run_id,reviewed_by,created_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)`, [id, scope.tenantId, scope.workspaceId, row.procedure_id, Number(row.version) + 1, row.title, row.procedure_type, row.body, decision, row.source_run_id, reviewerId]);
-    return id;
+    return { procedureId: id };
   }
 
-  async listMemories(scope: Scope) {
-    return (await this.store.query(scope, 'SELECT id,memory_type,title,content,source_id,source_version_id,confidence,importance,effective_from,effective_to,supersedes_id,updated_at FROM brain_memories WHERE tenant_id=$1 AND workspace_id=$2 ORDER BY updated_at DESC', [scope.tenantId, scope.workspaceId])).rows;
+  async listProcedures(scope: Scope, input: unknown = {}) {
+    const parsed = ProcedureListInput.parse(input);
+    return (await this.store.query(scope, `SELECT id,procedure_id,version,title,procedure_type,body,status,source_run_id,reviewed_by,created_at
+      FROM brain_procedures WHERE tenant_id=$1 AND workspace_id=$2 AND ($3::text IS NULL OR status=$3)
+      ORDER BY created_at DESC,id DESC LIMIT $4`, [scope.tenantId, scope.workspaceId, parsed.status ?? null, parsed.limit])).rows;
+  }
+
+  /** Persist an approved erasure intent. Blob and source bytes remain until CLOUD can safely coordinate deletion. */
+  async requestSourceErasure(scope: Scope, actorId: string, approvalRequestId: string | undefined, input: unknown) {
+    const request = ErasureRequestInput.parse(input);
+    if (!approvalRequestId) throw new Error('ERASURE_APPROVAL_REQUIRED');
+    const inputHash = await sha256Hex(canonicalJson(request));
+    await this.assertErasureApproval(scope, approvalRequestId, request, 'brain.sources.erase');
+    const source = await this.store.query<Record<string, unknown> & { id: string; retention: string; external_blob_refs: string[] }>(scope,
+      'SELECT id,retention,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, request.sourceId]);
+    const row = source.rows[0];
+    if (!row) throw new Error('SOURCE_NOT_FOUND');
+    const id = uuid();
+    await this.store.query(scope, 'INSERT INTO brain_source_erasures(id,tenant_id,workspace_id,source_id,status,requested_by,approval_request_id,approval_input_hash,retention_policy,external_blob_refs,last_error_code) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11) ON CONFLICT DO NOTHING',
+    [id, scope.tenantId, scope.workspaceId, request.sourceId, 'waiting_cloud', actorId, approvalRequestId, inputHash, row.retention, JSON.stringify(row.external_blob_refs), 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE']);
+    const existing = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
+      'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND (source_id=$3 OR (approval_request_id=$4 AND approval_input_hash=$5)) ORDER BY created_at LIMIT 1', [scope.tenantId, scope.workspaceId, request.sourceId, approvalRequestId, inputHash]);
+    const erasure = existing.rows[0];
+    if (!erasure) throw new Error('ERASURE_INTENT_CREATE_FAILED');
+    if (erasure.attempts > 0) return erasureRequestView(erasure);
+    await this.store.query(scope, `INSERT INTO brain_source_erasure_attempts(id,tenant_id,workspace_id,erasure_id,actor_id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,error_code)
+      VALUES ($1,$2,$3,$4,$5,'waiting_cloud','[]'::jsonb,'[]'::jsonb,$6,'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE') ON CONFLICT DO NOTHING`,
+    [uuid(), scope.tenantId, scope.workspaceId, erasure.id, actorId, erasure.retention_policy]);
+    return erasureRequestView(erasure);
+  }
+
+  /** Retry is explicit and bounded. This records the dependency blocker; it never deletes a shared object itself. */
+  async retrySourceErasure(scope: Scope, actorId: string, input: unknown) {
+    const { erasureId, approvalRequestId } = ErasureRetryInput.parse(input);
+    const old = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
+      'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, erasureId]);
+    const row = old.rows[0];
+    if (!row) throw new Error('ERASURE_NOT_FOUND');
+    if (row.status === 'complete') return erasureView(row);
+    if (Number(row.attempts) >= 5) throw new Error('ERASURE_RETRY_LIMIT');
+    if (row.status !== 'waiting_cloud') throw new Error('ERASURE_PRIVILEGED_WORKFLOW_REQUIRED');
+    await this.assertErasureApproval(scope, approvalRequestId, { erasureId, attempt: Number(row.attempts) + 1 }, 'brain.sources.erase.retry');
+    const attempts = Number(row.attempts) + 1;
+    await this.store.query(scope, `INSERT INTO brain_source_erasure_attempts(id,tenant_id,workspace_id,erasure_id,actor_id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,error_code)
+      VALUES ($1,$2,$3,$4,$5,'waiting_cloud','[]'::jsonb,'[]'::jsonb,$6,'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE')`, [uuid(), scope.tenantId, scope.workspaceId, erasureId, actorId, row.retention_policy]);
+    await this.store.query(scope, "UPDATE brain_source_erasures SET attempts=$1,last_error_code='PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE',updated_at=now() WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4", [attempts, scope.tenantId, scope.workspaceId, erasureId]);
+    return { ...erasureRequestView({ ...row, attempts }), status: 'waiting_cloud' as const, lastErrorCode: 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE', completionReceipt: null };
+  }
+
+  async sourceErasureStatus(scope: Scope, input: unknown) {
+    const { erasureId, limit, cursor } = ErasureStatusInput.parse(input);
+    const result = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
+      'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, erasureId]);
+    if (!result.rows[0]) throw new Error('ERASURE_NOT_FOUND');
+    const attempts = await this.store.query<Record<string, unknown> & { id: string; occurred_at: string; checked_blob_refs: string[]; deleted_blob_refs: string[]; retention_policy: string; audit_reference: string | null; error_code: string | null; outcome: string }>(scope, `SELECT id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,audit_reference,error_code,occurred_at
+      FROM brain_source_erasure_attempts WHERE tenant_id=$1 AND workspace_id=$2 AND erasure_id=$3
+        AND ($4::timestamptz IS NULL OR (occurred_at,id)<($4,$5::uuid)) ORDER BY occurred_at DESC,id DESC LIMIT $6`,
+    [scope.tenantId, scope.workspaceId, erasureId, cursor?.occurredAt ?? null, cursor?.id ?? null, limit + 1]);
+    const hasMore = attempts.rows.length > limit;
+    const items = attempts.rows.slice(0, limit);
+    const last = items.at(-1);
+    return { ...erasureView(result.rows[0]), audit: { items, nextCursor: hasMore && last ? { occurredAt: new Date(last.occurred_at).toISOString(), id: last.id } : null } };
+  }
+
+  private async assertErasureApproval(scope: Scope, approvalRequestId: string, input: unknown, capabilityId: string) {
+    const inputHash = await sha256Hex(canonicalJson(input));
+    const result = await this.store.query<IdRow>(scope, `SELECT r.id FROM approval_requests r JOIN approval_decisions d
+      ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.request_id=r.id
+      WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.id=$3 AND r.capability_id=$4
+        AND r.input_hash=$5 AND r.expires_at>now() AND d.decision='approved' AND d.valid=true
+        AND (r.capability_id<>'brain.sources.erase.retry' OR d.decided_by<>r.requested_by) LIMIT 1`,
+    [scope.tenantId, scope.workspaceId, approvalRequestId, capabilityId, inputHash]);
+    if (!result.rows.length) throw new Error('ERASURE_APPROVAL_INVALID');
+  }
+
+  async listMemories(scope: Scope, input: unknown = {}) {
+    const parsed = MemoryListInput.parse(input);
+    const limit = parsed.limit;
+    const rows = await this.store.query<Record<string, unknown> & { id: string; updated_at: string }>(scope, `SELECT id,memory_type,title,content,source_id,source_version_id,confidence,importance,effective_from,effective_to,supersedes_id,updated_at
+      FROM brain_memories WHERE tenant_id=$1 AND workspace_id=$2 AND ($3::text IS NULL OR memory_type=$3)
+        AND ($4::timestamptz IS NULL OR (updated_at,id)<($4,$5::uuid)) ORDER BY updated_at DESC,id DESC LIMIT $6`,
+    [scope.tenantId, scope.workspaceId, parsed.memoryType ?? null, parsed.cursor?.updatedAt ?? null, parsed.cursor?.id ?? null, limit + 1]);
+    const hasMore = rows.rows.length > limit;
+    const items = rows.rows.slice(0, limit);
+    const last = items.at(-1);
+    return { items, nextCursor: hasMore && last ? { updatedAt: new Date(last.updated_at).toISOString(), id: last.id } : null };
   }
 }
 
@@ -183,6 +269,15 @@ function splitChunks(text: string, size: number, overlap: number): string[] {
     start = Math.max(start + 1, end - overlap);
   }
   return parts;
+}
+
+function erasureView(row: { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }) {
+  return { id: row.id, sourceId: row.source_id, status: row.status as 'waiting_cloud' | 'retryable_failure' | 'local_purge_pending' | 'complete', attempts: Number(row.attempts), retentionPolicy: row.retention_policy, externalBlobRefs: row.external_blob_refs, lastErrorCode: row.last_error_code, completionReceipt: row.completion_receipt };
+}
+
+function erasureRequestView(row: { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null }) {
+  if (row.status !== 'waiting_cloud') throw new Error('ERASURE_PRIVILEGED_WORKFLOW_REQUIRED');
+  return { id: row.id, sourceId: row.source_id, status: 'waiting_cloud' as const, attempts: Number(row.attempts), retentionPolicy: row.retention_policy, externalBlobRefs: row.external_blob_refs, lastErrorCode: row.last_error_code, completionReceipt: null };
 }
 
 function zProcedure(input: { title: string; type: 'skill' | 'sop' | 'xyra_pattern'; body: string; successfulRunId?: string }) {
