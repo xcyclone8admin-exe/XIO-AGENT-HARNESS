@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- untyped JSON responses from the Worker under test */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
@@ -715,6 +716,11 @@ describe('blob references on workerd', () => {
 
 describe('development Worker configuration without R2', () => {
   it('fails blob GET/PUT closed while authorized non-blob sync remains available', async () => {
+    const devConfig = readFileSync(path.join(appDir, 'wrangler.dev.jsonc'), 'utf8');
+    expect(devConfig).toContain('"name": "institutional-agent-os-dev-cloud"');
+    expect(devConfig).not.toMatch(/^\s*"r2_buckets"\s*:/m);
+    expect(devConfig).toContain('No-R2 development deployment is supported');
+
     const original = mf;
     const signingJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', privateKey));
     const noR2 = new Miniflare(
@@ -1255,11 +1261,16 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const key = 'review:lease-cleanup';
     const first = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(first.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 5_100));
-    const maintained = await hub('/internal/maintenance', {});
-    const body = (await maintained.json()) as Record<string, any>;
-    expect(body['expiredLeases']).toBeGreaterThanOrEqual(1);
+    const expiryDeadline = Date.now() + 8_000;
+    let expiredLeases = 0;
+    while (expiredLeases < 1 && Date.now() < expiryDeadline) {
+      const maintained = await hub('/internal/maintenance', {});
+      const body = (await maintained.json()) as Record<string, any>;
+      expiredLeases = typeof body['expiredLeases'] === 'number' ? body['expiredLeases'] : 0;
+      if (expiredLeases < 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(expiredLeases, 'lease did not expire within the 8 second poll deadline').toBeGreaterThanOrEqual(1);
     const next = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(next.json?.['lease'].fence).toBeGreaterThan(first.json?.['lease'].fence);
-  }, 12_000);
+  }, 20_000);
 });

@@ -44,5 +44,6 @@
   // Secret bindings supplied by the scoped deployment broker, never committed here:
   // NEON_DATABASE_URL, HUB_INTERNAL_TOKEN, AUTH_JWT_JWK, AUTH_SIGNING_JWK,
   // BLOB_ACCESS_SECRET, WEBHOOK_SECRET.
-  // Required before deploy: provision R2 bucket and add {"binding":"BLOBS","bucket_name":"<verified-name>"}.
+  // No-R2 development deployment is supported for non-blob paths; blob endpoints return 503.
+  // Add BLOBS only after R2 activation and verified bucket provisioning; live blob/erasure checks stay blocked meanwhile.
 }
