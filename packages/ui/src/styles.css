@@ -1,0 +1,224 @@
+/*
+ * Original design system (ADR-0007). "Graphite + Signal": graphite neutrals, one warm Signal accent,
+ * semantic tones, pillar tints only as small glyph accents. Tokens are CSS variables (OKLCH) and are
+ * exposed to Tailwind v4 through @theme so utilities like bg-surface / text-fg / border-line work.
+ * Theme: <html data-theme="light|dark"> (absent = follow system). Density: <html data-density="compact">.
+ */
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@import '@fontsource/ibm-plex-serif/400.css';
+
+:root {
+  color-scheme: light;
+  --xy-bg: oklch(0.982 0.002 250);
+  --xy-surface: oklch(1 0 0);
+  --xy-surface-2: oklch(0.968 0.003 250);
+  --xy-surface-3: oklch(0.942 0.004 250);
+  --xy-line: oklch(0.905 0.004 250);
+  --xy-line-strong: oklch(0.83 0.006 250);
+  --xy-fg: oklch(0.225 0.012 258);
+  --xy-fg-muted: oklch(0.44 0.013 258);
+  --xy-fg-subtle: oklch(0.56 0.012 258);
+  --xy-accent: oklch(0.555 0.165 42);
+  --xy-accent-hover: oklch(0.51 0.16 42);
+  --xy-accent-fg: oklch(0.995 0 0);
+  --xy-accent-soft: oklch(0.955 0.035 55);
+  --xy-accent-text: oklch(0.5 0.15 42);
+  --xy-positive: oklch(0.52 0.13 155);
+  --xy-positive-soft: oklch(0.955 0.04 155);
+  --xy-negative: oklch(0.53 0.19 25);
+  --xy-negative-soft: oklch(0.96 0.03 25);
+  --xy-caution: oklch(0.52 0.12 75);
+  --xy-caution-soft: oklch(0.96 0.05 85);
+  --xy-info: oklch(0.52 0.13 248);
+  --xy-info-soft: oklch(0.96 0.03 248);
+  --xy-focus: oklch(0.6 0.16 248);
+  --xy-overlay: oklch(0.2 0.01 258 / 0.42);
+  --xy-shadow-1: 0 1px 2px oklch(0.2 0.01 258 / 0.06), 0 1px 1px oklch(0.2 0.01 258 / 0.04);
+  --xy-shadow-2: 0 8px 24px oklch(0.2 0.01 258 / 0.12), 0 2px 6px oklch(0.2 0.01 258 / 0.08);
+  --xy-font-size: 14px;
+  --xy-row: 36px;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --xy-bg: oklch(0.158 0.006 258);
+  --xy-surface: oklch(0.192 0.007 258);
+  --xy-surface-2: oklch(0.222 0.008 258);
+  --xy-surface-3: oklch(0.256 0.009 258);
+  --xy-line: oklch(0.285 0.009 258);
+  --xy-line-strong: oklch(0.36 0.01 258);
+  --xy-fg: oklch(0.945 0.004 258);
+  --xy-fg-muted: oklch(0.74 0.01 258);
+  --xy-fg-subtle: oklch(0.62 0.01 258);
+  --xy-accent: oklch(0.76 0.145 58);
+  --xy-accent-hover: oklch(0.8 0.14 60);
+  --xy-accent-fg: oklch(0.2 0.03 50);
+  --xy-accent-soft: oklch(0.3 0.055 52);
+  --xy-accent-text: oklch(0.8 0.13 62);
+  --xy-positive: oklch(0.76 0.14 155);
+  --xy-positive-soft: oklch(0.29 0.05 155);
+  --xy-negative: oklch(0.72 0.16 25);
+  --xy-negative-soft: oklch(0.3 0.06 25);
+  --xy-caution: oklch(0.82 0.13 82);
+  --xy-caution-soft: oklch(0.31 0.06 82);
+  --xy-info: oklch(0.75 0.11 248);
+  --xy-info-soft: oklch(0.29 0.05 248);
+  --xy-focus: oklch(0.72 0.13 248);
+  --xy-overlay: oklch(0.05 0 0 / 0.6);
+  --xy-shadow-1: 0 1px 2px oklch(0 0 0 / 0.4);
+  --xy-shadow-2: 0 12px 32px oklch(0 0 0 / 0.5), 0 2px 6px oklch(0 0 0 / 0.35);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --xy-bg: oklch(0.158 0.006 258);
+    --xy-surface: oklch(0.192 0.007 258);
+    --xy-surface-2: oklch(0.222 0.008 258);
+    --xy-surface-3: oklch(0.256 0.009 258);
+    --xy-line: oklch(0.285 0.009 258);
+    --xy-line-strong: oklch(0.36 0.01 258);
+    --xy-fg: oklch(0.945 0.004 258);
+    --xy-fg-muted: oklch(0.74 0.01 258);
+    --xy-fg-subtle: oklch(0.62 0.01 258);
+    --xy-accent: oklch(0.76 0.145 58);
+    --xy-accent-hover: oklch(0.8 0.14 60);
+    --xy-accent-fg: oklch(0.2 0.03 50);
+    --xy-accent-soft: oklch(0.3 0.055 52);
+    --xy-accent-text: oklch(0.8 0.13 62);
+    --xy-positive: oklch(0.76 0.14 155);
+    --xy-positive-soft: oklch(0.29 0.05 155);
+    --xy-negative: oklch(0.72 0.16 25);
+    --xy-negative-soft: oklch(0.3 0.06 25);
+    --xy-caution: oklch(0.82 0.13 82);
+    --xy-caution-soft: oklch(0.31 0.06 82);
+    --xy-info: oklch(0.75 0.11 248);
+    --xy-info-soft: oklch(0.29 0.05 248);
+    --xy-focus: oklch(0.72 0.13 248);
+    --xy-overlay: oklch(0.05 0 0 / 0.6);
+    --xy-shadow-1: 0 1px 2px oklch(0 0 0 / 0.4);
+    --xy-shadow-2: 0 12px 32px oklch(0 0 0 / 0.5), 0 2px 6px oklch(0 0 0 / 0.35);
+  }
+}
+
+:root[data-density='compact'] {
+  --xy-font-size: 13px;
+  --xy-row: 30px;
+}
+
+@theme {
+  --color-bg: var(--xy-bg);
+  --color-surface: var(--xy-surface);
+  --color-surface-2: var(--xy-surface-2);
+  --color-surface-3: var(--xy-surface-3);
+  --color-line: var(--xy-line);
+  --color-line-strong: var(--xy-line-strong);
+  --color-fg: var(--xy-fg);
+  --color-fg-muted: var(--xy-fg-muted);
+  --color-fg-subtle: var(--xy-fg-subtle);
+  --color-accent: var(--xy-accent);
+  --color-accent-hover: var(--xy-accent-hover);
+  --color-accent-fg: var(--xy-accent-fg);
+  --color-accent-soft: var(--xy-accent-soft);
+  --color-accent-text: var(--xy-accent-text);
+  --color-positive: var(--xy-positive);
+  --color-positive-soft: var(--xy-positive-soft);
+  --color-negative: var(--xy-negative);
+  --color-negative-soft: var(--xy-negative-soft);
+  --color-caution: var(--xy-caution);
+  --color-caution-soft: var(--xy-caution-soft);
+  --color-info: var(--xy-info);
+  --color-info-soft: var(--xy-info-soft);
+  --color-focus: var(--xy-focus);
+  --color-overlay: var(--xy-overlay);
+
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  --font-serif: 'IBM Plex Serif', ui-serif, Georgia, serif;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+
+  --shadow-1: var(--xy-shadow-1);
+  --shadow-2: var(--xy-shadow-2);
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.3, 0, 0, 1.15);
+}
+
+html {
+  font-size: var(--xy-font-size);
+  font-family: var(--font-sans);
+  background: var(--xy-bg);
+  color: var(--xy-fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--xy-bg);
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--xy-focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--xy-accent-soft);
+}
+
+@keyframes xy-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+@keyframes xy-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.xy-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--xy-surface-2) 25%,
+    var(--xy-surface-3) 37%,
+    var(--xy-surface-2) 63%
+  );
+  background-size: 400% 100%;
+  animation: xy-shimmer 1.4s ease infinite;
+}
+.xy-enter {
+  animation: xy-fade-in 200ms var(--ease-standard) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
