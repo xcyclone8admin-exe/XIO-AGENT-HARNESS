@@ -1,0 +1,66 @@
+import { defineCapability } from '@xyra/contracts';
+import { z } from 'zod';
+import { GuardrailLimits } from './risk';
+
+const Uuid = z.uuid();
+const Units = z.string().regex(/^(0|-?[1-9]\d{0,37})$/);
+const OrderView = z.object({
+  id: Uuid, portfolio_id: Uuid, instrument_id: Uuid, symbol: z.string(), side: z.enum(['buy', 'sell']), order_type: z.enum(['market', 'limit']),
+  quantity_units: Units, limit_price_units: Units.nullable(), status: z.enum(['proposed', 'approved', 'rejected', 'submitted', 'partially_filled', 'filled', 'cancelled', 'expired']),
+  environment: z.literal('paper'), created_at: z.string(),
+});
+const PortfolioView = z.object({ id: Uuid, name: z.string(), base_asset: z.string(), book_id: Uuid, environment: z.literal('paper'), status: z.enum(['active','paused','closed']) });
+const InstrumentView = z.object({ id: Uuid, symbol: z.string(), asset_class: z.string(), quantity_scale: z.number(), exchange_code: z.string().nullable() });
+const Summary = z.object({ portfolioId: Uuid, environment: z.literal('paper'), cashUnits: Units, navUnits: Units, positions: z.array(z.object({ instrumentId: Uuid, symbol: z.string(), quantityUnits: Units, priceUnits: Units, marketValueUnits: Units })) });
+const Empty = z.object({});
+
+export const investCapabilities = {
+  portfolios: defineCapability({ id: 'invest.portfolios.list', title: 'Portfolios', description: 'List PAPER investment portfolios',
+    kind: 'read', permission: 'invest:portfolio:read', input: Empty, output: z.array(PortfolioView) }),
+  summary: defineCapability({ id: 'invest.portfolios.summary', title: 'PAPER portfolio summary', description: 'Ledger-derived cash, positions and NAV for one PAPER portfolio',
+    kind: 'read', permission: 'invest:portfolio:read', input: z.object({ portfolioId: Uuid }), output: Summary }),
+  instruments: defineCapability({ id: 'invest.instruments.list', title: 'Instruments', description: 'List active investment instruments',
+    kind: 'read', permission: 'invest:market:read', input: Empty, output: z.array(InstrumentView) }),
+  orders: defineCapability({ id: 'invest.orders.list', title: 'Paper orders', description: 'List PAPER orders and their fills',
+    kind: 'read', permission: 'invest:order:read', input: z.object({ portfolioId: Uuid.optional() }), output: z.array(OrderView) }),
+  createPortfolio: defineCapability({ id: 'invest.portfolios.create', title: 'Create PAPER portfolio', description: 'Create isolated PAPER book and ledger accounts',
+    kind: 'write', permission: 'invest:portfolio:write', agentCallable: false,
+    input: z.object({ name: z.string().trim().min(1).max(160), baseAsset: z.string().regex(/^[A-Z0-9][A-Z0-9._:-]{0,31}$/) }).strict(), output: PortfolioView }),
+  fundPortfolio: defineCapability({ id: 'invest.portfolios.fund-paper', title: 'Fund PAPER portfolio', description: 'Record an explicit PAPER-only opening cash journal',
+    kind: 'write', permission: 'invest:portfolio:fund', agentCallable: false,
+    input: z.object({ portfolioId: Uuid, units: z.string().regex(/^[1-9]\d{0,37}$/), reference: z.string().min(1).max(200) }).strict(),
+    output: z.object({ transactionId: Uuid, environment: z.literal('paper') }) }),
+  createInstrument: defineCapability({ id: 'invest.instruments.create', title: 'Register instrument', description: 'Register an instrument and position accounting asset',
+    kind: 'write', permission: 'invest:market:ingest', agentCallable: false,
+    input: z.object({ symbol: z.string().trim().min(1).max(32), assetClass: z.enum(['equity','crypto','fixed_income','fund']), quantityScale: z.int().min(0).max(18), exchangeCode: z.string().max(32).nullable() }).strict(), output: z.object({ id: Uuid, symbol: z.string() }) }),
+  recordPrice: defineCapability({ id: 'invest.market.record-price', title: 'Record market price', description: 'Append source-stamped market data for PAPER risk and simulation',
+    kind: 'write', permission: 'invest:market:ingest', agentCallable: false,
+    input: z.object({ instrumentId: Uuid, priceUnits: Units.refine((v) => BigInt(v) > 0n), source: z.string().min(1).max(80), sourceAt: z.iso.datetime({ offset: true }), volatilityBps: z.int().min(0).max(1_000_000), payloadHash: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+    output: z.object({ id: Uuid, received_at: z.string() }) }),
+  recordMarketSession: defineCapability({ id: 'invest.market.record-session', title: 'Record market session', description: 'Append exchange session calendar data for fail-closed pre-trade checks',
+    kind: 'write', permission: 'invest:market:ingest', agentCallable: false,
+    input: z.object({ exchangeCode: z.string().min(1).max(32), sessionDate: z.iso.date(), opensAt: z.iso.datetime({ offset: true }), closesAt: z.iso.datetime({ offset: true }), isOpen: z.boolean(), source: z.string().min(1).max(80) }).strict(),
+    output: z.object({ received_at: z.string() }) }),
+  createMandate: defineCapability({ id: 'invest.mandates.create', title: 'Create approved mandate version', description: 'Record an effective-dated versioned PAPER investment policy with complete hard limits',
+    kind: 'write', permission: 'invest:mandate:manage', agentCallable: false,
+    input: z.object({ portfolioId: Uuid, version: z.int().min(1), effectiveFrom: z.iso.datetime({ offset: true }), effectiveUntil: z.iso.datetime({ offset: true }).nullable(),
+      allowedAssetClasses: z.array(z.enum(['equity','crypto','fixed_income','fund'])).min(1), allowedInstrumentIds: z.array(Uuid).max(500), benchmark: z.string().min(1).max(32), limits: GuardrailLimits }).strict(),
+    output: z.object({ id: Uuid, version: z.number(), status: z.literal('approved') }) }),
+  propose: defineCapability({ id: 'invest.orders.propose', title: 'Propose PAPER order', description: 'Size and risk-check an order from stored ledger and market data',
+    kind: 'write', permission: 'invest:order:propose', agentCallable: false,
+    input: z.object({ portfolioId: Uuid, instrumentId: Uuid, side: z.enum(['buy','sell']), orderType: z.enum(['market','limit']),
+      limitPriceUnits: Units.optional(), stopPriceUnits: Units, riskBps: z.int().min(1).max(1000), idempotencyKey: z.string().min(1).max(200) }).strict(),
+    output: OrderView }),
+  approve: defineCapability({ id: 'invest.orders.approve', title: 'Approve PAPER order', description: 'Approve a risk-cleared PAPER order',
+    kind: 'write', permission: 'invest:order:approve', agentCallable: false,
+    input: z.object({ orderId: Uuid }), output: OrderView }),
+  execute: defineCapability({ id: 'invest.orders.execute-paper', title: 'Execute PAPER fill', description: 'Fill an approved order at a stored PAPER market quote and post ledger entries atomically',
+    kind: 'write', permission: 'invest:order:execute', agentCallable: false,
+    input: z.object({ orderId: Uuid }), output: z.object({ order: OrderView, fillId: Uuid, transactionId: Uuid, environment: z.literal('paper') }) }),
+  cancel: defineCapability({ id: 'invest.orders.cancel', title: 'Cancel PAPER order', description: 'Cancel an unfilled PAPER order',
+    kind: 'write', permission: 'invest:order:cancel', agentCallable: false, input: z.object({ orderId: Uuid }), output: OrderView }),
+  killSwitch: defineCapability({ id: 'invest.orders.set-kill-switch', title: 'Halt PAPER trading', description: 'Halt new orders and cancel open PAPER orders for a portfolio; resuming requires this explicit action',
+    kind: 'write', permission: 'invest:order:kill-switch', agentCallable: false,
+    input: z.object({ portfolioId: Uuid, engaged: z.boolean(), reason: z.string().min(1).max(500) }).strict(),
+    output: z.object({ portfolioId: Uuid, engaged: z.boolean(), cancelledOrders: z.number() }) }),
+};
