@@ -9,7 +9,8 @@
   },
   "exports": {
     "./manifest": "./manifest.ts",
-    "./contracts": "./contracts.ts"
+    "./contracts": "./contracts.ts",
+    "./server": "./server/service.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
