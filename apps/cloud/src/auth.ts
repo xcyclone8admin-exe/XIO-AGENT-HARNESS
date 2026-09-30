@@ -122,7 +122,14 @@ export async function verifyAccessToken(request: Request, config: JwtVerifierCon
     const jwk = JSON.parse(config.verificationJwk) as JsonWebKey;
     if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || typeof jwk.x !== 'string')
       return { ok: false, code: 'AUTH_NOT_CONFIGURED' };
-    key = await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['verify']);
+    // Import only the public key material; runtimes differ on which optional JWK members they accept.
+    key = await crypto.subtle.importKey(
+      'jwk',
+      { kty: jwk.kty, crv: jwk.crv, x: jwk.x },
+      { name: 'Ed25519' },
+      false,
+      ['verify'],
+    );
   } catch {
     return { ok: false, code: 'AUTH_NOT_CONFIGURED' };
   }

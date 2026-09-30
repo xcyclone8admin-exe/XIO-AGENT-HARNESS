@@ -1,3 +1,6 @@
+import { SERVER_STAMPED_FIELDS } from '@xyra/contracts';
+import coreManifest from '@xyra/mod-core/manifest';
+import opsManifest from '@xyra/mod-ops/manifest';
 import type { CurrentMembership } from './model';
 
 export type SyncClass = 'lww' | 'append' | 'local';
@@ -7,78 +10,54 @@ export interface TableRule {
   readonly class: SyncClass;
   readonly authority: WriteAuthority;
   readonly permission?: string;
-  readonly guardedColumns?: readonly string[];
-  readonly allowedColumns?: readonly string[];
-  /** Append tables: the server stamps the author and time columns; clients may not supply them. */
-  readonly stamp?: { readonly actor: string; readonly time: string };
+  readonly guardedColumns: readonly string[];
+  /** Device-writable fields. Empty means every field is rejected (fail closed). */
+  readonly allowedColumns: readonly string[];
+  /** Column the Worker stamps with the verified principal on insert. */
+  readonly actorField?: string;
 }
 
-const SERVER: TableRule = { class: 'lww', authority: 'server' };
+interface DeclaredTable {
+  readonly name: string;
+  readonly class: SyncClass;
+  readonly authority: WriteAuthority;
+  readonly guardedColumns: readonly string[];
+  readonly allowedFields?: readonly string[] | undefined;
+  readonly actorField?: string | undefined;
+  readonly writePermission?: string | undefined;
+}
 
 /**
- * The frozen platform + ops manifests available at Worker implementation start.
- * An unknown table rejects rather than becoming device-writable. A generated
- * manifest feed is a required shared integration before more modules can sync.
+ * Derived from module manifests, never hand-copied, so rules and manifests cannot drift.
+ * An unknown table rejects rather than becoming device-writable. When more modules sync, the
+ * generated registry feed replaces this import list with the same TABLE_RULES shape.
  */
-export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
-  tenants: SERVER,
-  workspaces: SERVER,
-  users: SERVER,
-  memberships: SERVER,
-  approval_requests: {
-    class: 'append',
-    authority: 'append',
-    allowedColumns: ['capability_id', 'input_hash', 'reason', 'expires_at'],
-    stamp: { actor: 'requested_by', time: 'created_at' },
-  },
-  approval_decisions: { class: 'append', authority: 'server' },
-  audit_events: {
-    class: 'append',
-    authority: 'append',
-    allowedColumns: ['action', 'target_type', 'target_id', 'detail'],
-    stamp: { actor: 'actor_id', time: 'occurred_at' },
-  },
-  domain_events: {
-    class: 'append',
-    authority: 'append',
-    allowedColumns: ['event_type', 'aggregate_id', 'payload'],
-    stamp: { actor: 'actor_id', time: 'occurred_at' },
-  },
-  workspace_settings: SERVER,
-  ops_projects: {
-    class: 'lww',
-    authority: 'synced',
-    permission: 'ops:project:write',
-    guardedColumns: ['status'],
-    allowedColumns: ['name', 'description'],
-  },
-  ops_tasks: {
-    class: 'lww',
-    authority: 'synced',
-    permission: 'ops:task:write',
-    guardedColumns: ['status'],
-    allowedColumns: ['project_id', 'title', 'description', 'assignee_id', 'due_at'],
-  },
-  sync_outbox: { class: 'local', authority: 'local' },
-  sync_cursors: { class: 'local', authority: 'local' },
-  sync_conflicts: { class: 'local', authority: 'local' },
-};
+function derive(tables: readonly DeclaredTable[]): Record<string, TableRule> {
+  return Object.fromEntries(
+    tables.map((table) => [
+      table.name,
+      {
+        class: table.class,
+        authority: table.authority,
+        guardedColumns: table.guardedColumns,
+        allowedColumns: table.allowedFields ?? [],
+        ...(table.writePermission ? { permission: table.writePermission } : {}),
+        ...(table.actorField ? { actorField: table.actorField } : {}),
+      } satisfies TableRule,
+    ]),
+  );
+}
 
-const IMMUTABLE = new Set([
-  'id',
-  'tenant_id',
-  'workspace_id',
-  'created_by',
-  'created_at',
-  'tenantId',
-  'workspaceId',
-  'createdBy',
-  'createdAt',
+export const TABLE_RULES: Readonly<Record<string, TableRule>> = derive([
+  ...coreManifest.tables,
+  ...opsManifest.tables,
 ]);
+
+const STAMPED = new Set<string>(SERVER_STAMPED_FIELDS);
 
 export function hasPermission(membership: CurrentMembership, permission: string | undefined): boolean {
   if (membership.role === 'owner' || membership.role === 'admin') return true;
-  // Rules without a named permission (append tables) still exclude read-only roles.
+  // Rules without a named permission still exclude read-only roles.
   if (permission === undefined) return membership.role !== 'viewer' && membership.role !== 'auditor';
   return membership.permissions.includes(permission);
 }
@@ -87,9 +66,9 @@ export function forbiddenField(
   rule: TableRule,
   field: string,
 ): 'IMMUTABLE_FIELD' | 'ACTOR_FIELD' | 'GUARDED_FIELD' | 'INVALID_ROW' | null {
-  if (rule.stamp && (field === rule.stamp.actor || field === rule.stamp.time)) return 'ACTOR_FIELD';
-  if (IMMUTABLE.has(field)) return 'IMMUTABLE_FIELD';
-  if (rule.guardedColumns?.includes(field)) return 'GUARDED_FIELD';
-  if (rule.allowedColumns && !rule.allowedColumns.includes(field)) return 'INVALID_ROW';
+  if (rule.actorField === field) return 'ACTOR_FIELD';
+  if (STAMPED.has(field)) return 'IMMUTABLE_FIELD';
+  if (rule.guardedColumns.includes(field)) return 'GUARDED_FIELD';
+  if (!rule.allowedColumns.includes(field)) return 'INVALID_ROW';
   return null;
 }

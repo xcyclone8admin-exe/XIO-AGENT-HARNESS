@@ -349,7 +349,7 @@ export class WorkspaceHub extends DurableObject<Env> {
     );
     if (updated.revokedAtMs !== undefined && updated.revokedAtMs <= Date.now()) {
       for (const socket of this.ctx.getWebSockets(updated.principalId))
-        socket.close(4001, 'membership_revoked');
+        socket.close(1008, 'membership_revoked');
     }
     return response({ ok: true });
   }

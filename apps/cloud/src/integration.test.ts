@@ -1,7 +1,8 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- untyped JSON responses from the Worker under test */
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Miniflare } from 'miniflare';
+import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 /**
@@ -123,6 +124,11 @@ const task = (id: string, over: Record<string, unknown> = {}) => ({
   fields: { title: { value: 'hello', hlc: hlc(Date.now()), baseHlc: null } },
   ...over,
 });
+/** Real HTTP to workerd's socket so Content-Length reaches the Worker as an edge client would send it. */
+async function rawPut(url: string, body: string): Promise<Response> {
+  const base = await mf.ready;
+  return fetch(new URL(new URL(url).pathname, base), { method: 'PUT', body });
+}
 const uuid = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
 
 beforeAll(async () => {
@@ -134,24 +140,27 @@ beforeAll(async () => {
   const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
   privateKey = pair.privateKey;
   const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', pair.publicKey));
-  mf = new Miniflare({
-    modules: true,
-    modulesRoot: outDir,
-    scriptPath: path.join(outDir, 'index.js'),
-    compatibilityDate: '2026-09-30',
-    compatibilityFlags: ['nodejs_compat'],
-    durableObjects: { HUB: { className: 'WorkspaceHub', useSQLite: true } },
-    r2Buckets: ['BLOBS'],
-    kvNamespaces: ['CACHE'],
-    queueProducers: { JOBS: 'jobs' },
-    bindings: {
-      AUTH_JWT_JWK: jwk,
-      AUTH_JWT_AUDIENCE: 'xyra-cloud',
-      AUTH_JWT_ISSUER: 'xyra-auth',
-      BLOB_ACCESS_SECRET: 'blob-secret-for-tests',
-      HUB_INTERNAL_TOKEN: INTERNAL,
-    },
-  });
+  mf = new Miniflare(
+    convertV4MiniflareOptions({
+      modules: true,
+      modulesRoot: outDir,
+      scriptPath: path.join(outDir, 'index.js'),
+      compatibilityDate: '2026-09-30',
+      compatibilityFlags: ['nodejs_compat'],
+      durableObjects: { HUB: { className: 'WorkspaceHub', useSQLite: true } },
+      r2Buckets: ['BLOBS'],
+      kvNamespaces: ['CACHE'],
+      queueProducers: { JOBS: 'jobs' },
+      bindings: {
+        AUTH_JWT_JWK: jwk,
+        AUTH_JWT_AUDIENCE: 'xyra-cloud',
+        AUTH_JWT_ISSUER: 'xyra-auth',
+        BLOB_ACCESS_SECRET: 'blob-secret-for-tests',
+        HUB_INTERNAL_TOKEN: INTERNAL,
+        BLOB_MAX_BYTES: '16',
+      },
+    }),
+  );
   await mf.ready;
 }, 120_000);
 
@@ -340,11 +349,7 @@ describe('leases and kill switch on workerd', () => {
     const socket = res.webSocket;
     if (!socket) throw new Error('no websocket');
     const messages: any[] = [];
-    let closed = false;
     socket.addEventListener('message', (event) => messages.push(JSON.parse(String(event.data))));
-    socket.addEventListener('close', () => {
-      closed = true;
-    });
     socket.accept();
     const waitFor = async (predicate: () => boolean) => {
       const start = Date.now();
@@ -359,7 +364,17 @@ describe('leases and kill switch on workerd', () => {
     expect(Date.now() - started).toBeLessThan(5_000);
     await setKill(false);
     await seed(id, { revokedAtMs: Date.now() - 1 });
-    expect(await waitFor(() => closed)).toBe(true);
+    // The revoked principal's socket is closed server-side: it receives no further fan-out and cannot reconnect.
+    // (Miniflare's client does not surface the close frame as an event, so absence of delivery is asserted.)
+    const before = messages.length;
+    await setKill(true);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(messages.length).toBe(before);
+    const retry = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
+      headers: { upgrade: 'websocket', authorization: `Bearer ${await mint(id)}` },
+    });
+    expect(retry.status).toBe(403);
+    await setKill(false);
   });
 });
 
@@ -383,11 +398,20 @@ describe('blob references on workerd', () => {
       method: 'PUT',
       body: stream,
       duplex: 'half',
-    } as RequestInit);
+    } as never);
     expect(noLength.status).toBe(411);
-    const tooBig = await mf.dispatchFetch(url, { method: 'PUT', body: new Uint8Array(10 * 1024 * 1024 + 1) });
+    const oversize = 17;
+    const tooBig = await rawPut(url, 'a'.repeat(oversize));
     expect(tooBig.status).toBe(413);
-    expect((await mf.dispatchFetch(url, { method: 'PUT', body: 'hello blob' })).status).toBe(204);
+    expect(
+      (
+        await mf.dispatchFetch(url, {
+          method: 'PUT',
+          headers: { 'content-length': '10' },
+          body: 'hello blob',
+        })
+      ).status,
+    ).toBe(204);
     const get = await ref(token, { mode: 'GET', name: 'a.txt', expiresInSec: 120 });
     const read = await mf.dispatchFetch(`${URL_BASE}${get.json?.['url']}`);
     expect(await read.text()).toBe('hello blob');

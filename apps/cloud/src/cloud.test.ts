@@ -5,6 +5,7 @@ import { signBlobAccess, tenantWorkspaceKey, verifyBlobAccess } from './blobs';
 import { acquireLease, emptyLeaseBook, renewLease, type LeaseBook } from './leases';
 import type { ActivePrincipal, CurrentMembership } from './model';
 import { IDEMPOTENCY_RETENTION_MS, SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from './model';
+import { TABLE_RULES, forbiddenField } from './tables';
 import { IdempotencyKeyReusedError, SyncAuthorityEngine, parseSyncPush } from './sync';
 
 const T1 = '11111111-1111-4111-8111-111111111111';
@@ -192,7 +193,7 @@ describe('sync push authority', () => {
     );
     expect(r.rejected.map((x) => x.code)).toEqual([
       'SERVER_AUTHORITY',
-      'LOCAL_ONLY',
+      'UNKNOWN_TABLE',
       'UNKNOWN_TABLE',
       'APPEND_REQUIRED',
       'UPSERT_REQUIRED',
@@ -314,13 +315,13 @@ describe('sync push authority', () => {
     const r = e.push(principal(), push([change()]), NOW);
     expect(r).toMatchObject({ accepted: 0, conflicts: 0 });
   });
-  it('server-stamps actor and time on append rows and rejects client-supplied actor fields', () => {
+  it('stamps the verified actor on append and ops inserts and rejects device-supplied actor fields', () => {
     const e = new SyncAuthorityEngine();
     const w = (value: unknown) => ({ value, hlc: hlc(NOW), baseHlc: null });
     const good = change({
       table: 'audit_events',
       op: 'append',
-      fields: { action: w('login'), target_type: w('user') },
+      fields: { action: w('login'), target_type: w('user'), occurred_at: w('2020-01-01T00:00:00Z') },
     });
     const forged = change({
       table: 'audit_events',
@@ -328,22 +329,32 @@ describe('sync push authority', () => {
       id: ROW2,
       fields: { action: w('x'), actor_id: w(T2) },
     });
-    const forgedTime = change({
-      table: 'audit_events',
-      op: 'append',
-      id: ROW2,
-      fields: { action: w('x'), occurred_at: w('2000-01-01') },
-    });
     const unlisted = change({
       table: 'domain_events',
       op: 'append',
       fields: { event_type: w('e'), evil: w(1) },
     });
-    const r = e.push(principal(), push([good, forged, forgedTime, unlisted]), NOW);
-    expect(r.rejected.map((x) => x.code)).toEqual(['ACTOR_FIELD', 'ACTOR_FIELD', 'INVALID_ROW']);
+    const opsForged = change({
+      id: '12121212-1212-4121-8121-121212121212',
+      fields: { title: w('t'), created_by: w(T2) },
+    });
+    const r = e.push(principal(), push([good, forged, unlisted, opsForged]), NOW);
+    expect(r.rejected.map((x) => x.code)).toEqual(['ACTOR_FIELD', 'INVALID_ROW', 'ACTOR_FIELD']);
     const stored = e.snapshot().log[0]?.change.fields;
     expect(stored?.['actor_id']?.value).toBe(U1);
-    expect(stored?.['occurred_at']?.value).toBe(new Date(NOW).toISOString());
+    expect(stored?.['occurred_at']?.value).toBe('2020-01-01T00:00:00Z'); // client-provided event time is kept
+    e.push(principal(), push([change({ id: ROW2 })]), NOW);
+    expect(e.snapshot().rows[`ops_tasks:${ROW2}`]?.fields['created_by']?.value).toBe(U1);
+  });
+  it('derives table rules from manifests and fails closed for writable tables without allowedFields', () => {
+    expect(TABLE_RULES['ops_tasks']?.allowedColumns).toContain('title');
+    expect(TABLE_RULES['approval_decisions']).toMatchObject({ class: 'append', authority: 'server' });
+    expect(
+      forbiddenField(
+        { class: 'lww', authority: 'synced', guardedColumns: [], allowedColumns: [] },
+        'anything',
+      ),
+    ).toBe('INVALID_ROW');
   });
   it('keeps approval_decisions server-only and denies read-only roles append', () => {
     const e = new SyncAuthorityEngine();

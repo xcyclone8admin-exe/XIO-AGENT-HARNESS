@@ -147,20 +147,14 @@ function validateChange(
   return { rule };
 }
 
-/** Server-stamped author and time make an appended row attributable to its real author. */
-function stampAppend(
-  change: RowChange,
-  rule: TableRule,
-  principal: ActivePrincipal,
-  nowMs: number,
-): RowChange {
-  if (!rule.stamp) return change;
+/** Server-stamped author on insert makes a row attributable to its verified principal. */
+function stampActor(change: RowChange, rule: TableRule, principal: ActivePrincipal): RowChange {
+  if (!rule.actorField) return change;
   return {
     ...change,
     fields: {
       ...change.fields,
-      [rule.stamp.actor]: { value: principal.principalId, hlc: change.hlc, baseHlc: null },
-      [rule.stamp.time]: { value: new Date(nowMs).toISOString(), hlc: change.hlc, baseHlc: null },
+      [rule.actorField]: { value: principal.principalId, hlc: change.hlc, baseHlc: null },
     },
   };
 }
@@ -208,7 +202,7 @@ export class SyncAuthorityEngine {
 
       if (authorization.rule.authority === 'append') {
         if (!current) {
-          const stamped = stampAppend(change, authorization.rule, principal, nowMs);
+          const stamped = stampActor(change, authorization.rule, principal);
           store.putRow(rowKey, { fields: stamped.fields });
           store.appendLog(stamped);
           accepted += 1;
@@ -229,10 +223,11 @@ export class SyncAuthorityEngine {
         continue;
       }
 
+      const incomingChange = current ? change : stampActor(change, authorization.rule, principal);
       const existingFields = current?.fields ?? {};
       const nextFields: Record<string, FieldWrite> = { ...existingFields };
       const applied: Record<string, FieldWrite> = {};
-      for (const [field, incoming] of Object.entries(change.fields)) {
+      for (const [field, incoming] of Object.entries(incomingChange.fields)) {
         const existing = existingFields[field];
         if (existing) {
           const order = compareHlc(incoming.hlc, existing.hlc);

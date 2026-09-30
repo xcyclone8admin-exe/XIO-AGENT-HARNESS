@@ -20,6 +20,7 @@ export interface Env {
   readonly BLOB_ACCESS_SECRET?: string;
   /** Service-to-DO credential, never exposed by a public route. */
   readonly HUB_INTERNAL_TOKEN?: string;
+  readonly BLOB_MAX_BYTES?: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -228,8 +229,10 @@ app.all('/v1/blobs/access/:token', async (c) => {
     );
   if (access.mode === 'PUT') {
     const length = c.req.header('content-length');
-    if (!length || !/^d+$/.test(length)) return c.json({ code: 'LENGTH_REQUIRED' }, 411);
-    if (Number(length) > MAX_BLOB_BYTES) return c.json({ code: 'BLOB_TOO_LARGE' }, 413);
+    if (!length || !/^[0-9]+$/.test(length)) return c.json({ code: 'LENGTH_REQUIRED' }, 411);
+    // BLOB_MAX_BYTES may only lower the cap (used to exercise the limit cheaply).
+    const cap = Math.min(MAX_BLOB_BYTES, Number(c.env.BLOB_MAX_BYTES) || MAX_BLOB_BYTES);
+    if (Number(length) > cap) return c.json({ code: 'BLOB_TOO_LARGE' }, 413);
     await c.env.BLOBS.put(access.key, c.req.raw.body ?? new Uint8Array(), {
       httpMetadata: { contentType: c.req.header('content-type') ?? 'application/octet-stream' },
     });
