@@ -17,6 +17,9 @@ export default tseslint.config(
       '**/out/**',
       '**/dist/**',
       '**/src/generated/**',
+      'apps/web/src/schema/**',
+      'packages/brain/schema/**',
+      'packages/runtime/schema/**',
       'apps/desktop/**',
       '**/.wrangler/**',
       'coverage/**',
@@ -40,7 +43,14 @@ export default tseslint.config(
     rules: {
       'no-restricted-imports': [
         'error',
-        { patterns: [{ group: ['@xyra/mod-*', '@xyra/web', '@xyra/sidecar', '@xyra/cloud'], message: 'packages/* never import modules or apps.' }] },
+        {
+          patterns: [
+            {
+              group: ['@xyra/mod-*', '@xyra/web', '@xyra/sidecar', '@xyra/cloud'],
+              message: 'packages/* never import modules or apps.',
+            },
+          ],
+        },
       ],
     },
   },
@@ -52,7 +62,10 @@ export default tseslint.config(
         {
           patterns: [
             crossModuleInternals,
-            { group: ['**/server', '**/server/**', 'node:*', '@xyra/db', '@xyra/agent-core', '@xyra/policy'], message: 'UI code cannot import server code, Node APIs or backend packages.' },
+            {
+              group: ['**/server', '**/server/**', 'node:*', '@xyra/db', '@xyra/agent-core', '@xyra/policy'],
+              message: 'UI code cannot import server code, Node APIs or backend packages.',
+            },
           ],
         },
       ],
@@ -66,7 +79,10 @@ export default tseslint.config(
         {
           patterns: [
             crossModuleInternals,
-            { group: ['**/ui', '**/ui/**', 'react', 'react-dom', '@xyra/ui', '@xyra/sdk'], message: 'Server code cannot import UI code.' },
+            {
+              group: ['**/ui', '**/ui/**', 'react', 'react-dom', '@xyra/ui', '@xyra/sdk'],
+              message: 'Server code cannot import UI code.',
+            },
           ],
         },
       ],
