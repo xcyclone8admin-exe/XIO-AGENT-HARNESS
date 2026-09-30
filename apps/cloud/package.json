@@ -10,10 +10,14 @@
   "dependencies": {
     "@xyra/contracts": "0.1.0",
     "@xyra/policy": "0.1.0",
-    "hono": "4.12.8"
+    "hono": "4.12.8",
+    "@xyra/mod-core": "0.1.0",
+    "@xyra/mod-ops": "0.1.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260930.2",
-    "wrangler": "4.145.0"
+    "miniflare": "5.20260930.0-alpha",
+    "wrangler": "4.145.0",
+    "@xyra/core": "0.1.0"
   }
 }
