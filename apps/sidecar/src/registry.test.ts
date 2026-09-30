@@ -48,3 +48,87 @@ test('migrations apply in an alternate valid dependency order', async () => {
     await db.close();
   }
 }, 60_000);
+
+const PG_TYPE: Readonly<Record<string, string>> = {
+  uuid: 'uuid',
+  text: 'text',
+  integer: 'integer',
+  numeric: 'numeric',
+  boolean: 'boolean',
+  'timestamp with time zone': 'timestamptz',
+  date: 'date',
+  jsonb: 'jsonb',
+};
+
+/**
+ * Manifest column specs mirror the migrations (CLD-R-007): type, nullability, requiredOnInsert
+ * (NOT NULL without default) and every `references` backed by a real foreign key. The Worker
+ * validates synced rows with these specs, so drift here would let it accept rows devices reject.
+ */
+test('manifest column specs match the migrated schema', async () => {
+  const db = await openLocalStore();
+  try {
+    await applyPGliteMigrations(db, MIGRATIONS);
+    for (const table of MANIFESTS.flatMap((manifest) => manifest.tables)) {
+      if (!table.columns) continue;
+      const described = await db.query<{
+        column_name: string;
+        data_type: string;
+        is_nullable: string;
+        column_default: string | null;
+      }>(
+        `SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1`,
+        [table.name],
+      );
+      const byName = new Map(described.rows.map((row) => [row.column_name, row]));
+      for (const [name, spec] of Object.entries(table.columns)) {
+        const column = byName.get(name);
+        const where = `${table.name}.${name}`;
+        expect(column, where).toBeDefined();
+        if (!column) continue;
+        expect(PG_TYPE[column.data_type], where).toBe(spec.type);
+        expect(column.is_nullable === 'YES', `${where} nullable`).toBe(spec.nullable);
+        expect(
+          column.is_nullable === 'NO' && column.column_default === null,
+          `${where} requiredOnInsert`,
+        ).toBe(spec.requiredOnInsert);
+        if (spec.references) {
+          const fk = await db.query(
+            `SELECT 1 FROM information_schema.key_column_usage k
+             JOIN information_schema.referential_constraints r
+               ON r.constraint_name = k.constraint_name AND r.constraint_schema = k.constraint_schema
+             JOIN information_schema.table_constraints t
+               ON t.constraint_name = r.unique_constraint_name
+               AND t.constraint_schema = r.unique_constraint_schema
+             WHERE k.table_name = $1 AND k.column_name = $2 AND t.table_name = $3`,
+            [table.name, name, spec.references.table],
+          );
+          expect(fk.rows.length, `${where} references ${spec.references.table}`).toBeGreaterThan(0);
+        }
+      }
+    }
+  } finally {
+    await db.close();
+  }
+}, 60_000);
+
+/** A manifest table without a migration breaks derived grants at startup (SWM-R-014). */
+test('every manifest-declared table exists after the full migration list', async () => {
+  const db = await openLocalStore();
+  try {
+    await applyPGliteMigrations(db, MIGRATIONS);
+    const present = await db.query<{ table_name: string }>(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+    );
+    const names = new Set(present.rows.map((row) => row.table_name));
+    const missing = MANIFESTS.flatMap((manifest) =>
+      manifest.tables
+        .filter((table) => !names.has(table.name))
+        .map((table) => `${manifest.id}:${table.name}`),
+    );
+    expect(missing).toEqual([]);
+  } finally {
+    await db.close();
+  }
+}, 60_000);
