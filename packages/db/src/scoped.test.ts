@@ -23,7 +23,7 @@ beforeAll(async () => {
     db,
     files.map((name) => migration(`platform/${name.slice(0, -4)}`, readFileSync(`${dir}${name}`, 'utf8'))),
   );
-  // Mirrors the core and ops manifest declarations (the sidecar passes MANIFESTS).
+  // Mirrors core, ops, and SWARM manifest declarations (the sidecar passes MANIFESTS).
   await prepareLocalAppRole(db, [
     ...[
       'tenants',
@@ -35,6 +35,23 @@ beforeAll(async () => {
       'ops_tasks',
     ].map((name) => ({ name, class: 'lww' as const })),
     ...['approval_requests', 'approval_decisions', 'audit_events', 'domain_events'].map((name) => ({
+      name,
+      class: 'append' as const,
+    })),
+    {
+      name: 'swarm_agent_profiles',
+      class: 'lww' as const,
+      privilegedColumns: [
+        'capability_grants',
+        'autonomy_level',
+        'secret_scopes',
+        'network_policy',
+        'filesystem_policy',
+        'approval_policy',
+        'eval_history',
+      ],
+    },
+    ...['swarm_runs', 'swarm_run_journal', 'swarm_model_evals', 'swarm_prompt_versions'].map((name) => ({
       name,
       class: 'append' as const,
     })),
