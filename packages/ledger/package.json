@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@electric-sql/pglite": "0.5.8",
     "@xyra/contracts": "0.1.0",
     "@xyra/core": "0.1.0",
     "zod": "4.6.5"

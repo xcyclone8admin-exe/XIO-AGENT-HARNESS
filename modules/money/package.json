@@ -1,0 +1,23 @@
+{
+  "name": "@xyra/mod-money",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "xyraModule": {
+    "id": "money",
+    "dependsOn": []
+  },
+  "exports": {
+    "./manifest": "./manifest.ts",
+    "./contracts": "./contracts.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@xyra/contracts": "0.1.0",
+    "@xyra/core": "0.1.0",
+    "@xyra/db": "0.1.0",
+    "@xyra/ledger": "0.1.0"
+  }
+}

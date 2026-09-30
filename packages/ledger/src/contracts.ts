@@ -17,7 +17,7 @@
 import { defineCapability, type ModuleManifestInput } from '@xyra/contracts';
 import { z } from 'zod';
 
-export const LEDGER_CONTRACT_VERSION = '1.0.0';
+export const LEDGER_CONTRACT_VERSION = '1.1.0';
 
 // ---------------------------------------------------------------------------------------------
 // Scalars
@@ -402,6 +402,8 @@ export type LedgerErrorCode = (typeof LEDGER_ERROR_CODES)[number];
 export interface LedgerScope {
   readonly tenantId: string;
   readonly workspaceId: string;
+  /** Trusted local HLC applied to the same posting transaction and its balance watermark. */
+  readonly hlc?: string;
 }
 
 export interface LedgerApi {

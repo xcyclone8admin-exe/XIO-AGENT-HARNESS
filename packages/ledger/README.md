@@ -1,6 +1,6 @@
-# Ledger contract v1.0.0
+# Ledger contract v1.1.0
 
-The public API and data declarations are frozen for Money, Invest, Studio and Corporate. Existing public names, wire shapes, column types and referenced keys change additively only, under ADR-0016. `src/contracts.ts` is the machine-readable contract. This milestone supplies schemas, capability descriptors, table declarations and exact arithmetic helpers. It does **not** supply a database engine, SQL migrations or registered capabilities yet.
+The public API and data declarations are frozen for Money, Invest, Studio and Corporate. Existing public names, wire shapes, column types and referenced keys change additively only, under ADR-0016. `src/contracts.ts` is the machine-readable contract; version 1.1.0 adds HLC scope support. The current implementation supplies typed schemas, capabilities, exact arithmetic helpers, the Money-owned SQL schema and a PGlite writer for assets, books, accounts, posting, reversal and balances. Query aggregation, reconciliation, other storage adapters, sidecar capability registration and user-interface work remain open.
 
 Import schemas and types from `@xyra/ledger/contracts`; import arithmetic helpers from `@xyra/ledger`. Server implementations consume `LedgerApi`. Only Money hosts the `money.ledger.*` capabilities; dependent modules should not re-register them.
 
@@ -20,7 +20,7 @@ Every ledger table carries non-null `tenant_id uuid` and `workspace_id uuid`. Th
 
 Columns above are non-null except those marked NULL. Receipt columns default to `now()`; other listed fields have no SQL default. Their nullability, bounds and default/required semantics are also declared in `LEDGER_TABLES.columns`. `base_asset` and `asset` reference the scoped asset code; UUID relationships declared with `references` require real scoped FKs. `subject_id` and `correlation_id` are opaque domain identifiers, so Money has no reverse dependency on its consumers.
 
-`ledger_balances`, `ledger_reconciliation_runs` and `ledger_discrepancies` are internal ledger relations. Consumers use the API outputs for these rather than adding foreign keys to their implementation details. Balances are an RLS table, never a materialized view, and carry the required `as_of_hlc` watermark when the engine lands.
+`ledger_balances`, `ledger_reconciliation_runs` and `ledger_discrepancies` are internal ledger relations. Consumers use the API outputs for these rather than adding foreign keys to their implementation details. Balances are an RLS table, never a materialized view, and carry the required `as_of_hlc` watermark. `LedgerScope.hlc` is the trusted scope stamp the engine applies to projection updates; callers must supply the workspace HLC for postings that advance the watermark.
 
 ## Posting and arithmetic semantics
 
@@ -45,4 +45,4 @@ No app-role DELETE grant is required. Journal rows use reversals; mutable record
 
 ## Verification boundary
 
-`src/contracts.test.ts` checks wire rejection, numeric boundaries, generated exact-arithmetic cases, explicit environment inputs, typed manifest compatibility and capability permissions. SQL parity, alternate migration order, two-tenant behavior and engine properties remain required at the next milestone. Passing the current foundation registry tests does not verify ledger tables that have not been migrated.
+`src/contracts.test.ts` checks wire rejection, numeric boundaries, generated exact-arithmetic cases, explicit environment inputs, typed manifest compatibility and capability permissions. `modules/money/tests/ledger-schema.test.ts` applies the platform and Money migrations in PGlite; it checks schema/FK parity, deferred posting checks, live rejection, append immutability, no app-role DELETE, HLC balance projection and tenant isolation. `apps/sidecar/src/registry.test.ts` checks package/manifest dependency parity and alternate module migration order. Neon parity, capability wiring and reconciliation remain required.
