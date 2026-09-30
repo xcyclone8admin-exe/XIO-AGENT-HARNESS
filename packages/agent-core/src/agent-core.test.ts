@@ -1,4 +1,4 @@
-import { defineCapability, type Principal } from '@xyra/contracts';
+﻿import { defineCapability, type Principal } from '@xyra/contracts';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import {
@@ -426,7 +426,12 @@ describe('Night Shift and MCP boundaries', () => {
     const prompts = new PromptRegistry();
     prompts.register({ id: 'charter', version: 1, purpose: 'test', template: 'first', requiredCapabilities: ['text'], outputContract: {}, retiredAt: null });
     prompts.register({ id: 'charter', version: 2, purpose: 'test', template: 'second', requiredCapabilities: ['text'], outputContract: {}, retiredAt: null });
-    expect(prompts.rollback('charter', 1, '2026-01-01T00:00:00.000Z').version).toBe(3);
+    expect(prompts.rollback('charter', 1).version).toBe(3);
+    expect(prompts.current('charter').template).toBe('first');
+    expect(prompts.retire('charter', '2026-01-01T00:00:00.000Z').version).toBe(4);
+    expect(() => prompts.current('charter')).toThrow('PROMPT_RETIRED');
+    expect(prompts.rollback('charter', 2).version).toBe(5);
+    expect(prompts.current('charter').template).toBe('second');
     expect(
       regressionReasons(
         { taskCompletion: 1, toolSuccess: 1, schemaSuccess: 1, hallucinationRate: 0, fallbackRate: 0 },

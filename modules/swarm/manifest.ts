@@ -1,4 +1,4 @@
-import { defineModule } from '@xyra/contracts';
+﻿import { defineModule } from '@xyra/contracts';
 
 /**
  * Frozen v1 table ownership. Append records are immutable journals; schedule configuration is
@@ -67,7 +67,7 @@ export default defineModule({
       class: 'lww',
       authority: 'synced',
       // Privilege-bearing columns are server-checked, never blind device writes.
-      guardedColumns: ['capability_grants', 'autonomy_level', 'secret_scopes', 'network_policy', 'filesystem_policy', 'approval_policy'],
+      guardedColumns: ['capability_grants', 'autonomy_level', 'secret_scopes', 'network_policy', 'filesystem_policy', 'approval_policy', 'eval_history'],
       actorField: 'created_by',
       writePermission: 'swarm:profile:write',
       allowedFields: [
@@ -79,7 +79,6 @@ export default defineModule({
         'budgets',
         'memory_scope',
         'output_schema',
-        'eval_history',
       ],
     },
     {

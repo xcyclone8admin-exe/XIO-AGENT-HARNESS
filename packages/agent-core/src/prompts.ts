@@ -1,4 +1,4 @@
-import type { EvalMetrics, PromptVersion } from './contracts';
+﻿import type { EvalMetrics, PromptVersion } from './contracts';
 
 /** In-memory version registry; persistence is the append-only swarm_prompt_versions table. */
 export class PromptRegistry {
@@ -10,24 +10,40 @@ export class PromptRegistry {
     this.prompts.set(prompt.id, [...versions, prompt].sort((a, b) => a.version - b.version));
   }
 
+  /**
+   * Rows are append-only: the highest version is authoritative. A prompt is retired by appending a
+   * newer version whose retiredAt is set, so a retired latest row means no current prompt.
+   */
   current(id: string): PromptVersion {
-    const versions = this.prompts.get(id) ?? [];
-    const prompt = [...versions].reverse().find((entry) => entry.retiredAt === null);
-    if (!prompt) throw new Error('PROMPT_NOT_FOUND');
-    return prompt;
+    const latest = this.latest(id);
+    if (!latest) throw new Error('PROMPT_NOT_FOUND');
+    if (latest.retiredAt !== null) throw new Error('PROMPT_RETIRED');
+    return latest;
   }
 
-  rollback(id: string, targetVersion: number, at: string): PromptVersion {
-    const versions = this.prompts.get(id) ?? [];
-    const target = versions.find((entry) => entry.version === targetVersion);
+  /** Appends a retired copy of the latest version; earlier rows are never mutated. */
+  retire(id: string, at: string): PromptVersion {
+    const latest = this.latest(id);
+    if (!latest) throw new Error('PROMPT_NOT_FOUND');
+    const retired = { ...latest, version: latest.version + 1, retiredAt: at };
+    this.register(retired);
+    return retired;
+  }
+
+  /** Restores an earlier version's content as a new, live version. */
+  rollback(id: string, targetVersion: number): PromptVersion {
+    const target = (this.prompts.get(id) ?? []).find((entry) => entry.version === targetVersion);
     if (!target) throw new Error('PROMPT_VERSION_NOT_FOUND');
-    const retired = versions.map((entry) => (entry.retiredAt === null ? { ...entry, retiredAt: at } : entry));
-    const restored = { ...target, version: Math.max(...versions.map((entry) => entry.version), 0) + 1, retiredAt: null };
-    this.prompts.set(id, [...retired, restored]);
+    const latest = this.latest(id);
+    const restored = { ...target, version: (latest?.version ?? 0) + 1, retiredAt: null };
+    this.register(restored);
     return restored;
   }
-}
 
+  private latest(id: string): PromptVersion | undefined {
+    return this.prompts.get(id)?.at(-1);
+  }
+}
 export function regressionReasons(previous: EvalMetrics, candidate: EvalMetrics, tolerance = 0.02): string[] {
   if (tolerance < 0 || !Number.isFinite(tolerance)) throw new Error('Invalid regression tolerance');
   const failures: string[] = [];
