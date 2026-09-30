@@ -73,6 +73,8 @@ export class LocalScopedStore {
       await tx.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
       await tx.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
       await tx.query("SELECT set_config('app.hlc', $1, true)", [hlc ?? '']);
+      const role = await tx.query<{ current_user: string }>('SELECT current_user');
+      if (role.rows[0]?.current_user !== 'xyra_server') throw new Error('Local server role not active');
       const client: ScopedTransaction = {
         query: async <T extends Record<string, unknown>>(sql: string, params: unknown[] = []) => {
           assertScopedStatement(sql);
@@ -185,7 +187,10 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
           ...(updatable.length ? [`GRANT UPDATE (${updatable.join(', ')}) ON ${table.name} TO xyra_server`] : []),
         ];
       }
-      return [`GRANT SELECT, INSERT, UPDATE ON ${table.name} TO xyra_server`];
+      // Per-store projections (e.g. ledger_balances) are maintained by SECURITY INVOKER triggers
+      // inside server-scoped posting transactions. Device-owned synced rows stay read-only here.
+      if (authority === 'local') return [`GRANT SELECT, INSERT, UPDATE ON ${table.name} TO xyra_server`];
+      return [`GRANT SELECT ON ${table.name} TO xyra_server`];
     }),
   ];
   const grants = [
