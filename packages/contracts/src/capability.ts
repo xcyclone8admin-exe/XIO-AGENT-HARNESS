@@ -44,9 +44,11 @@ export function defineCapability<I extends z.ZodType, O extends z.ZodType>(
   d: Omit<CapabilityDescriptor<I, O>, 'module' | 'agentCallable' | 'idempotent' | 'risk'> &
     Partial<Pick<CapabilityDescriptor<I, O>, 'agentCallable' | 'idempotent' | 'risk'>>,
 ): CapabilityDescriptor<I, O> {
-  if (!CAP_ID_RE.test(d.id)) throw new Error(`Invalid capability id "${d.id}" (expected module.resource.verb)`);
+  if (!CAP_ID_RE.test(d.id))
+    throw new Error(`Invalid capability id "${d.id}" (expected module.resource.verb)`);
   const module = d.id.split('.')[0] ?? '';
-  if (!d.permission.startsWith(module + ':')) throw new Error(`Capability ${d.id}: permission must be in module "${module}"`);
+  if (!d.permission.startsWith(module + ':'))
+    throw new Error(`Capability ${d.id}: permission must be in module "${module}"`);
   return {
     ...d,
     module,

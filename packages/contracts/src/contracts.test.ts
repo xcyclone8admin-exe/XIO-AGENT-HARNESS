@@ -6,11 +6,25 @@ import {
   isHonestStatus,
   permissionCatalog,
   TableDecl,
+  ColumnSpec,
+  compareDecimal,
+  validateColumnValue,
   type ConnectorStatus,
 } from './index';
 
 describe('TableDecl write surface', () => {
-  const base = { name: 'audit_events', class: 'append', authority: 'append' } as const;
+  const base = {
+    name: 'audit_events',
+    class: 'append',
+    authority: 'append',
+    receivedAtField: 'received_at',
+    columns: {
+      action: { type: 'text', requiredOnInsert: true },
+      actor_id: { type: 'uuid', requiredOnInsert: true },
+      status: { type: 'text' },
+      received_at: { type: 'timestamptz' },
+    },
+  } as const;
   it('accepts allowed fields with a separate actor stamp', () => {
     const table = TableDecl.parse({ ...base, actorField: 'actor_id', allowedFields: ['action'] });
     expect(table.allowedFields).toEqual(['action']);
@@ -54,7 +68,15 @@ describe('defineModule', () => {
       icon: 'list-checks',
       permissions: ['ops:task:read'],
       roleGrants: { viewer: ['ops:task:read'] },
-      tables: [{ name: 'ops_tasks', class: 'lww', authority: 'synced', guardedColumns: ['status'] }],
+      tables: [
+        {
+          name: 'ops_tasks',
+          class: 'lww',
+          authority: 'synced',
+          guardedColumns: ['status'],
+          columns: {},
+        },
+      ],
     });
     expect(guarded.tables[0]?.guardedColumns).toEqual(['status']);
     expect(() =>
@@ -155,5 +177,63 @@ describe('honest connector status', () => {
   it('never lets an unavailable connector claim a live state', () => {
     expect(isHonestStatus(s({ availability: 'not-yet-available' }), now)).toBe(false);
     expect(isHonestStatus(s({ availability: 'not-yet-available', state: 'NOT_CONFIGURED' }), now)).toBe(true);
+  });
+});
+
+describe('TableDecl sync specs (CLD-R-007, CLD-R-013)', () => {
+  it('requires column specs, a receipt column on append tables and typed stamp columns', () => {
+    expect(() =>
+      TableDecl.parse({ name: 'ops_tasks', class: 'lww', authority: 'synced', allowedFields: ['title'] }),
+    ).toThrow(/declare columns/);
+    expect(() =>
+      TableDecl.parse({ name: 'audit_events', class: 'append', authority: 'append', columns: {} }),
+    ).toThrow(/receipt column/);
+    expect(() =>
+      TableDecl.parse({
+        name: 'ops_tasks',
+        class: 'lww',
+        authority: 'synced',
+        allowedFields: ['title'],
+        columns: {},
+      }),
+    ).toThrow(/title needs a column spec/);
+    expect(() =>
+      TableDecl.parse({
+        name: 'ops_tasks',
+        class: 'lww',
+        authority: 'synced',
+        actorField: 'created_by',
+        columns: { created_by: { type: 'text' } },
+      }),
+    ).toThrow(/actor column is a uuid/);
+  });
+});
+
+describe('validateColumnValue', () => {
+  it('enforces type, nullability, length, enum, ranges, scale and size', () => {
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'text', minLength: 1, maxLength: 3 }), 'abcd')).toBe(
+      'LENGTH',
+    );
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'text', enum: ['a'] }), 'b')).toBe('ENUM');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'text' }), { not: 'a string' })).toBe('TYPE');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'uuid' }), 'not-a-uuid')).toBe('TYPE');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'uuid' }), null)).toBe('NULL');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'uuid', nullable: true }), null)).toBeNull();
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'integer' }), '2147483648')).toBe('RANGE');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'integer' }), 7)).toBeNull();
+    const units = ColumnSpec.parse({ type: 'numeric', scale: 0, min: '0' });
+    expect(validateColumnValue(units, '123456789012345678901234567890123456')).toBeNull();
+    expect(validateColumnValue(units, '1.5')).toBe('SCALE');
+    expect(validateColumnValue(units, '-1')).toBe('RANGE');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'numeric' }), 1.5)).toBe('TYPE');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'timestamptz' }), '2026-09-30')).toBe('TYPE');
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'timestamptz' }), '2026-09-30T12:00:00Z')).toBeNull();
+    expect(validateColumnValue(ColumnSpec.parse({ type: 'jsonb', maxBytes: 8 }), { a: 'ééé' })).toBe('SIZE');
+  });
+
+  it('compares decimals exactly', () => {
+    expect(compareDecimal('-0.5', '0')).toBe(-1);
+    expect(compareDecimal('10.10', '10.1')).toBe(0);
+    expect(compareDecimal('99999999999999999999.01', '99999999999999999999')).toBe(1);
   });
 });
