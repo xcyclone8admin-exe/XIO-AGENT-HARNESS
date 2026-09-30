@@ -565,6 +565,58 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     expect((await call('GET', '/v1/sync/conflicts', reader)).status).toBe(200);
   });
 
+  it('CLD-R-003 filters real ops conflict records by agent read grants and advances conflict cursor', async () => {
+    const writer = '48484848-4848-4484-8484-484848484848';
+    const agent = '49494949-4949-4494-8494-494949494949';
+    await seed(writer, { role: 'owner' });
+    await seed(agent, {
+      kind: 'agent',
+      delegatedBy: writer,
+      autonomy: 2,
+      role: 'member',
+      permissions: ['ops:task:write'],
+    });
+    const ownerToken = await mint(writer);
+    const agentToken = await mint(agent, { kind: 'agent', delegated_by: writer, autonomy_level: 2 });
+    const before = await call('GET', '/v1/sync/conflicts?limit=200', ownerToken);
+    expect(before.status).toBe(200);
+    const after = Number(before.json?.['next']);
+    const id = uuid(470);
+    const ms = Date.now();
+    const oldHlc = hlc(ms, 1);
+    const newHlc = hlc(ms, 2);
+    const first = task(id, {
+      hlc: oldHlc,
+      fields: {
+        project_id: { value: PROJECT, hlc: oldHlc, baseHlc: null },
+        title: { value: 'restricted-losing-value-470', hlc: oldHlc, baseHlc: null },
+      },
+    });
+    expect((await call('POST', '/v1/sync/push', ownerToken, pushBody([first]))).json?.['accepted']).toBe(1);
+    const winner = {
+      ...task(id),
+      hlc: newHlc,
+      fields: { title: { value: 'authorized-winning-value-470', hlc: newHlc, baseHlc: null } },
+    };
+    const push = await call('POST', '/v1/sync/push', ownerToken, pushBody([winner]));
+    expect(push.json?.['conflictHistory']).toContainEqual(
+      expect.objectContaining({ rowId: id, field: 'title', losingValue: 'restricted-losing-value-470' }),
+    );
+
+    const ownerPage = await call('GET', `/v1/sync/conflicts?after=${after}&limit=20`, ownerToken);
+    expect(ownerPage.json?.['items']).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({ rowId: id, losingValue: 'restricted-losing-value-470' }),
+      }),
+    );
+    const restrictedPage = await call('GET', `/v1/sync/conflicts?after=${after}&limit=20`, agentToken);
+    expect(restrictedPage.status).toBe(200);
+    expect(restrictedPage.json?.['items']).toEqual([]);
+    expect(restrictedPage.json?.['next']).toBeGreaterThan(after);
+    expect(JSON.stringify(restrictedPage.json)).not.toContain(id);
+    expect(JSON.stringify(restrictedPage.json)).not.toContain('restricted-losing-value-470');
+  });
+
   it('CLD-R-004 denies L0 agent writes and lost delegator grants', async () => {
     const delegated = 'abababab-abab-4bab-8bab-abababababab';
     await seed(delegated, { role: 'manager', permissions: [] });
