@@ -1,0 +1,19 @@
+{
+  "name": "@xyra/ledger",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Decimal-safe append-only double-entry ledger shared by money, invest, studio and corporate (ADR-0010).",
+  "exports": {
+    ".": "./src/index.ts",
+    "./contracts": "./src/contracts.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@xyra/contracts": "0.1.0",
+    "@xyra/core": "0.1.0",
+    "zod": "4.6.5"
+  }
+}
