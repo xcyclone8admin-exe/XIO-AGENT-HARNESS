@@ -1,32 +1,220 @@
-import { DurableObject } from 'cloudflare:workers';
 import { Hono } from 'hono';
+import { signBlobAccess, tenantWorkspaceKey, verifyBlobAccess } from './blobs';
+import { verifyAccessToken } from './auth';
+import type { WorkspaceHub } from './hub';
+
+export { WorkspaceHub } from './hub';
+import type { CandidateClaims } from './model';
+import { hasPermission } from './tables';
 
 export interface Env {
-  readonly NEON_DATABASE_URL: string;
+  /** Runtime app credential only; migrations use a separately held owner credential. */
+  readonly NEON_DATABASE_URL?: string;
   readonly BLOBS: R2Bucket;
   readonly JOBS: Queue;
   readonly HUB: DurableObjectNamespace<WorkspaceHub>;
   readonly CACHE: KVNamespace;
-}
-
-/** The hub will own per-workspace leases and kill-switch broadcast in WP-CLOUD. */
-export class WorkspaceHub extends DurableObject<Env> {
-  override async fetch(): Promise<Response> {
-    return Response.json({ code: 'HUB_NOT_READY' }, { status: 503 });
-  }
+  readonly AUTH_JWT_JWK?: string;
+  readonly AUTH_JWT_AUDIENCE?: string;
+  readonly AUTH_JWT_ISSUER?: string;
+  readonly BLOB_ACCESS_SECRET?: string;
+  /** Service-to-DO credential, never exposed by a public route. */
+  readonly HUB_INTERNAL_TOKEN?: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
-app.get('/v1/health', (c) => c.json({ status: 'ok' }));
+
+function error(code: string, status: 400 | 401 | 403 | 503): Response {
+  return Response.json({ code }, { status });
+}
+
+async function currentHub(c: { env: Env; req: { raw: Request } }): Promise<
+  | { readonly response: Response }
+  | {
+      readonly claims: CandidateClaims;
+      readonly hub: DurableObjectStub<WorkspaceHub>;
+      readonly membership: {
+        readonly role: 'owner' | 'admin' | 'manager' | 'member' | 'viewer' | 'auditor';
+        readonly permissions: readonly string[];
+      };
+    }
+> {
+  const authentication = await verifyAccessToken(c.req.raw, {
+    ...(c.env.AUTH_JWT_JWK ? { verificationJwk: c.env.AUTH_JWT_JWK } : {}),
+    ...(c.env.AUTH_JWT_AUDIENCE ? { audience: c.env.AUTH_JWT_AUDIENCE } : {}),
+    ...(c.env.AUTH_JWT_ISSUER ? { issuer: c.env.AUTH_JWT_ISSUER } : {}),
+  });
+  if (!authentication.ok)
+    return {
+      response: error(authentication.code, authentication.code === 'AUTH_NOT_CONFIGURED' ? 503 : 401),
+    };
+  const hub = c.env.HUB.get(c.env.HUB.idFromName(authentication.claims.activeWorkspaceId));
+  const authorization = await hub.fetch('https://workspace-hub/internal/authorize', {
+    method: 'POST',
+    body: JSON.stringify({ claims: authentication.claims }),
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!authorization.ok) return { response: error('CURRENT_MEMBERSHIP_REQUIRED', 403) };
+  const body = (await authorization.json()) as { membership?: unknown };
+  if (!body.membership || typeof body.membership !== 'object')
+    return { response: error('CURRENT_MEMBERSHIP_REQUIRED', 403) };
+  const membership = body.membership as { role?: unknown; permissions?: unknown };
+  if (
+    !['owner', 'admin', 'manager', 'member', 'viewer', 'auditor'].includes(membership.role as string) ||
+    !Array.isArray(membership.permissions) ||
+    !membership.permissions.every((permission) => typeof permission === 'string')
+  ) {
+    return { response: error('CURRENT_MEMBERSHIP_REQUIRED', 403) };
+  }
+  return {
+    claims: authentication.claims,
+    hub,
+    membership: {
+      role: membership.role as 'owner' | 'admin' | 'manager' | 'member' | 'viewer' | 'auditor',
+      permissions: membership.permissions,
+    },
+  };
+}
+
+async function forwardHub(
+  hub: DurableObjectStub<WorkspaceHub>,
+  path: string,
+  payload: object,
+): Promise<Response> {
+  return hub.fetch(`https://workspace-hub${path}`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+app.get('/v1/health', (c) =>
+  c.json({
+    status: 'ok',
+    neon: c.env.NEON_DATABASE_URL ? 'configured_unverified' : 'blocked_credentials',
+    r2: 'binding_configured_unverified',
+    auth: c.env.AUTH_JWT_JWK ? 'verification_configured' : 'blocked_credentials',
+  }),
+);
+
+app.post('/v1/sync/push', async (c) => {
+  const current = await currentHub(c);
+  if ('response' in current) return current.response;
+  const declaredLength = Number(c.req.header('content-length') ?? '0');
+  if (Number.isFinite(declaredLength) && declaredLength > 1_000_000)
+    return c.json({ code: 'PUSH_TOO_LARGE' }, 413);
+  let request: unknown;
+  try {
+    request = await c.req.json();
+  } catch {
+    return c.json({ code: 'INVALID_JSON' }, 400);
+  }
+  return forwardHub(current.hub, '/internal/sync/push', { claims: current.claims, request });
+});
+
+app.get('/v1/sync/pull', async (c) => {
+  const current = await currentHub(c);
+  if ('response' in current) return current.response;
+  const cursor = c.req.query('cursor');
+  return forwardHub(current.hub, '/internal/sync/pull', {
+    claims: current.claims,
+    ...(cursor ? { cursor } : {}),
+  });
+});
+
+for (const route of ['acquire', 'renew'] as const) {
+  app.post(`/v1/leases/${route}`, async (c) => {
+    const current = await currentHub(c);
+    if ('response' in current) return current.response;
+    let request: unknown;
+    try {
+      request = await c.req.json();
+    } catch {
+      return c.json({ code: 'INVALID_JSON' }, 400);
+    }
+    const body = request && typeof request === 'object' ? request : {};
+    return forwardHub(current.hub, `/internal/lease/${route}`, {
+      claims: current.claims,
+      ...(body as object),
+    });
+  });
+}
+
+app.get('/v1/kill-switch', async (c) => {
+  const current = await currentHub(c);
+  if ('response' in current) return current.response;
+  return forwardHub(current.hub, '/internal/kill-switch/get', { claims: current.claims });
+});
+
+app.post('/v1/blobs/ref', async (c) => {
+  const current = await currentHub(c);
+  if ('response' in current) return current.response;
+  if (!c.env.BLOB_ACCESS_SECRET) return c.json({ code: 'BLOB_SIGNER_UNAVAILABLE' }, 503);
+  let request: unknown;
+  try {
+    request = await c.req.json();
+  } catch {
+    return c.json({ code: 'INVALID_JSON' }, 400);
+  }
+  if (!request || typeof request !== 'object') return c.json({ code: 'INVALID_BLOB_REQUEST' }, 400);
+  const body = request as Record<string, unknown>;
+  const mode = body.mode === 'GET' || body.mode === 'PUT' ? body.mode : null;
+  const name = typeof body.name === 'string' ? body.name : null;
+  const expiresInSec = typeof body.expiresInSec === 'number' ? body.expiresInSec : 0;
+  const permission = mode === 'GET' ? 'core:workspace:read' : 'core:workspace:write';
+  const membership = {
+    ...current.membership,
+    principalId: current.claims.principalId,
+    tenantId: current.claims.tenantId,
+    workspaceId: current.claims.activeWorkspaceId,
+  };
+  if (
+    !mode ||
+    !name ||
+    !Number.isInteger(expiresInSec) ||
+    expiresInSec < 30 ||
+    expiresInSec > 900 ||
+    !hasPermission(membership, permission)
+  ) {
+    return c.json({ code: 'BLOB_ACCESS_DENIED' }, 403);
+  }
+  const key = tenantWorkspaceKey(current.claims.tenantId, current.claims.activeWorkspaceId, name);
+  if (!key) return c.json({ code: 'INVALID_BLOB_NAME' }, 400);
+  const expiresAtMs = Date.now() + expiresInSec * 1000;
+  const token = await signBlobAccess({ key, mode, expiresAtMs }, c.env.BLOB_ACCESS_SECRET);
+  return c.json({ key, mode, expiresAtMs, url: `/v1/blobs/access/${token}` });
+});
+
+app.all('/v1/blobs/access/:token', async (c) => {
+  if (!c.env.BLOB_ACCESS_SECRET) return c.json({ code: 'BLOB_SIGNER_UNAVAILABLE' }, 503);
+  const access = await verifyBlobAccess(c.req.param('token'), c.env.BLOB_ACCESS_SECRET);
+  if (!access || access.mode !== c.req.method) return c.json({ code: 'INVALID_BLOB_REFERENCE' }, 403);
+  if (access.mode === 'PUT') {
+    await c.env.BLOBS.put(access.key, c.req.raw.body ?? new Uint8Array(), {
+      httpMetadata: { contentType: c.req.header('content-type') ?? 'application/octet-stream' },
+    });
+    return new Response(null, { status: 204 });
+  }
+  const object = await c.env.BLOBS.get(access.key);
+  if (!object) return c.json({ code: 'BLOB_NOT_FOUND' }, 404);
+  return new Response(object.body, {
+    headers: { 'content-type': object.httpMetadata?.contentType ?? 'application/octet-stream' },
+  });
+});
+
+/** Passkey enrolment and refresh-family persistence require the Neon auth schema and scoped grants. */
+app.post('/v1/auth/refresh', (c) => c.json({ code: 'AUTH_REFRESH_STORE_UNAVAILABLE' }, 503));
 app.all('/v1/*', (c) => c.json({ code: 'CLOUD_CAPABILITY_NOT_READY' }, 503));
 
 export default {
   fetch: app.fetch,
-  async queue(): Promise<void> {
-    // Never acknowledge jobs while the handler is absent; Queues will retry.
-    throw new Error('CLOUD_QUEUE_HANDLER_NOT_READY');
+  async queue(batch): Promise<void> {
+    // No job is acknowledged until an idempotent consumer exists; Queue retries are intentional.
+    console.warn('CLOUD_QUEUE_HANDLER_NOT_READY', { messages: batch.messages.length });
+    batch.retryAll();
   },
   async scheduled(): Promise<void> {
-    throw new Error('CLOUD_CRON_HANDLER_NOT_READY');
+    // Deliberately no work: Cron wiring is present but has no invented maintenance behavior.
+    console.warn('CLOUD_CRON_HANDLER_NOT_READY');
   },
 } satisfies ExportedHandler<Env>;
