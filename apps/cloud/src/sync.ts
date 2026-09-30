@@ -1,18 +1,30 @@
 import {
   MAX_HLC_DRIFT_MS,
+  MAX_PULL_BYTES,
   MAX_PULL_ROWS,
-  MAX_PUSH_BYTES,
+  MAX_ROW_BYTES,
   PushRequest as PushRequestSchema,
+  SYNC_PROTOCOL_VERSION,
+  SYNC_SCHEMA_VERSION,
   type ConflictRecord,
   type PullResponse,
   type PushRequest,
   type PushResponse,
   type RowChange,
+  type SyncRejection,
   type SyncRejectionCode,
 } from '@xyra/contracts';
-import { IDEMPOTENCY_RETENTION_MS, type ActivePrincipal } from './model';
-import { MemorySyncStore, type FieldWrite, type StoredConflict, type SyncStorePort } from './store';
-import { TABLE_RULES, forbiddenField, hasPermission, type TableRule } from './tables';
+import { decideAccess, type AccessContext } from './access';
+import { IDEMPOTENCY_RETENTION_MS, MAX_INLINE_CONFLICT_BYTES, MAX_PULL_SCAN_ROWS } from './model';
+import { checkRow } from './schema';
+import {
+  MemorySyncStore,
+  byteLength,
+  type FieldWrite,
+  type StoredConflict,
+  type SyncStorePort,
+} from './store';
+import { TABLE_RULES, forbiddenField, ruleFor, type TableRule } from './tables';
 
 interface ParsedHlc {
   readonly physical: number;
@@ -27,13 +39,14 @@ export class IdempotencyKeyReusedError extends Error {
   }
 }
 
-function parseHlc(value: string): ParsedHlc | null {
+function parseHlc(value: string | null | undefined): ParsedHlc | null {
   // Shared encoding (packages/core hlc.ts): `<ms:13 digits>-<counter:4 hex>-<node>`.
-  const match = /^(\d{13})-([0-9a-f]{4})-([a-z0-9]{1,32})$/.exec(value);
+  const match = /^(\d{13})-([0-9a-f]{4})-([a-z0-9]{1,32})$/.exec(value ?? '');
   if (!match || match[1] === undefined || match[2] === undefined || match[3] === undefined) return null;
   return { physical: Number(match[1]), logical: parseInt(match[2], 16), node: match[3] };
 }
 
+/** Plain code-point order on the fixed-width encoding: identical to packages/core compareHlc. */
 export function compareHlc(left: string, right: string): number {
   const a = parseHlc(left);
   const b = parseHlc(right);
@@ -41,12 +54,13 @@ export function compareHlc(left: string, right: string): number {
   return a.physical - b.physical || a.logical - b.logical || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0);
 }
 
-function keyFor(change: RowChange): string {
-  return `${change.table}:${change.id}`;
+function keyFor(table: string, id: string): string {
+  return `${table}:${id}`;
 }
 
-function idempotencyKey(principal: ActivePrincipal, request: PushRequest): string {
-  return `${principal.tenantId}:${principal.activeWorkspaceId}:${principal.principalId}:${request.nodeId}:${request.idempotencyKey}`;
+function idempotencyKey(access: AccessContext, request: PushRequest): string {
+  const { claims } = access;
+  return `${claims.tenantId}:${claims.activeWorkspaceId}:${claims.principalId}:${request.nodeId}:${request.idempotencyKey}`;
 }
 
 function canonical(value: unknown): string {
@@ -73,74 +87,130 @@ function fallbackHash(request: PushRequest): string {
   return canonical(body);
 }
 
-function encodeCursor(seq: bigint): string {
-  return btoa(`v1:${seq.toString(10)}`)
+/** Version identity is checked before any row is parsed (ADR-0003 A1 §G). */
+export function versionsSupported(input: unknown): boolean {
+  if (!input || typeof input !== 'object') return false;
+  const candidate = input as Record<string, unknown>;
+  return (
+    candidate['protocolVersion'] === SYNC_PROTOCOL_VERSION &&
+    candidate['schemaVersion'] === SYNC_SCHEMA_VERSION
+  );
+}
+
+/** Transport bytes are capped by the caller before JSON parsing (CLD-R-008). */
+export function parseSyncPush(input: unknown): PushRequest | null {
+  const parsed = PushRequestSchema.safeParse(input);
+  return parsed.success ? parsed.data : null;
+}
+
+// ---------------------------------------------------------------- cursors
+
+/** Short, stable fingerprint of the tables a caller may read; not a security token. */
+function scopeFingerprint(readable: readonly string[]): string {
+  let hash = 0x811c9dc5;
+  for (const char of readable.join(',')) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+function encodeCursor(seq: bigint, scope: string): string {
+  return btoa(`v2:${seq.toString(10)}:${scope}`)
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/g, '');
 }
 
-function decodeCursor(cursor: string | undefined): bigint | null {
-  if (!cursor) return 0n;
+type DecodedCursor = { readonly seq: bigint; readonly scope: string | null } | null;
+
+function decodeCursor(cursor: string | undefined): DecodedCursor {
+  if (!cursor) return { seq: 0n, scope: null };
+  if (cursor.length > 512) return null;
   const padded = cursor.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (cursor.length % 4)) % 4);
   try {
-    const digits = /^v1:(\d+)$/.exec(atob(padded))?.[1];
-    return digits === undefined ? null : BigInt(digits);
+    const match = /^v2:(\d{1,20}):([0-9a-f]{8})$/.exec(atob(padded));
+    return match?.[1] && match[2] ? { seq: BigInt(match[1]), scope: match[2] } : null;
   } catch {
     return null;
   }
 }
 
-function requestSize(request: PushRequest): number {
-  return new TextEncoder().encode(JSON.stringify(request)).byteLength;
+export type PullOutcome =
+  | { readonly ok: true; readonly response: PullResponse }
+  | { readonly ok: false; readonly code: 'INVALID_CURSOR' | 'RESYNC_REQUIRED' };
+
+// ---------------------------------------------------------------- validation
+
+type Validated =
+  { readonly rule: TableRule } | { readonly code: SyncRejectionCode; readonly reason?: string };
+
+function validateClocks(change: RowChange, nowMs: number): SyncRejectionCode | null {
+  const horizon = nowMs + MAX_HLC_DRIFT_MS;
+  const row = parseHlc(change.hlc);
+  if (!row || row.physical > horizon) return 'CLOCK_SKEW';
+  for (const write of Object.values(change.fields)) {
+    const field = parseHlc(write.hlc);
+    // Every clock used for ordering is bounded, and a field clock may not exceed its row clock.
+    if (!field || field.physical > horizon) return 'CLOCK_SKEW';
+    if (compareHlc(write.hlc, change.hlc) > 0) return 'CLOCK_SKEW';
+    if (write.baseHlc !== null) {
+      if (!parseHlc(write.baseHlc)) return 'INVALID_ROW';
+      if (compareHlc(write.baseHlc, write.hlc) >= 0) return 'CLOCK_SKEW';
+    }
+  }
+  return null;
 }
 
-export function parseSyncPush(input: unknown): PushRequest | null {
-  const parsed = PushRequestSchema.safeParse(input);
-  if (!parsed.success) return null;
-  return requestSize(parsed.data) <= MAX_PUSH_BYTES ? parsed.data : null;
-}
-
-function validateChange(
-  principal: ActivePrincipal,
-  change: RowChange,
-  nowMs: number,
-): { rule: TableRule } | { code: SyncRejectionCode } {
-  if (change.tenantId !== principal.tenantId || change.workspaceId !== principal.activeWorkspaceId)
+function validateChange(access: AccessContext, change: RowChange, nowMs: number): Validated {
+  const { claims } = access;
+  if (change.tenantId !== claims.tenantId || change.workspaceId !== claims.activeWorkspaceId)
     return { code: 'AUTH_SCOPE_MISMATCH' };
-  const rule = TABLE_RULES[change.table];
+  const rule = ruleFor(change.table);
   if (!rule) return { code: 'UNKNOWN_TABLE' };
   if (rule.authority === 'server') return { code: 'SERVER_AUTHORITY' };
   if (rule.authority === 'local') return { code: 'LOCAL_ONLY' };
   if (rule.authority === 'append' && change.op !== 'append') return { code: 'APPEND_REQUIRED' };
   if (rule.authority === 'synced' && change.op === 'append') return { code: 'UPSERT_REQUIRED' };
-  if (!hasPermission(principal.membership, rule.permission)) return { code: 'PERMISSION_DENIED' };
-  const stamp = parseHlc(change.hlc);
-  if (!stamp || stamp.physical > nowMs + MAX_HLC_DRIFT_MS) return { code: 'CLOCK_SKEW' };
-  for (const [field, write] of Object.entries(change.fields)) {
-    if (!parseHlc(write.hlc)) return { code: 'INVALID_ROW' };
+  const decision = decideAccess(access, rule.manifest, rule.permission, 'write');
+  if (!decision.ok) return { code: decision.code, reason: decision.reason };
+  const clock = validateClocks(change, nowMs);
+  if (clock) return { code: clock };
+  if (change.op === 'delete' && Object.keys(change.fields).length > 0) return { code: 'INVALID_ROW' };
+  for (const field of Object.keys(change.fields)) {
     const fieldError = forbiddenField(rule, field);
     if (fieldError) return { code: fieldError };
   }
   return { rule };
 }
 
-/** Server-stamped author on insert makes a row attributable to its verified principal. */
-function stampActor(change: RowChange, rule: TableRule, principal: ActivePrincipal): RowChange {
-  if (!rule.actorField) return change;
-  return {
-    ...change,
-    fields: {
-      ...change.fields,
-      [rule.actorField]: { value: principal.principalId, hlc: change.hlc, baseHlc: null },
-    },
-  };
+/** Server stamps on insert: verified actor and receipt time (never device-supplied). */
+function stamps(
+  rule: TableRule,
+  access: AccessContext,
+  hlc: string,
+  nowMs: number,
+): Record<string, FieldWrite> {
+  const stamped: Record<string, FieldWrite> = {};
+  if (rule.actorField) stamped[rule.actorField] = { value: access.claims.principalId, hlc, baseHlc: null };
+  if (rule.receivedAtField)
+    stamped[rule.receivedAtField] = { value: new Date(nowMs).toISOString(), hlc, baseHlc: null };
+  return stamped;
+}
+
+function parentKeys(rule: TableRule, fields: Readonly<Record<string, FieldWrite>>): string[] {
+  const parents: string[] = [];
+  for (const [field, spec] of rule.columns) {
+    const value = fields[field]?.value;
+    if (spec.references && typeof value === 'string') parents.push(keyFor(spec.references.table, value));
+  }
+  return parents;
 }
 
 /**
- * Pure field-LWW authority engine over a storage port. The caller (WorkspaceHub) must run
- * push() inside a single storage transaction so rows, log, seq, conflicts and the
- * idempotency record commit or roll back together.
+ * Pure field-LWW authority engine over a storage port. The caller (WorkspaceHub) must run push()
+ * inside a single storage transaction so rows, log, seq, conflicts and the idempotency record
+ * commit or roll back together.
  */
 export class SyncAuthorityEngine {
   constructor(readonly store: SyncStorePort = new MemorySyncStore()) {}
@@ -151,14 +221,19 @@ export class SyncAuthorityEngine {
     return this.store.snapshot();
   }
 
+  private liveParent(key: string): boolean {
+    const parent = this.store.getRow(key);
+    return parent !== undefined && parent.deletedHlc === undefined;
+  }
+
   push(
-    principal: ActivePrincipal,
+    access: AccessContext,
     request: PushRequest,
     nowMs = Date.now(),
     requestHash = fallbackHash(request),
   ): PushResponse {
     const store = this.store;
-    const replayKey = idempotencyKey(principal, request);
+    const replayKey = idempotencyKey(access, request);
     store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
     const previous = store.getIdempotency(replayKey);
     if (previous) {
@@ -166,105 +241,200 @@ export class SyncAuthorityEngine {
       return { ...previous.response, replayed: true };
     }
 
-    const rejected: { index: number; changeId: string; code: SyncRejectionCode }[] = [];
+    const rejected: SyncRejection[] = [];
     const conflicts: ConflictRecord[] = [];
     let accepted = 0;
+    const reject = (index: number, change: RowChange, code: SyncRejectionCode, reason?: string): void => {
+      rejected.push({ index, changeId: change.id, code, ...(reason ? { reason } : {}) });
+    };
+
     for (const [index, change] of request.changes.entries()) {
-      const authorization = validateChange(principal, change, nowMs);
-      if ('code' in authorization) {
-        rejected.push({ index, changeId: change.id, code: authorization.code });
+      const validated = validateChange(access, change, nowMs);
+      if ('code' in validated) {
+        reject(index, change, validated.code, validated.reason);
         continue;
       }
-      const rowKey = keyFor(change);
+      const { rule } = validated;
+      const rowKey = keyFor(change.table, change.id);
       const current = store.getRow(rowKey);
 
-      if (authorization.rule.authority === 'append') {
-        if (!current) {
-          const stamped = stampActor(change, authorization.rule, principal);
-          store.putRow(rowKey, { fields: stamped.fields });
-          store.appendLog(stamped);
-          accepted += 1;
-        }
-        continue;
-      }
-
       if (change.op === 'delete') {
-        if (!current?.deletedHlc || compareHlc(change.hlc, current.deletedHlc) > 0) {
-          store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
-          store.appendLog({ ...change, fields: {} });
-          accepted += 1;
+        if (current?.deletedHlc && compareHlc(change.hlc, current.deletedHlc) <= 0) continue;
+        // Parents referenced by live rows cannot be removed (the migration's ON DELETE RESTRICT).
+        if (store.hasLiveChildren(rowKey)) {
+          reject(index, change, 'ORPHAN_REFERENCE', 'LIVE_CHILDREN');
+          continue;
         }
+        store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
+        store.setRefs(rowKey, []);
+        store.appendLog({ ...change, fields: {} });
+        accepted += 1;
         continue;
       }
       if (current?.deletedHlc) {
-        rejected.push({ index, changeId: change.id, code: 'TOMBSTONED' });
+        reject(index, change, 'TOMBSTONED');
         continue;
       }
+      if (rule.authority === 'append' && current) continue; // insert-only; redelivery is a no-op
 
-      const incomingChange = current ? change : stampActor(change, authorization.rule, principal);
-      const existingFields = current?.fields ?? {};
-      const nextFields: Record<string, FieldWrite> = { ...existingFields };
+      const insert = current === undefined;
+      const incoming: Record<string, FieldWrite> = insert
+        ? { ...change.fields, ...stamps(rule, access, change.hlc, nowMs) }
+        : change.fields;
+      const existing = current?.fields ?? {};
+      const next: Record<string, FieldWrite> = { ...existing };
       const applied: Record<string, FieldWrite> = {};
-      for (const [field, incoming] of Object.entries(incomingChange.fields)) {
-        const existing = existingFields[field];
-        if (existing) {
-          const order = compareHlc(incoming.hlc, existing.hlc);
-          // An identical re-delivery (same HLC, same value) is a no-op, not a conflict.
-          if (order === 0 && canonical(incoming.value) === canonical(existing.value)) continue;
-          if (order <= 0) {
-            const conflict: ConflictRecord = {
+      const rowConflicts: ConflictRecord[] = [];
+      for (const [field, write] of Object.entries(incoming)) {
+        const stored = existing[field];
+        if (!stored) {
+          next[field] = write;
+          applied[field] = write;
+          continue;
+        }
+        const order = compareHlc(write.hlc, stored.hlc);
+        if (order === 0 && canonical(write.value) === canonical(stored.value)) continue; // redelivery
+        // Sequential: the writer saw the stored value. Otherwise the writes were concurrent and the
+        // loser is retained whichever arrived first (CLD-R-006).
+        const sequential = write.baseHlc !== null && compareHlc(write.baseHlc, stored.hlc) === 0;
+        if (order > 0) {
+          next[field] = write;
+          applied[field] = write;
+          if (!sequential) {
+            rowConflicts.push({
               table: change.table,
               rowId: change.id,
               field,
-              winningHlc: existing.hlc,
-              losingHlc: incoming.hlc,
-              losingValue: incoming.value,
-            };
-            conflicts.push(conflict);
-            store.addConflict(conflict);
-            continue;
+              winningHlc: write.hlc,
+              losingHlc: stored.hlc,
+              losingValue: stored.value,
+            });
           }
+        } else {
+          rowConflicts.push({
+            table: change.table,
+            rowId: change.id,
+            field,
+            winningHlc: stored.hlc,
+            losingHlc: write.hlc,
+            losingValue: write.value,
+          });
         }
-        nextFields[field] = incoming;
-        applied[field] = incoming;
+      }
+
+      // Every value that would be stored, and the whole resulting row, must satisfy the schema.
+      const problem = checkRow(rule.columns, incoming, false) ?? checkRow(rule.columns, next, insert);
+      if (problem) {
+        reject(index, change, 'SCHEMA_VIOLATION', `${problem.kind}:${problem.field}`.slice(0, 64));
+        continue;
+      }
+      const parents = parentKeys(rule, next);
+      if (parents.some((parent) => !this.liveParent(parent))) {
+        reject(index, change, 'ORPHAN_REFERENCE');
+        continue;
+      }
+      if (byteLength(JSON.stringify(next)) > MAX_ROW_BYTES) {
+        reject(index, change, 'ROW_TOO_LARGE');
+        continue;
+      }
+      for (const conflict of rowConflicts) {
+        conflicts.push(conflict);
+        store.addConflict(conflict);
       }
       if (Object.keys(applied).length > 0) {
-        store.putRow(rowKey, { fields: nextFields });
+        store.putRow(rowKey, { fields: next });
+        store.setRefs(rowKey, parents);
         store.appendLog({ ...change, fields: applied });
         accepted += 1;
       }
+    }
+
+    // Inline history is bounded; the full record is always paged from /v1/sync/conflicts.
+    const inline: ConflictRecord[] = [];
+    let inlineBytes = 0;
+    for (const conflict of conflicts) {
+      inlineBytes += byteLength(JSON.stringify(conflict));
+      if (inlineBytes > MAX_INLINE_CONFLICT_BYTES) break;
+      inline.push(conflict);
     }
     const response: PushResponse = {
       accepted,
       conflicts: conflicts.length,
       serverSeq: store.serverSeq().toString(10),
       rejected,
-      conflictHistory: conflicts,
+      conflictHistory: inline,
       replayed: false,
     };
     store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
     return response;
   }
 
-  pull(cursor: string | undefined, pageSize = MAX_PULL_ROWS): PullResponse | null {
-    const after = decodeCursor(cursor);
-    if (after === null || pageSize < 1 || pageSize > MAX_PULL_ROWS) return null;
-    const fetched = this.store.readLog(after, pageSize + 1);
-    const changes = fetched.slice(0, pageSize);
-    const last = changes.at(-1);
+  private readableTables(access: AccessContext): string[] {
+    const readable: string[] = [];
+    for (const [name, rule] of TABLE_RULES) {
+      if (rule.authority !== 'synced' && rule.authority !== 'append') continue;
+      if (decideAccess(access, rule.manifest, rule.readPermission, 'read').ok) readable.push(name);
+    }
+    return readable.sort();
+  }
+
+  /**
+   * Pages the log by rows AND serialized bytes, delivering only tables the caller may read now.
+   * The cursor advances past unreadable entries and carries the read scope, so a grant change
+   * forces a resync (and local purge) instead of silently skipping or leaking rows (CLD-R-003).
+   */
+  pull(
+    access: AccessContext,
+    cursor: string | undefined,
+    limit = MAX_PULL_ROWS,
+    maxBytes = MAX_PULL_BYTES,
+  ): PullOutcome {
+    const decoded = decodeCursor(cursor);
+    if (!decoded || !Number.isInteger(limit) || limit < 1 || limit > MAX_PULL_ROWS)
+      return { ok: false, code: 'INVALID_CURSOR' };
+    const readable = this.readableTables(access);
+    const scope = scopeFingerprint(readable);
+    if (decoded.scope !== null && decoded.scope !== scope) return { ok: false, code: 'RESYNC_REQUIRED' };
+    const allowed = new Set(readable);
+    const serverSeq = this.store.serverSeq();
+    const page = this.store.readLogPage({
+      after: decoded.seq,
+      maxRows: limit,
+      maxBytes,
+      maxScan: MAX_PULL_SCAN_ROWS,
+      readable: (table) => allowed.has(table),
+    });
+    const resume = page.exhausted && serverSeq > page.lastExamined ? serverSeq : page.lastExamined;
     return {
-      changes,
-      cursor: encodeCursor(last ? BigInt(last.seq) : after),
-      more: fetched.length > changes.length,
-      serverSeq: this.store.serverSeq().toString(10),
+      ok: true,
+      response: {
+        protocolVersion: SYNC_PROTOCOL_VERSION,
+        schemaVersion: SYNC_SCHEMA_VERSION,
+        changes: page.items,
+        cursor: encodeCursor(resume, scope),
+        more: !page.exhausted,
+        serverSeq: serverSeq.toString(10),
+      },
     };
   }
 
-  /** Conflict history is retained indefinitely (REQ-DATA-008) and read in pages. */
-  conflictPage(afterId: number, limit: number): { items: StoredConflict[]; more: boolean } | null {
-    if (!Number.isInteger(afterId) || afterId < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200)
+  /** Conflict history is retained (REQ-DATA-008), read-filtered and paged by rows and bytes. */
+  conflictPage(
+    access: AccessContext,
+    afterId: number,
+    limit: number,
+    maxBytes = MAX_PULL_BYTES,
+  ): { items: StoredConflict[]; more: boolean; next: number } | null {
+    if (!Number.isSafeInteger(afterId) || afterId < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200)
       return null;
-    const fetched = this.store.readConflicts(afterId, limit + 1);
-    return { items: fetched.slice(0, limit), more: fetched.length > limit };
+    const allowed = new Set(this.readableTables(access));
+    const page = this.store.readConflictPage({
+      after: BigInt(afterId),
+      maxRows: limit,
+      maxBytes,
+      maxScan: MAX_PULL_SCAN_ROWS,
+      readable: (table) => allowed.has(table),
+    });
+    return { items: page.items, more: !page.exhausted, next: Number(page.lastExamined) };
   }
 }

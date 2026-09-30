@@ -31,6 +31,10 @@ interface JwtPayload {
   readonly autonomy_level?: unknown;
   readonly exp?: unknown;
   readonly iat?: unknown;
+  readonly nbf?: unknown;
+  readonly device_id?: unknown;
+  readonly delegated_by?: unknown;
+  readonly run_id?: unknown;
   readonly aud?: unknown;
   readonly iss?: unknown;
 }
@@ -64,8 +68,24 @@ function validAudience(value: unknown, expected: string | undefined): boolean {
   );
 }
 
+/** Leeway applied to iat and nbf only; exp is never extended. */
+export const CLOCK_LEEWAY_SEC = 60;
+/** Access tokens are 15 minutes (Protocol 02 §24); anything longer-lived is refused. */
+export const MAX_TOKEN_LIFETIME_SEC = 15 * 60 + CLOCK_LEEWAY_SEC;
+
+const isNumericDate = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 2 ** 40;
+
+function optionalUuid(value: unknown): string | undefined | null {
+  if (value === undefined) return undefined;
+  return typeof value === 'string' && UUID.test(value) ? value : null;
+}
+
 function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClaims | null {
-  const nowSeconds = Math.floor((config.nowMs ?? Date.now()) / 1000);
+  const nowSeconds = (config.nowMs ?? Date.now()) / 1000;
+  const deviceId = optionalUuid(payload.device_id);
+  const delegatedBy = optionalUuid(payload.delegated_by);
+  const runId = optionalUuid(payload.run_id);
   if (
     typeof payload.sub !== 'string' ||
     typeof payload.tenant_id !== 'string' ||
@@ -78,10 +98,19 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
     !payload.workspace_ids.includes(payload.active_workspace) ||
     (payload.kind !== 'user' && payload.kind !== 'agent') ||
     ![0, 1, 2, 3, 4].includes(payload.autonomy_level as number) ||
-    typeof payload.exp !== 'number' ||
-    typeof payload.iat !== 'number' ||
+    !isNumericDate(payload.exp) ||
+    !isNumericDate(payload.iat) ||
     payload.exp <= nowSeconds ||
-    payload.iat > nowSeconds + 60 ||
+    payload.iat > nowSeconds + CLOCK_LEEWAY_SEC ||
+    payload.exp <= payload.iat ||
+    payload.exp - payload.iat > MAX_TOKEN_LIFETIME_SEC ||
+    (payload.nbf !== undefined &&
+      (!isNumericDate(payload.nbf) || payload.nbf > nowSeconds + CLOCK_LEEWAY_SEC)) ||
+    deviceId === null ||
+    delegatedBy === null ||
+    runId === null ||
+    // An agent token must name its delegating user; a user token must not claim one.
+    (payload.kind === 'agent') !== (delegatedBy !== undefined) ||
     !validAudience(payload.aud, config.audience) ||
     (config.issuer !== undefined && payload.iss !== config.issuer)
   ) {
@@ -95,6 +124,9 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
     activeWorkspaceId: payload.active_workspace,
     autonomy: payload.autonomy_level as CandidateClaims['autonomy'],
     expiresAtMs: payload.exp * 1000,
+    ...(deviceId ? { deviceId } : {}),
+    ...(delegatedBy ? { delegatedBy } : {}),
+    ...(runId ? { runId } : {}),
   };
 }
 

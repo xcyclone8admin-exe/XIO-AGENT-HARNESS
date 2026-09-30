@@ -1,73 +1,74 @@
-import { SERVER_STAMPED_FIELDS } from '@xyra/contracts';
+import { SERVER_STAMPED_FIELDS, type ColumnSpec, type ModuleManifest } from '@xyra/contracts';
 import coreManifest from '@xyra/mod-core/manifest';
 import opsManifest from '@xyra/mod-ops/manifest';
-import type { CurrentMembership } from './model';
 
 export type SyncClass = 'lww' | 'append' | 'local';
 export type WriteAuthority = 'server' | 'synced' | 'append' | 'local';
 
 export interface TableRule {
+  readonly name: string;
   readonly class: SyncClass;
   readonly authority: WriteAuthority;
+  /** The owning module's manifest: the policy source for this table's permissions. */
+  readonly manifest: ModuleManifest;
   readonly permission?: string;
+  /** Absent: any current workspace member may read. */
+  readonly readPermission?: string;
   readonly guardedColumns: readonly string[];
   /** Device-writable fields. Empty means every field is rejected (fail closed). */
   readonly allowedColumns: readonly string[];
   /** Column the Worker stamps with the verified principal on insert. */
   readonly actorField?: string;
+  /** Column the Worker stamps with server receipt time on insert. */
+  readonly receivedAtField?: string;
+  /** Typed column specs; a writable table without them rejects every row (fail closed). */
+  readonly columns: ReadonlyMap<string, ColumnSpec>;
 }
 
-interface DeclaredTable {
-  readonly name: string;
-  readonly class: SyncClass;
-  readonly authority: WriteAuthority;
-  readonly guardedColumns: readonly string[];
-  readonly allowedFields?: readonly string[] | undefined;
-  readonly actorField?: string | undefined;
-  readonly writePermission?: string | undefined;
+function derive(manifests: readonly ModuleManifest[]): ReadonlyMap<string, TableRule> {
+  const rules = new Map<string, TableRule>();
+  for (const manifest of manifests) {
+    for (const table of manifest.tables) {
+      const readPermission = table.readPermission;
+      const receivedAtField = table.receivedAtField;
+      rules.set(table.name, {
+        name: table.name,
+        class: table.class,
+        authority: table.authority,
+        manifest,
+        guardedColumns: table.guardedColumns,
+        allowedColumns: table.allowedFields ?? [],
+        columns: new Map(Object.entries(table.columns ?? {})),
+        ...(table.writePermission ? { permission: table.writePermission } : {}),
+        ...(readPermission ? { readPermission } : {}),
+        ...(table.actorField ? { actorField: table.actorField } : {}),
+        ...(receivedAtField ? { receivedAtField } : {}),
+      });
+    }
+  }
+  return rules;
 }
 
 /**
- * Derived from module manifests, never hand-copied, so rules and manifests cannot drift.
- * An unknown table rejects rather than becoming device-writable. When more modules sync, the
- * generated registry feed replaces this import list with the same TABLE_RULES shape.
+ * Derived from module manifests, never hand-copied. A Map, not an object: an inherited name such
+ * as `constructor` must never resolve to a rule (CLD-R-012). The generated registry feed replaces
+ * the manifest list when more modules sync.
  */
-function derive(tables: readonly DeclaredTable[]): Record<string, TableRule> {
-  return Object.fromEntries(
-    tables.map((table) => [
-      table.name,
-      {
-        class: table.class,
-        authority: table.authority,
-        guardedColumns: table.guardedColumns,
-        allowedColumns: table.allowedFields ?? [],
-        ...(table.writePermission ? { permission: table.writePermission } : {}),
-        ...(table.actorField ? { actorField: table.actorField } : {}),
-      } satisfies TableRule,
-    ]),
-  );
-}
+export const MANIFESTS: readonly ModuleManifest[] = [coreManifest, opsManifest];
+export const TABLE_RULES: ReadonlyMap<string, TableRule> = derive(MANIFESTS);
 
-export const TABLE_RULES: Readonly<Record<string, TableRule>> = derive([
-  ...coreManifest.tables,
-  ...opsManifest.tables,
-]);
+export function ruleFor(table: string): TableRule | undefined {
+  return TABLE_RULES.get(table);
+}
 
 const STAMPED = new Set<string>(SERVER_STAMPED_FIELDS);
-
-export function hasPermission(membership: CurrentMembership, permission: string | undefined): boolean {
-  if (membership.role === 'owner' || membership.role === 'admin') return true;
-  // Rules without a named permission still exclude read-only roles.
-  if (permission === undefined) return membership.role !== 'viewer' && membership.role !== 'auditor';
-  return membership.permissions.includes(permission);
-}
 
 export function forbiddenField(
   rule: TableRule,
   field: string,
 ): 'IMMUTABLE_FIELD' | 'ACTOR_FIELD' | 'GUARDED_FIELD' | 'INVALID_ROW' | null {
   if (rule.actorField === field) return 'ACTOR_FIELD';
-  if (STAMPED.has(field)) return 'IMMUTABLE_FIELD';
+  if (STAMPED.has(field) || rule.receivedAtField === field) return 'IMMUTABLE_FIELD';
   if (rule.guardedColumns.includes(field)) return 'GUARDED_FIELD';
   if (!rule.allowedColumns.includes(field)) return 'INVALID_ROW';
   return null;
