@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { PGlite } from '@electric-sql/pglite';
-import { applyPGliteMigrations, migration, prepareLocalAppRole } from '@xyra/db';
+import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
 import { randomUUID } from 'node:crypto';
 import { PGliteLedgerWriter } from '@xyra/ledger';
@@ -216,6 +216,10 @@ test('the app role has no DELETE grant and RLS hides every other tenant ledger r
 });
 
 test('the ledger writer commits balanced postings, advances HLC balances and reverses append-only', async () => {
+  await prepareLocalAppRole(db, [
+    ...moneyManifest.tables,
+    { name: 'swarm_agent_profiles', class: 'lww', authority: 'synced', guardedColumns: ['approval_policy'] },
+  ]);
   const writer = new PGliteLedgerWriter(db);
   const scope = { tenantId: TA, workspaceId: WA, hlc: '1790800000000-0001-devicea' };
   const book = await writer.createBook(scope, ACTOR_A, {
@@ -384,4 +388,41 @@ test('ledger query, aggregate, reconciliation, and discrepancy APIs return contr
   });
   expect(resolved.status).toBe('resolved');
   expect((await writer.discrepancies(scope, { environment: 'paper', status: 'resolved' }))).toHaveLength(1);
+});
+
+test('Money ledger capability scope can post atomically but cannot mutate Swarm settings', async () => {
+  await prepareLocalAppRole(db, [
+    ...moneyManifest.tables,
+    { name: 'swarm_agent_profiles', class: 'lww', authority: 'synced', guardedColumns: ['approval_policy'] },
+  ]);
+  const writer = new PGliteLedgerWriter(db);
+  const scope = { tenantId: TA, workspaceId: WA, hlc: '1790800000000-0001-devicea' };
+  const settingId = '019a0000-0000-7000-8000-000000000099';
+  await db.query(
+    `INSERT INTO swarm_agent_profiles(id,tenant_id,workspace_id,role_id,charter,default_provider,default_model,
+       budgets,approval_policy,memory_scope,created_by)
+     VALUES ($1,$2,$3,'reviewer','Ledger guard test','local','test','{}','ask','{}',$4)`,
+    [settingId, TA, WA, ACTOR_A],
+  );
+  const postId = '019a0000-0000-7000-8000-000000000098';
+  await writer.post(scope, ACTOR_A, {
+    id: postId, bookId: BOOK_A, environment: 'actual', effectiveDate: '2026-09-30',
+    description: 'Scoped atomic control', source: 'money',
+    entries: [{ accountId: ACCT_A1, asset: 'USD', units: '2' }, { accountId: ACCT_A2, asset: 'USD', units: '-2' }],
+  });
+  const projection = await writer.balances(scope, { environment: 'actual', bookId: BOOK_A });
+  expect(projection.find((row) => row.accountId === ACCT_A1 && row.asset === 'USD')?.units).toBe('103');
+  const appScoped = new LocalScopedStore(db);
+  await expect(appScoped.query({ tenantId: TA, workspaceId: WA },
+    `UPDATE swarm_agent_profiles SET approval_policy='changed' WHERE id=$1`, [settingId],
+  )).rejects.toThrow(/permission denied/);
+  const unchanged = await db.query<{ charter: string }>('SELECT charter FROM swarm_agent_profiles WHERE id=$1', [settingId]);
+  expect(unchanged.rows[0]?.charter).toBe('Ledger guard test');
+});
+
+test('ledger rejects HLC stamps more than one minute in the future', async () => {
+  const writer = new PGliteLedgerWriter(db);
+  const future = `${Date.now() + 61_000}-0001-devicea`;
+  await expect(writer.reconcile({ tenantId: TA, workspaceId: WA, hlc: future }, ACTOR_A, { environment: 'actual' }))
+    .rejects.toMatchObject({ code: 'NOT_FOUND' });
 });
