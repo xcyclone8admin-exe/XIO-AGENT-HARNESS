@@ -7,7 +7,10 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "dev": "node ../../tools/gen-module-registry.mjs && tsx src/main.ts",
+    "build": "node ../../tools/gen-module-registry.mjs && esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/main.mjs --external:@electric-sql/pglite --external:@electric-sql/pglite-pgvector",
+    "smoke:bundle": "node tools/smoke-bundle.mjs"
   },
   "dependencies": {
     "@hono/node-server": "1.19.6",
@@ -19,5 +22,9 @@
     "@xyra/policy": "0.1.0",
     "hono": "4.12.8",
     "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15"
   }
 }
