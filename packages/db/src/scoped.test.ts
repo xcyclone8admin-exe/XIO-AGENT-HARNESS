@@ -187,6 +187,7 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
       { name: 'workspaces', class: 'lww', authority: 'server' },
       { name: 'memberships', class: 'lww', authority: 'server' },
       { name: 'ops_projects', class: 'lww', authority: 'synced', guardedColumns: ['status'] },
+      { name: 'ops_tasks', class: 'lww', authority: 'synced' },
     ]);
     await fresh.query('INSERT INTO tenants(id,name) VALUES ($1,$2)', [tenantA, 'A']);
     await fresh.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)', [
@@ -233,6 +234,24 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
         ),
       ),
     ).rejects.toThrow();
+    // Server scope reads are RLS-bounded too: another tenant's workspace is invisible.
+    await fresh.query('INSERT INTO tenants(id,name) VALUES ($1,$2)', [tenantB, 'B']);
+    await fresh.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)', [
+      workspaceB,
+      tenantB,
+      'B',
+    ]);
+    await expect(
+      store.withServerScope(scope, undefined, (tx) =>
+        tx.query('SELECT id FROM workspaces WHERE id = $1', [workspaceB]),
+      ),
+    ).resolves.toMatchObject({ rowCount: 0 });
+    // Device-owned synced rows are read-only to the server role; only guarded tables differ.
+    await expect(
+      store.withServerScope(scope, undefined, (tx) =>
+        tx.query("UPDATE ops_tasks SET title = 'x' WHERE tenant_id = $1", [tenantA]),
+      ),
+    ).rejects.toThrow(/permission denied/);
   } finally {
     await fresh.close();
   }
