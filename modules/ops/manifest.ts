@@ -22,7 +22,23 @@ export default defineModule({
   ],
   dependsOn: ['core'],
   tables: [
-    { name: 'ops_projects', class: 'lww', authority: 'synced', guardedColumns: ['status'] },
-    { name: 'ops_tasks', class: 'lww', authority: 'synced', guardedColumns: ['status'] },
+    {
+      name: 'ops_projects',
+      class: 'lww',
+      authority: 'synced',
+      guardedColumns: ['status'],
+      actorField: 'created_by',
+      writePermission: 'ops:project:write',
+      allowedFields: ['name', 'description'],
+    },
+    {
+      name: 'ops_tasks',
+      class: 'lww',
+      authority: 'synced',
+      guardedColumns: ['status'],
+      actorField: 'created_by',
+      writePermission: 'ops:task:write',
+      allowedFields: ['project_id', 'title', 'description', 'assignee_id', 'due_at'],
+    },
   ],
 });

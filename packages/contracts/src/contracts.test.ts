@@ -5,8 +5,31 @@ import {
   defineModule,
   isHonestStatus,
   permissionCatalog,
+  TableDecl,
   type ConnectorStatus,
 } from './index';
+
+describe('TableDecl write surface', () => {
+  const base = { name: 'audit_events', class: 'append', authority: 'append' } as const;
+  it('accepts allowed fields with a separate actor stamp', () => {
+    const table = TableDecl.parse({ ...base, actorField: 'actor_id', allowedFields: ['action'] });
+    expect(table.allowedFields).toEqual(['action']);
+  });
+  it('rejects server-stamped, actor and guarded fields as device-writable', () => {
+    expect(() => TableDecl.parse({ ...base, allowedFields: ['created_by'] })).toThrow(/server-stamped/);
+    expect(() => TableDecl.parse({ ...base, actorField: 'actor_id', allowedFields: ['actor_id'] })).toThrow(
+      /server-stamped/,
+    );
+    expect(() => TableDecl.parse({ ...base, guardedColumns: ['status'], allowedFields: ['status'] })).toThrow(
+      /guarded/,
+    );
+  });
+  it('rejects a write surface on server or local tables', () => {
+    expect(() =>
+      TableDecl.parse({ name: 'memberships', class: 'lww', authority: 'server', allowedFields: ['role'] }),
+    ).toThrow(/only to synced or append/);
+  });
+});
 
 describe('defineModule', () => {
   it('parses defaults and enforces permission prefixes and unique nav paths', () => {
