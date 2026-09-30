@@ -8,6 +8,7 @@ import {
   BoundedRunLoop,
   InMemoryRunJournal,
   LocalKillSwitch,
+  LocalOnlyLeasePort,
   McpClientBoundary,
   ModelRouter,
   NightShiftController,
@@ -326,6 +327,75 @@ describe('provider routing and bounded loop', () => {
     await Promise.resolve();
     killSwitch.engage();
     await expect(pending).resolves.toMatchObject({ termination: 'KILL_SWITCH' });
+  });
+});
+
+describe('workspace lease and per-step kill checks', () => {
+  const toolCallResponse = (): ProviderResponse => ({
+    ...response(),
+    toolCalls: [{ id: 'c1', capabilityId: 'ops.tasks.list', input: {} }],
+  });
+
+  it('stops when the lease cannot be acquired', async () => {
+    const loop = new BoundedRunLoop(routerWith([provider('primary', async () => response()), provider('fallback', async () => response())]), tools(), {
+      workspaceLease: { port: { acquire: async () => undefined }, ttlMs: 1000 },
+    });
+    const result = await loop.run({ ...runInput(), leaseScope: { jobId: 'j', window: 'w' } });
+    expect(result.termination).toBe('LEASE_LOST');
+  });
+
+  it('stops before the next step when a heartbeat reports the lease lost', async () => {
+    let beats = 0;
+    let released = false;
+    const port = {
+      acquire: async () => ({
+        heartbeat: async () => ++beats < 2,
+        release: async () => {
+          released = true;
+        },
+      }),
+    };
+    const loop = new BoundedRunLoop(
+      routerWith([provider('primary', async () => toolCallResponse()), provider('fallback', async () => response())]),
+      tools(),
+      { workspaceLease: { port, ttlMs: 1000 } },
+    );
+    const result = await loop.run({ ...runInput(), leaseScope: { jobId: 'j', window: 'w' } });
+    expect(result.termination).toBe('LEASE_LOST');
+    expect(released).toBe(true);
+  });
+
+  it('LocalOnlyLeasePort is exclusive per (workspace, job, window) and expires by TTL', async () => {
+    let t = 0;
+    const port = new LocalOnlyLeasePort(() => t);
+    const key = { workspaceId: IDS.workspace, jobId: 'j', window: 'w' };
+    const first = await port.acquire(key, 100);
+    expect(await port.acquire(key, 100)).toBeUndefined();
+    expect(await port.acquire({ ...key, window: 'w2' }, 100)).toBeDefined();
+    t = 200;
+    expect(await first?.heartbeat()).toBe(false);
+    expect(await port.acquire(key, 100)).toBeDefined();
+  });
+
+  it('checks the kill switch before each tool step, not only at start', async () => {
+    const killSwitch = new LocalKillSwitch();
+    let calls = 0;
+    const loop = new BoundedRunLoop(
+      routerWith([
+        provider('primary', async () => {
+          calls += 1;
+          killSwitch.engage();
+          return toolCallResponse();
+        }),
+        provider('fallback', async () => response()),
+      ]),
+      tools(),
+      { killSwitch },
+    );
+    const result = await loop.run(runInput());
+    expect(result.termination).toBe('KILL_SWITCH');
+    expect(calls).toBe(1);
+    expect(result.counters.actions).toBe(0);
   });
 });
 

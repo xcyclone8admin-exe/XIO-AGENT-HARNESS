@@ -1,6 +1,6 @@
 import { BudgetTracker } from './budgets';
 import type { AgentRunInput, AgentRunResult, RunArtifact, RunEvent, RunTermination, ToolResult } from './contracts';
-import type { RunLease } from './concurrency';
+import type { RunLease, WorkspaceLeaseHandle, WorkspaceLeasePort } from './concurrency';
 import type { RunJournal } from './journal';
 import type { ModelRouter } from './router';
 import type { TierZeroToolExecutor } from './tier-zero';
@@ -40,6 +40,8 @@ export interface RunLoopOptions {
   readonly noProgressLimit?: number;
   readonly journal?: RunJournal;
   readonly concurrency?: { tryAcquire(workspaceId: string): RunLease | undefined };
+  /** Applies to runs carrying a `leaseScope`; the lease is heartbeated before every model and tool step. */
+  readonly workspaceLease?: { readonly port: WorkspaceLeasePort; readonly ttlMs: number };
 }
 
 /**
@@ -53,6 +55,7 @@ export class BoundedRunLoop {
   private readonly noProgressLimit: number;
   private readonly journal: RunJournal | undefined;
   private readonly concurrency: RunLoopOptions['concurrency'];
+  private readonly workspaceLease: RunLoopOptions['workspaceLease'];
 
   constructor(
     private readonly router: ModelRouter,
@@ -64,6 +67,7 @@ export class BoundedRunLoop {
     this.noProgressLimit = options.noProgressLimit ?? 3;
     this.journal = options.journal;
     this.concurrency = options.concurrency;
+    this.workspaceLease = options.workspaceLease;
   }
 
   cancel(runId: string): boolean {
@@ -95,10 +99,33 @@ export class BoundedRunLoop {
     };
     emit('run.started', { profileId: input.profile.id });
 
+    let wsLease: WorkspaceLeaseHandle | undefined;
+    const leased = this.workspaceLease !== undefined && input.leaseScope !== undefined;
+    const leaseLost = async (): Promise<boolean> => {
+      if (!leased) return false;
+      try {
+        return !(await wsLease?.heartbeat());
+      } catch {
+        return true;
+      }
+    };
+
     try {
+      if (this.workspaceLease && input.leaseScope) {
+        try {
+          wsLease = await this.workspaceLease.port.acquire(
+            { workspaceId: input.workspaceId, jobId: input.leaseScope.jobId, window: input.leaseScope.window },
+            this.workspaceLease.ttlMs,
+          );
+        } catch {
+          wsLease = undefined;
+        }
+        if (!wsLease) return this.finish(input.runId, 'LEASE_LOST', null, budget, events, artifacts, emit, 'LEASE_UNAVAILABLE');
+      }
       for (;;) {
         const terminal = this.checkTerminal(budget, controller.signal);
         if (terminal) return this.finish(input.runId, terminal, null, budget, events, artifacts, emit);
+        if (await leaseLost()) return this.finish(input.runId, 'LEASE_LOST', null, budget, events, artifacts, emit);
         budget.recordIteration();
         emit('run.model.called', { iteration: budget.snapshot().iterations });
         let completion;
@@ -129,6 +156,7 @@ export class BoundedRunLoop {
         for (const call of completion.response.toolCalls) {
           const beforeTool = this.checkTerminal(budget, controller.signal);
           if (beforeTool) return this.finish(input.runId, beforeTool, null, budget, events, artifacts, emit);
+          if (await leaseLost()) return this.finish(input.runId, 'LEASE_LOST', null, budget, events, artifacts, emit);
           budget.recordAction();
           emit('run.tool.called', { capabilityId: call.capabilityId, callId: call.id });
           const result = await this.tools.call(
@@ -155,6 +183,7 @@ export class BoundedRunLoop {
       unsubscribeKill?.();
       input.signal?.removeEventListener('abort', onExternalAbort);
       lease?.release();
+      await wsLease?.release().catch(() => undefined);
     }
   }
 

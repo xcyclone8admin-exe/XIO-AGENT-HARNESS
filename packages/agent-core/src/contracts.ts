@@ -208,6 +208,7 @@ export const RunTermination = z.enum([
   'TIMEOUT',
   'CANCELED',
   'KILL_SWITCH',
+  'LEASE_LOST',
   'NO_PROGRESS',
   'CONCURRENCY_LIMIT',
   'FAILED',
@@ -261,6 +262,8 @@ export interface AgentRunInput {
   readonly spawn: SpawnContract;
   readonly route: RouteRequest;
   readonly signal?: AbortSignal;
+  /** Night Shift/trigger runs on a syncing workspace carry a scope so a WP-CLOUD lease can be keyed. */
+  readonly leaseScope?: { readonly jobId: string; readonly window: string };
 }
 
 export interface AgentRunResult {
