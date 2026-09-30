@@ -174,17 +174,19 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
       fresh,
       files.map((name) => migration(`platform/${name.slice(0, -4)}`, readFileSync(`${dir}${name}`, 'utf8'))),
     );
-    // Simulate a database from an earlier release with table-wide UPDATE before manifest grants
-    // became column-scoped. Re-running setup must revoke that stale privilege.
+    // Simulate an earlier setup that gave server tables and guarded records broad write grants.
+    // Re-running setup must remove stale privileges before applying current manifest authority.
     await prepareLocalAppRole(fresh, [
       { name: 'tenants', class: 'lww' },
       { name: 'workspaces', class: 'lww' },
+      { name: 'memberships', class: 'lww' },
       { name: 'ops_projects', class: 'lww' },
     ]);
     await prepareLocalAppRole(fresh, [
-      { name: 'tenants', class: 'lww' },
-      { name: 'workspaces', class: 'lww' },
-      { name: 'ops_projects', class: 'lww', privilegedColumns: ['status'] },
+      { name: 'tenants', class: 'lww', authority: 'server' },
+      { name: 'workspaces', class: 'lww', authority: 'server' },
+      { name: 'memberships', class: 'lww', authority: 'server' },
+      { name: 'ops_projects', class: 'lww', authority: 'synced', guardedColumns: ['status'] },
     ]);
     await fresh.query('INSERT INTO tenants(id,name) VALUES ($1,$2)', [tenantA, 'A']);
     await fresh.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)', [
@@ -205,6 +207,17 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
     ).resolves.toBeDefined();
     await expect(
       store.query(scope, "UPDATE ops_projects SET status = 'paused' WHERE id = $1", [project]),
+    ).rejects.toThrow(/permission denied/);
+    await expect(
+      store.query(scope, "UPDATE workspaces SET name = 'Changed' WHERE id = $1", [workspaceA]),
+    ).rejects.toThrow(/permission denied/);
+    await expect(
+      store.query(
+        scope,
+        `INSERT INTO memberships(id,tenant_id,workspace_id,user_id,role)
+         VALUES ('019a0000-0000-7000-8000-000000000302',$1,$2,$3,'owner')`,
+        [tenantA, workspaceA, tenantA],
+      ),
     ).rejects.toThrow(/permission denied/);
   } finally {
     await fresh.close();

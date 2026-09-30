@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "types": ["node"] },
+  "include": ["manifest.ts", "contracts.ts", "server", "ui", "tests"]
+}
