@@ -15,6 +15,35 @@ const AgentRunSummary = z.object({
   }),
 });
 
+/**
+ * Privilege-bearing and server-derived profile fields (manifest guardedColumns). Device and agent
+ * writes never carry them: creates get fail-closed defaults and eval history derives from evals.
+ */
+export const GUARDED_PROFILE_FIELDS = [
+  'capabilityGrants',
+  'autonomyLevel',
+  'secretScopes',
+  'networkPolicy',
+  'filesystemPolicy',
+  'approvalPolicy',
+  'evalHistory',
+] as const;
+
+/** The only profile fields a caller may write; unknown or guarded keys are rejected, not stripped. */
+export const AgentProfileDraft = z.strictObject(
+  AgentProfile.pick({
+    roleId: true,
+    charter: true,
+    defaultProvider: true,
+    defaultModel: true,
+    fallbacks: true,
+    budgets: true,
+    memoryScope: true,
+    outputSchema: true,
+  }).shape,
+);
+export type AgentProfileDraft = z.infer<typeof AgentProfileDraft>;
+
 /** Public contracts only. Runtime implementations stay in packages/agent-core. */
 export const swarmCapabilities = {
   profiles: defineCapability({
@@ -29,10 +58,10 @@ export const swarmCapabilities = {
   createProfile: defineCapability({
     id: 'swarm.profiles.create',
     title: 'Create agent profile',
-    description: 'Create a bounded agent profile with explicit grants and budgets',
+    description: 'Create a bounded agent profile; privilege fields start fail-closed',
     kind: 'write',
     permission: 'swarm:profile:write',
-    input: AgentProfile,
+    input: AgentProfileDraft,
     output: AgentProfile,
   }),
   runs: defineCapability({

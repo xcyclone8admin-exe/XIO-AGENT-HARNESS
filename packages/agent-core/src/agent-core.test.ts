@@ -1,4 +1,4 @@
-﻿import { defineCapability, type Principal } from '@xyra/contracts';
+import { defineCapability, type Principal } from '@xyra/contracts';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import {
@@ -179,7 +179,8 @@ describe('AgentProfile and delegation contracts', () => {
         childProfile: profile({ autonomyLevel: 3 }),
         parentDepth: 0,
         maximumDepth: 2,
-        parentRemainingBudget: parent.budgets,
+        parentBudget: parent.budgets,
+        parentConsumed: { counters: { iterations: 0, actions: 0, failures: 0, costUsd: 0 }, elapsedMs: 0 },
       }),
     ).toEqual({ allowed: false, reason: 'DELEGATION_AUTONOMY_EXCEEDED' });
   });
@@ -349,6 +350,7 @@ describe('workspace lease and per-step kill checks', () => {
     let released = false;
     const port = {
       acquire: async () => ({
+        token: 1,
         heartbeat: async () => ++beats < 2,
         release: async () => {
           released = true;
@@ -440,3 +442,266 @@ describe('Night Shift and MCP boundaries', () => {
     ).toEqual(expect.arrayContaining(['TASK_COMPLETION_REGRESSION', 'HALLUCINATION_REGRESSION']));
   });
 });
+
+describe('review cycle 2 regressions', () => {
+  const hang = (request: { signal: AbortSignal }, error = new ProviderError('UNAVAILABLE', 'aborted', true)) =>
+    new Promise<ProviderResponse>((_, reject) => {
+      request.signal.addEventListener('abort', () => reject(error), { once: true });
+    });
+  const toolCall = () => response([{ id: 'c1', capabilityId: 'ops.tasks.list', input: {} }]);
+
+  it('SWM-R-001: delegation is bounded by the parent REMAINING budget, not its original caps', () => {
+    const parent = profile();
+    const consumed = { counters: { iterations: 1, actions: 1, failures: 0, costUsd: 6 }, elapsedMs: 1_000 };
+    const denied = decideDelegation({
+      parentProfile: parent,
+      childProfile: profile(),
+      parentDepth: 0,
+      maximumDepth: 2,
+      parentBudget: parent.budgets,
+      parentConsumed: consumed,
+    });
+    expect(denied).toEqual({ allowed: false, reason: 'DELEGATION_BUDGET_EXCEEDED' });
+    const childBudget = { maxDurationMs: 30_000, maxCostUsd: 4, maxActions: 2, maxFailures: 3, maxIterations: 2 };
+    const allowed = decideDelegation({
+      parentProfile: parent,
+      childProfile: profile({ budgets: childBudget }),
+      parentDepth: 0,
+      maximumDepth: 2,
+      parentBudget: parent.budgets,
+      parentConsumed: consumed,
+    });
+    expect(allowed).toEqual({ allowed: true, depth: 1, budget: childBudget });
+  });
+
+  it('probe (a): no fallback provider call after cancellation', async () => {
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    const loop = new BoundedRunLoop(
+      routerWith([
+        provider('primary', async (request) => {
+          primaryCalls += 1;
+          return hang(request);
+        }),
+        provider('fallback', async () => {
+          fallbackCalls += 1;
+          return response();
+        }),
+      ]),
+      tools(),
+    );
+    const pending = loop.run(runInput());
+    await Promise.resolve();
+    loop.cancel(IDS.run);
+    await expect(pending).resolves.toMatchObject({ termination: 'CANCELED' });
+    expect(primaryCalls).toBe(1);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it('probe (a): no fallback provider call after the kill switch engages', async () => {
+    const killSwitch = new LocalKillSwitch();
+    let fallbackCalls = 0;
+    const loop = new BoundedRunLoop(
+      routerWith([
+        provider('primary', async (request) => hang(request)),
+        provider('fallback', async () => {
+          fallbackCalls += 1;
+          return response();
+        }),
+      ]),
+      tools(),
+      { killSwitch },
+    );
+    const pending = loop.run(runInput());
+    await Promise.resolve();
+    killSwitch.engage();
+    await expect(pending).resolves.toMatchObject({ termination: 'KILL_SWITCH' });
+    expect(fallbackCalls).toBe(0);
+  });
+
+  it('probe (b): the run deadline aborts an in-flight provider call', async () => {
+    let aborted = false;
+    const loop = new BoundedRunLoop(
+      routerWith([
+        provider('primary', async (request) => {
+          request.signal.addEventListener('abort', () => (aborted = true), { once: true });
+          return hang(request, new ProviderError('TIMEOUT', 'deadline', false));
+        }),
+        provider('fallback', async () => response()),
+      ]),
+      tools(),
+    );
+    const budgets = { maxDurationMs: 25, maxCostUsd: 10, maxActions: 3, maxFailures: 3, maxIterations: 3 };
+    const result = await loop.run(runInput({ profile: profile({ budgets }) }));
+    expect(result.termination).toBe('TIMEOUT');
+    expect(aborted).toBe(true);
+  }, 2_000);
+
+  it('probe (c): an expired lease holder can neither renew nor release its replacement', async () => {
+    let now = 0;
+    const port = new LocalOnlyLeasePort(() => now);
+    const key = { workspaceId: IDS.workspace, jobId: 'j', window: 'w' };
+    const stale = await port.acquire(key, 100);
+    now = 200;
+    const replacement = await port.acquire(key, 100);
+    expect(replacement?.token).toBeGreaterThan(stale?.token ?? Infinity);
+    expect(await stale?.heartbeat()).toBe(false);
+    await stale?.release();
+    expect(await port.acquire(key, 100)).toBeUndefined();
+    expect(await replacement?.heartbeat()).toBe(true);
+  });
+
+  it('probe (c): tool calls carry the lease fencing token', async () => {
+    const tokens: unknown[] = [];
+    const port = new LocalOnlyLeasePort();
+    const loop = new BoundedRunLoop(
+      routerWith([provider('primary', async () => toolCall()), provider('fallback', async () => response())]),
+      new TierZeroToolExecutor([listTasks], {
+        call: async (request) => {
+          tokens.push(request.fencingToken);
+          return ['task'];
+        },
+      }),
+      { workspaceLease: { port, ttlMs: 60_000 } },
+    );
+    await loop.run({ ...runInput({ profile: profile({ budgets: { maxDurationMs: 60_000, maxCostUsd: 10, maxActions: 1, maxFailures: 3, maxIterations: 3 } }) }), leaseScope: { jobId: 'j', window: 'w' } });
+    expect(tokens).toEqual([expect.any(Number)]);
+  });
+
+  it('probe (d) / SWM-R-009: Night Shift rejects negative or NaN costs and records nothing after a kill', () => {
+    const nightShift = new NightShiftController();
+    nightShift.configure({ maxRuns: 5, maxSpendUsd: 1, allowedCapabilityIds: ['ops.tasks.list'], autonomyCeiling: 2 });
+    nightShift.begin({ desktopRunning: true, leaseAvailable: true, killSwitchEngaged: false });
+    const request = (estimatedCostUsd: number) => ({ estimatedCostUsd, capabilityIds: ['ops.tasks.list'], autonomyLevel: 1 });
+    expect(nightShift.canStart(request(-5))).toEqual({ allowed: false, reason: 'NIGHT_SHIFT_INVALID_COST' });
+    expect(nightShift.canStart(request(Number.NaN))).toEqual({ allowed: false, reason: 'NIGHT_SHIFT_INVALID_COST' });
+    expect(() => nightShift.recordRun(request(-5))).toThrow('NIGHT_SHIFT_INVALID_COST');
+    expect(() => nightShift.recordRun({ ...request(0.1), capabilityIds: ['core.admin'] })).toThrow('NIGHT_SHIFT_CAPABILITY_DENIED');
+    nightShift.recordRun(request(0.9));
+    expect(nightShift.canStart(request(0.2))).toEqual({ allowed: false, reason: 'NIGHT_SHIFT_SPEND_CAP' });
+    nightShift.kill();
+    expect(() => nightShift.recordRun(request(0))).toThrow('NIGHT_SHIFT_KILLED');
+  });
+
+  it('SWM-R-004: releases the workspace lease exactly once on every termination path', async () => {
+    const cases: { termination: string; build: (port: ReturnType<typeof countingPort>) => Promise<{ termination: string }> }[] = [
+      { termination: 'COMPLETED', build: (port) => leasedRun(port, async () => response()) },
+      { termination: 'BUDGET_EXCEEDED', build: (port) => leasedRun(port, async () => toolCall(), { maxIterations: 1 }) },
+      { termination: 'FAILED', build: (port) => leasedRun(port, async () => { throw new ProviderError('INVALID_RESPONSE', 'bad', false); }) },
+      { termination: 'LEASE_LOST', build: (port) => { port.beats = 0; return leasedRun(port, async () => toolCall()); } },
+      {
+        termination: 'CANCELED',
+        build: (port) => {
+          const controller = new AbortController();
+          controller.abort();
+          return leasedRun(port, async () => response(), {}, { signal: controller.signal });
+        },
+      },
+      {
+        termination: 'KILL_SWITCH',
+        build: (port) => {
+          const killSwitch = new LocalKillSwitch();
+          killSwitch.engage();
+          return leasedRun(port, async () => response(), {}, {}, killSwitch);
+        },
+      },
+    ];
+    for (const item of cases) {
+      const port = countingPort();
+      await expect(item.build(port)).resolves.toMatchObject({ termination: item.termination });
+      expect({ termination: item.termination, releases: port.releases }).toEqual({ termination: item.termination, releases: 1 });
+    }
+  });
+
+  it('SWM-R-005: the kill switch aborts an in-flight tool call', async () => {
+    const killSwitch = new LocalKillSwitch();
+    let started!: () => void;
+    const toolStarted = new Promise<void>((resolve) => (started = resolve));
+    const loop = new BoundedRunLoop(
+      routerWith([provider('primary', async () => toolCall()), provider('fallback', async () => response())]),
+      new TierZeroToolExecutor([listTasks], {
+        call: async (request) =>
+          new Promise((_, reject) => {
+            started();
+            request.signal.addEventListener('abort', () => reject(new Error('ABORTED')), { once: true });
+          }),
+      }),
+      { killSwitch },
+    );
+    const pending = loop.run(runInput());
+    await toolStarted;
+    killSwitch.engage();
+    const result = await pending;
+    expect(result.termination).toBe('KILL_SWITCH');
+    expect(result.artifacts.filter((artifact) => (artifact.content as { status?: string }).status === 'ok')).toEqual([]);
+  });
+
+  it('SWM-R-006: a negative provider cost fails the run closed instead of throwing', async () => {
+    const loop = new BoundedRunLoop(
+      routerWith([provider('primary', async () => ({ ...response(), usage: { inputTokens: 1, outputTokens: 1, costUsd: -1 } })), provider('fallback', async () => response())]),
+      tools(),
+    );
+    await expect(loop.run(runInput())).resolves.toMatchObject({ termination: 'FAILED', counters: { costUsd: 0 } });
+  });
+
+  it('SWM-R-006: the kill switch wins when it races budget exhaustion', async () => {
+    const killSwitch = new LocalKillSwitch();
+    const loop = new BoundedRunLoop(
+      routerWith([
+        provider('primary', async () => {
+          killSwitch.engage();
+          return { ...response(), usage: { inputTokens: 1, outputTokens: 1, costUsd: 50 } };
+        }),
+        provider('fallback', async () => response()),
+      ]),
+      tools(),
+      { killSwitch },
+    );
+    await expect(loop.run(runInput())).resolves.toMatchObject({ termination: 'KILL_SWITCH' });
+  });
+
+  it('SWM-R-006/008: MCP rejects revoked credentials and aborted signals before the transport', async () => {
+    let transportCalls = 0;
+    const transport = { listTools: async () => [], callTool: async () => { transportCalls += 1; return {}; } };
+    const mcp = new McpClientBoundary();
+    mcp.register({ id: 'revoked', allowedTools: ['read'], credential: { id: 'r', scope: 'mcp:r', expiresAt: '2027-01-01T00:00:00.000Z', revokedAt: '2026-01-01T00:00:00.000Z' }, transport, externalCallsEnabled: true });
+    mcp.register({ id: 'live', allowedTools: ['read'], credential: { id: 'l', scope: 'mcp:l', expiresAt: '2027-01-01T00:00:00.000Z', revokedAt: null }, transport, externalCallsEnabled: true });
+    const now = new Date('2026-06-01T00:00:00.000Z');
+    await expect(mcp.callTool('revoked', 'read', {}, new AbortController().signal, now)).rejects.toThrow('CREDENTIAL_EXPIRED_OR_REVOKED');
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(mcp.callTool('live', 'read', {}, aborted.signal, now)).rejects.toThrow('CANCELED');
+    await expect(mcp.listTools('live', aborted.signal, now)).rejects.toThrow('CANCELED');
+    expect(transportCalls).toBe(0);
+  });
+});
+
+function countingPort() {
+  const port = {
+    releases: 0,
+    beats: Number.POSITIVE_INFINITY,
+    acquire: async () => ({
+      token: 1,
+      heartbeat: async () => port.beats-- > 0,
+      release: async () => {
+        port.releases += 1;
+      },
+    }),
+  };
+  return port;
+}
+
+function leasedRun(
+  port: ReturnType<typeof countingPort>,
+  complete: AiProvider['complete'],
+  budgets: Partial<AgentProfileType['budgets']> = {},
+  extra: Partial<AgentRunInput> = {},
+  killSwitch?: LocalKillSwitch,
+) {
+  const loop = new BoundedRunLoop(routerWith([provider('primary', complete), provider('fallback', complete)]), tools(), {
+    workspaceLease: { port, ttlMs: 60_000 },
+    ...(killSwitch ? { killSwitch } : {}),
+  });
+  const base = runInput({ profile: profile({ budgets: { ...profile().budgets, ...budgets } }), ...extra });
+  return loop.run({ ...base, leaseScope: { jobId: 'j', window: 'w' } });
+}

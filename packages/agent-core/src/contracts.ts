@@ -163,7 +163,7 @@ export interface AiProvider {
 
 export class ProviderError extends Error {
   constructor(
-    readonly code: 'UNAVAILABLE' | 'RATE_LIMITED' | 'TIMEOUT' | 'INVALID_RESPONSE' | 'CONTEXT_OVERFLOW',
+    readonly code: 'UNAVAILABLE' | 'RATE_LIMITED' | 'TIMEOUT' | 'INVALID_RESPONSE' | 'CONTEXT_OVERFLOW' | 'CANCELED',
     message: string,
     readonly retryable: boolean,
   ) {
@@ -195,6 +195,8 @@ export interface CapabilityCall {
   readonly traceId: string;
   readonly idempotencyKey: string;
   readonly signal: AbortSignal;
+  /** Workspace-lease fencing value; the authority rejects writes carrying a stale token. */
+  readonly fencingToken?: number;
 }
 
 /** Tier-0 is the sole agent-core bridge into the Capability Bus. */

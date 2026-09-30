@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["node"]
   },
-  "include": ["manifest.ts", "contracts.ts"]
+  "include": ["manifest.ts", "contracts.ts", "server", "*.test.ts"]
 }

@@ -9,7 +9,8 @@
   },
   "exports": {
     "./manifest": "./manifest.ts",
-    "./contracts": "./contracts.ts"
+    "./contracts": "./contracts.ts",
+    "./server": "./server/profile-service.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
@@ -17,6 +18,8 @@
   "dependencies": {
     "@xyra/agent-core": "0.1.0",
     "@xyra/contracts": "0.1.0",
+    "@xyra/core": "0.1.0",
+    "@xyra/db": "0.1.0",
     "zod": "4.6.5"
   }
 }

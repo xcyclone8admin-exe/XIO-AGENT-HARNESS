@@ -10,6 +10,8 @@ export interface WorkspaceLeaseKey {
 }
 
 export interface WorkspaceLeaseHandle {
+  /** Monotonically increasing fencing value; downstream authorities reject stale holders. */
+  readonly token: number;
   /** Renews the TTL; false means the lease is lost and the holder must stop. */
   heartbeat(): Promise<boolean>;
   release(): Promise<void>;
@@ -25,24 +27,27 @@ export interface WorkspaceLeasePort {
  * expiry. It makes no multi-device claim; synced workspaces must inject the cloud port.
  */
 export class LocalOnlyLeasePort implements WorkspaceLeasePort {
-  private readonly held = new Map<string, number>();
+  private readonly held = new Map<string, { readonly expiry: number; readonly token: number }>();
+  private nextToken = 0;
 
   constructor(private readonly now: () => number = Date.now) {}
 
   async acquire(key: WorkspaceLeaseKey, ttlMs: number): Promise<WorkspaceLeaseHandle | undefined> {
     const id = JSON.stringify([key.workspaceId, key.jobId, key.window]);
-    const expiry = this.held.get(id);
-    if (expiry !== undefined && expiry > this.now()) return undefined;
-    this.held.set(id, this.now() + ttlMs);
+    const held = this.held.get(id);
+    if (held !== undefined && held.expiry > this.now()) return undefined;
+    const token = ++this.nextToken;
+    this.held.set(id, { expiry: this.now() + ttlMs, token });
     return {
+      token,
       heartbeat: async () => {
         const current = this.held.get(id);
-        if (current === undefined || current <= this.now()) return false;
-        this.held.set(id, this.now() + ttlMs);
+        if (current === undefined || current.token !== token || current.expiry <= this.now()) return false;
+        this.held.set(id, { expiry: this.now() + ttlMs, token });
         return true;
       },
       release: async () => {
-        this.held.delete(id);
+        if (this.held.get(id)?.token === token) this.held.delete(id);
       },
     };
   }

@@ -43,16 +43,24 @@ export class ModelRouter {
     for (let index = 0; index < candidates.length; index += 1) {
       const routed = candidates[index];
       if (!routed) continue;
+      let signal: AbortSignal | undefined;
       try {
         const response = await retryOperation(
-          () => routed.provider.complete(buildRequest(routed.model)),
+          () => {
+            const providerRequest = buildRequest(routed.model);
+            signal = providerRequest.signal;
+            if (signal.aborted) throw new ProviderError('CANCELED', 'Provider call canceled', false);
+            return routed.provider.complete(providerRequest);
+          },
           {
-            shouldRetry: (error) => error instanceof ProviderError && error.retryable,
+            shouldRetry: (error) => !signal?.aborted && error instanceof ProviderError && error.retryable,
             onRetry: (retry) => hooks?.onRetry?.(routed.provider.id, retry),
           },
         );
         return { response, routed };
       } catch (error) {
+        // Cancellation, kill switch, and deadline exhaustion are terminal: never fall back.
+        if (signal?.aborted) throw new ProviderError('CANCELED', 'Provider call canceled', false);
         lastError = error;
         if (index < candidates.length - 1) hooks?.onFallback?.(routed.provider.id);
       }

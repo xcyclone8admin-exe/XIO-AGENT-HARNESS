@@ -35,6 +35,7 @@ export class McpClientBoundary {
   }
 
   async listTools(serverId: string, signal: AbortSignal, now = new Date()): Promise<readonly McpToolDescriptor[]> {
+    if (signal.aborted) throw new Error('CANCELED');
     const server = this.authorize(serverId, now);
     return (await server.transport.listTools(signal)).filter((tool) => server.allowedTools.includes(tool.name));
   }
@@ -46,6 +47,7 @@ export class McpClientBoundary {
     signal: AbortSignal,
     now = new Date(),
   ): Promise<unknown> {
+    if (signal.aborted) throw new Error('CANCELED');
     const server = this.authorize(serverId, now);
     if (!server.externalCallsEnabled) throw new Error('MCP_EXTERNAL_CALLS_DISABLED');
     if (!server.allowedTools.includes(toolName)) throw new Error('MCP_TOOL_NOT_GRANTED');

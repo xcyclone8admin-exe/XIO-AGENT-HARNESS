@@ -1,4 +1,4 @@
-﻿import type { EvalMetrics, PromptVersion } from './contracts';
+import type { EvalMetrics, PromptVersion } from './contracts';
 
 /** In-memory version registry; persistence is the append-only swarm_prompt_versions table. */
 export class PromptRegistry {

@@ -8,6 +8,7 @@ export interface TierZeroContext {
   readonly runId: string;
   readonly traceId: string;
   readonly signal: AbortSignal;
+  readonly fencingToken?: number;
 }
 
 /**
@@ -37,6 +38,7 @@ export class TierZeroToolExecutor {
         traceId: context.traceId,
         idempotencyKey: `${context.runId}:${call.id}`,
         signal: context.signal,
+        ...(context.fencingToken === undefined ? {} : { fencingToken: context.fencingToken }),
       });
       return { callId: call.id, capabilityId: capability.id, status: 'ok', output };
     } catch (error) {

@@ -88,6 +88,7 @@ export class BoundedRunLoop {
     this.controllers.set(input.runId, controller);
     const unsubscribeKill = this.killSwitch.onEngage?.(() => controller.abort());
     const budget = new BudgetTracker(input.profile.budgets, this.now());
+    const deadline = setTimeout(() => controller.abort(), input.profile.budgets.maxDurationMs);
     const events: RunEvent[] = [];
     const toolResults: ToolResult[] = [];
     const artifacts: RunArtifact[] = [];
@@ -144,7 +145,21 @@ export class BoundedRunLoop {
           budget.recordFailure();
           return this.finish(input.runId, 'FAILED', null, budget, events, artifacts, emit, error instanceof Error ? error.message : 'PROVIDER_FAILED');
         }
-        budget.recordCost(completion.response.usage.costUsd);
+        try {
+          budget.recordCost(completion.response.usage.costUsd);
+        } catch (error) {
+          budget.recordFailure();
+          return this.finish(
+            input.runId,
+            'FAILED',
+            null,
+            budget,
+            events,
+            artifacts,
+            emit,
+            error instanceof Error ? error.message : 'INVALID_PROVIDER_COST',
+          );
+        }
         const afterModel = this.checkTerminal(budget, controller.signal);
         if (afterModel) return this.finish(input.runId, afterModel, null, budget, events, artifacts, emit);
         if (completion.response.toolCalls.length === 0) {
@@ -166,6 +181,7 @@ export class BoundedRunLoop {
               runId: input.runId,
               traceId: input.runId,
               signal: controller.signal,
+              ...(wsLease === undefined ? {} : { fencingToken: wsLease.token }),
             },
             call,
           );
@@ -180,6 +196,7 @@ export class BoundedRunLoop {
       }
     } finally {
       this.controllers.delete(input.runId);
+      clearTimeout(deadline);
       unsubscribeKill?.();
       input.signal?.removeEventListener('abort', onExternalAbort);
       lease?.release();
@@ -189,9 +206,10 @@ export class BoundedRunLoop {
 
   private checkTerminal(budget: BudgetTracker, signal: AbortSignal): RunTermination | undefined {
     if (this.killSwitch.engaged()) return 'KILL_SWITCH';
-    if (signal.aborted) return 'CANCELED';
     const check = budget.check(this.now());
-    return check.allowed ? undefined : check.termination;
+    if (!check.allowed) return check.termination;
+    if (signal.aborted) return 'CANCELED';
+    return undefined;
   }
 
   private finish(

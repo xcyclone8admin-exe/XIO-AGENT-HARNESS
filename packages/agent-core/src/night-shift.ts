@@ -41,6 +41,8 @@ export class NightShiftController {
     if (this.state !== 'RUNNING') return { allowed: false, reason: `NIGHT_SHIFT_${this.state}` };
     const leash = this.leash;
     if (!leash) return { allowed: false, reason: 'NIGHT_SHIFT_NOT_CONFIGURED' };
+    if (!Number.isFinite(request.estimatedCostUsd) || request.estimatedCostUsd < 0)
+      return { allowed: false, reason: 'NIGHT_SHIFT_INVALID_COST' };
     if (this.runs >= leash.maxRuns) return { allowed: false, reason: 'NIGHT_SHIFT_RUN_CAP' };
     if (this.spentUsd + request.estimatedCostUsd > leash.maxSpendUsd) return { allowed: false, reason: 'NIGHT_SHIFT_SPEND_CAP' };
     if (request.autonomyLevel > leash.autonomyCeiling) return { allowed: false, reason: 'NIGHT_SHIFT_AUTONOMY_CEILING' };
@@ -50,11 +52,11 @@ export class NightShiftController {
     return { allowed: true };
   }
 
-  recordRun(costUsd: number): void {
-    const permitted = this.canStart({ estimatedCostUsd: costUsd, capabilityIds: [], autonomyLevel: 0 });
-    if (!permitted.allowed && permitted.reason !== 'NIGHT_SHIFT_CAPABILITY_DENIED') throw new Error(permitted.reason);
+  recordRun(request: NightShiftRunRequest): void {
+    const permitted = this.canStart(request);
+    if (!permitted.allowed) throw new Error(permitted.reason);
     this.runs += 1;
-    this.spentUsd += costUsd;
+    this.spentUsd += request.estimatedCostUsd;
   }
 
   complete(): NightShiftState {
