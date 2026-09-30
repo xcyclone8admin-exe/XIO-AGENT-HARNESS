@@ -174,6 +174,13 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
       fresh,
       files.map((name) => migration(`platform/${name.slice(0, -4)}`, readFileSync(`${dir}${name}`, 'utf8'))),
     );
+    // Simulate a database from an earlier release with table-wide UPDATE before manifest grants
+    // became column-scoped. Re-running setup must revoke that stale privilege.
+    await prepareLocalAppRole(fresh, [
+      { name: 'tenants', class: 'lww' },
+      { name: 'workspaces', class: 'lww' },
+      { name: 'ops_projects', class: 'lww' },
+    ]);
     await prepareLocalAppRole(fresh, [
       { name: 'tenants', class: 'lww' },
       { name: 'workspaces', class: 'lww' },

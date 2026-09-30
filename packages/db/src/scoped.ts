@@ -90,6 +90,11 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
     );
     if (!described.rows.length) throw new Error(`Table ${name} does not exist`);
     const updatable = described.rows.map((row) => row.column_name).filter((c) => !columns.includes(c));
+    const allColumns = described.rows.map((row) => row.column_name);
+    columnGrants.push(`REVOKE UPDATE ON ${name} FROM xyra_app`);
+    if (allColumns.length) {
+      columnGrants.push(`REVOKE UPDATE (${allColumns.join(', ')}) ON ${name} FROM xyra_app`);
+    }
     columnGrants.push(`GRANT SELECT, INSERT ON ${name} TO xyra_app`);
     if (updatable.length) columnGrants.push(`GRANT UPDATE (${updatable.join(', ')}) ON ${name} TO xyra_app`);
   }
