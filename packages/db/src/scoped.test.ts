@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { PGlite } from '@electric-sql/pglite';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { applyPGliteMigrations, migration } from './migrations';
 import { openLocalStore } from './pglite';
@@ -15,32 +15,94 @@ let scoped: LocalScopedStore;
 
 beforeAll(async () => {
   db = await openLocalStore();
-  const sql = readFileSync(fileURLToPath(new URL('../migrations/0001_platform.sql', import.meta.url)), 'utf8');
-  const modules = readFileSync(fileURLToPath(new URL('../migrations/0002_modules.sql', import.meta.url)), 'utf8');
-  await applyPGliteMigrations(db, [migration('platform/0001_platform', sql), migration('platform/0002_modules', modules)]);
+  const dir = fileURLToPath(new URL('../migrations/', import.meta.url));
+  const files = readdirSync(dir)
+    .filter((name) => name.endsWith('.sql'))
+    .sort();
+  await applyPGliteMigrations(
+    db,
+    files.map((name) => migration(`platform/${name.slice(0, -4)}`, readFileSync(`${dir}${name}`, 'utf8'))),
+  );
   await prepareLocalAppRole(db);
   await db.query('INSERT INTO tenants(id,name) VALUES ($1,$2),($3,$4)', [tenantA, 'A', tenantB, 'B']);
-  await db.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3),($4,$5,$6)',
-    [workspaceA, tenantA, 'A', workspaceB, tenantB, 'B']);
+  await db.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3),($4,$5,$6)', [
+    workspaceA,
+    tenantA,
+    'A',
+    workspaceB,
+    tenantB,
+    'B',
+  ]);
   scoped = new LocalScopedStore(db);
 }, 60_000);
 
-afterAll(async () => { await db?.close(); });
+afterAll(async () => {
+  await db?.close();
+});
 
 test('a scoped query sees only its own workspace and resets role after the transaction', async () => {
-  const a = await scoped.query<{ id: string }>({ tenantId: tenantA, workspaceId: workspaceA },
-    'SELECT id FROM workspaces ORDER BY id');
+  const a = await scoped.query<{ id: string }>(
+    { tenantId: tenantA, workspaceId: workspaceA },
+    'SELECT id FROM workspaces ORDER BY id',
+  );
   expect(a.rows.map((row) => row.id)).toEqual([workspaceA]);
-  const b = await scoped.query<{ id: string }>({ tenantId: tenantB, workspaceId: workspaceB },
-    'SELECT id FROM workspaces ORDER BY id');
+  const b = await scoped.query<{ id: string }>(
+    { tenantId: tenantB, workspaceId: workspaceB },
+    'SELECT id FROM workspaces ORDER BY id',
+  );
   expect(b.rows.map((row) => row.id)).toEqual([workspaceB]);
   const identity = await db.query<{ current_user: string }>('SELECT current_user');
   expect(identity.rows[0]?.current_user).not.toBe('xyra_app');
 });
 
 test('a scoped write cannot insert another tenant', async () => {
-  await expect(scoped.query({ tenantId: tenantA, workspaceId: workspaceA },
-    'INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)',
-    ['019a0000-0000-7000-8000-000000000099', tenantB, 'intruder']))
-    .rejects.toThrow();
+  await expect(
+    scoped.query(
+      { tenantId: tenantA, workspaceId: workspaceA },
+      'INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)',
+      ['019a0000-0000-7000-8000-000000000099', tenantB, 'intruder'],
+    ),
+  ).rejects.toThrow();
+});
+
+test('swarm tables isolate tenants and keep run records append-only', async () => {
+  const profileA = '019a0000-0000-7000-8000-000000000201';
+  const runA = '019a0000-0000-7000-8000-000000000202';
+  const actorA = '019a0000-0000-7000-8000-000000000203';
+  const scopeA = { tenantId: tenantA, workspaceId: workspaceA };
+  await scoped.query(
+    scopeA,
+    `INSERT INTO swarm_agent_profiles(id,tenant_id,workspace_id,role_id,charter,default_provider,
+       default_model,budgets,approval_policy,memory_scope,created_by)
+     VALUES ($1,$2,$3,'builder','Build things','anthropic','claude','{}','ask','{}',$4)`,
+    [profileA, tenantA, workspaceA, actorA],
+  );
+  await scoped.query(
+    scopeA,
+    `INSERT INTO swarm_runs(id,tenant_id,workspace_id,profile_id,termination,iterations,actions,
+       failures,cost_usd,budgets,started_at,ended_at,created_by)
+     VALUES ($1,$2,$3,$4,'LEASE_LOST',1,0,0,0,'{}',now(),now(),$5)`,
+    [runA, tenantA, workspaceA, profileA, actorA],
+  );
+
+  const seenByB = await scoped.query(
+    { tenantId: tenantB, workspaceId: workspaceB },
+    'SELECT id FROM swarm_agent_profiles UNION ALL SELECT id FROM swarm_runs',
+  );
+  expect(seenByB.rows).toEqual([]);
+  // A run cannot point at another tenant's profile, even with a guessed id.
+  await expect(
+    scoped.query(
+      { tenantId: tenantB, workspaceId: workspaceB },
+      `INSERT INTO swarm_runs(id,tenant_id,workspace_id,profile_id,termination,iterations,actions,
+       failures,cost_usd,budgets,started_at,ended_at,created_by)
+     VALUES ('019a0000-0000-7000-8000-000000000204',$1,$2,$3,'COMPLETED',0,0,0,0,'{}',now(),now(),$4)`,
+      [tenantB, workspaceB, profileA, actorA],
+    ),
+  ).rejects.toThrow();
+  // The app role has no UPDATE grant on append tables, and the trigger holds even for the owner.
+  await expect(
+    scoped.query(scopeA, "UPDATE swarm_runs SET output = 'x' WHERE id = $1", [runA]),
+  ).rejects.toThrow();
+  await expect(db.query('DELETE FROM swarm_runs WHERE id = $1', [runA])).rejects.toThrow(/append-only/);
 });
