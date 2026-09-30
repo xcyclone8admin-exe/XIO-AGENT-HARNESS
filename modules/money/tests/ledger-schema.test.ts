@@ -329,3 +329,59 @@ test('posting rejects live environments and per-asset imbalance before database 
     writer.post(scope, ACTOR_A, { ...common, id: randomUUID(), environment: 'live' }),
   ).rejects.toMatchObject({ code: 'LIVE_TRADING_DISABLED' });
 });
+
+test('ledger query, aggregate, reconciliation, and discrepancy APIs return contract shapes', async () => {
+  const writer = new PGliteLedgerWriter(db);
+  const scope = { tenantId: TA, workspaceId: WA, hlc: '1790800001000-0001-devicea' };
+  await writer.post(scope, ACTOR_A, {
+    id: randomUUID(), bookId: BOOK_A, environment: 'actual', effectiveDate: '2026-09-30',
+    description: 'Second fixture posting', source: 'money',
+    entries: [{ accountId: ACCT_A1, asset: 'USD', units: '1' }, { accountId: ACCT_A2, asset: 'USD', units: '-1' }],
+  });
+  const page1 = await writer.transactions(scope, { environment: 'actual', bookId: BOOK_A, limit: 1 });
+  expect(page1.items).toHaveLength(1);
+  expect(page1.items[0]?.entries).toHaveLength(2);
+  expect(page1.nextCursor).toBeTruthy();
+  const page2 = await writer.transactions(scope, { environment: 'actual', bookId: BOOK_A, limit: 1, cursor: page1.nextCursor! });
+  expect(page2.items).toHaveLength(1);
+  expect(page2.items[0]?.id).not.toBe(page1.items[0]?.id);
+  expect(page2.nextCursor).toBeNull();
+
+  const trial = await writer.trialBalance(scope, { environment: 'actual', bookId: BOOK_A });
+  expect(trial.rows.map((row) => row.debit)).toEqual(['101', '0']);
+  expect(trial.totals).toEqual([{ asset: 'USD', scale: 2, debit: '101', credit: '101', balanced: true }]);
+  const totals = await writer.totals(scope, { environment: 'actual', asset: 'USD' });
+  expect(totals.byType).toMatchObject({ asset: '101', equity: '-101' });
+
+  const run = await writer.reconcile(scope, ACTOR_A, { environment: 'actual', bookId: BOOK_A });
+  expect(run.status).toBe('clean');
+  expect(run.discrepancyCount).toBe(0);
+  const repeated = await writer.reconcile(scope, ACTOR_A, { environment: 'actual', bookId: BOOK_A });
+  expect(repeated.id).toBe(run.id);
+  expect(repeated.reused).toBe(true);
+
+  const paperBook = await writer.createBook(scope, ACTOR_A, {
+    name: 'Discrepancy test', environment: 'paper', baseAsset: 'USD', ownerModule: 'money', purpose: 'business',
+  });
+  const cash = await writer.createAccount(scope, ACTOR_A, { bookId: paperBook.id, code: 'cash', name: 'Cash', type: 'asset' });
+  const equity = await writer.createAccount(scope, ACTOR_A, { bookId: paperBook.id, code: 'equity', name: 'Equity', type: 'equity' });
+  const firstId = randomUUID();
+  const importPosting = {
+    id: firstId, bookId: paperBook.id, environment: 'paper' as const, effectiveDate: '2026-09-30',
+    description: 'Imported line', source: 'money',
+    entries: [{ accountId: cash.id, asset: 'USD', units: '10', externalRef: 'discrepancy-ref' },
+      { accountId: equity.id, asset: 'USD', units: '-10' }],
+  };
+  await writer.post(scope, ACTOR_A, importPosting);
+  const duplicate = await writer.post(scope, ACTOR_A, { ...importPosting, id: randomUUID() });
+  expect(duplicate.status).toBe('duplicate');
+  const open = await writer.discrepancies(scope, { environment: 'paper', status: 'open', bookId: paperBook.id });
+  expect(open).toHaveLength(1);
+  const assigned = await writer.assignDiscrepancy(scope, ACTOR_A, { discrepancyId: open[0]!.id, ownerId: ACTOR_A });
+  expect(assigned.status).toBe('assigned');
+  const resolved = await writer.resolveDiscrepancy(scope, ACTOR_A, {
+    discrepancyId: open[0]!.id, resolution: 'Verified duplicate import',
+  });
+  expect(resolved.status).toBe('resolved');
+  expect((await writer.discrepancies(scope, { environment: 'paper', status: 'resolved' }))).toHaveLength(1);
+});

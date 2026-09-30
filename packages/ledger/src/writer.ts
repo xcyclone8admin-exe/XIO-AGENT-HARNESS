@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { PGlite } from '@electric-sql/pglite';
 import {
   Account,
@@ -6,6 +6,19 @@ import {
   Balance,
   BalanceQuery,
   Book,
+  Discrepancy,
+  DiscrepancyQuery,
+  Transaction,
+  TransactionPage,
+  TransactionQuery,
+  TrialBalance,
+  TrialBalanceQuery,
+  TotalsQuery,
+  TypeTotals,
+  ReconcileInput,
+  ReconciliationRun,
+  AssignDiscrepancyInput,
+  ResolveDiscrepancyInput,
   CreateAccountInput,
   CreateBookInput,
   MinorUnits,
@@ -13,7 +26,7 @@ import {
   PostTransactionInput,
   ReverseTransactionInput,
 } from './contracts';
-import type { LedgerEnvironment, LedgerScope } from './contracts';
+import type { LedgerApi, LedgerEnvironment, LedgerScope, TrialBalance as TrialBalanceType } from './contracts';
 import { toUnits } from './units';
 
 export type LedgerStoreErrorCode =
@@ -76,7 +89,7 @@ function pgMessage(error: unknown): string {
  * PGlite ledger write/read primitive. Posting, entries and the SQL balance projection share one
  * scoped transaction. Higher-level aggregation/reconciliation and capability wiring build on this.
  */
-export class PGliteLedgerWriter {
+export class PGliteLedgerWriter implements LedgerApi {
   constructor(private readonly db: PGlite) {}
 
   private async inScope<T>(scope: LedgerScope, work: (tx: TxContext) => Promise<T>): Promise<T> {
@@ -476,6 +489,260 @@ export class PGliteLedgerWriter {
         }),
       );
     });
+  }
+
+  async transactions(scope: LedgerScope, value: TransactionQuery): Promise<TransactionPage> {
+    const query = TransactionQuery.parse(value);
+    if (query.from && query.to && query.from > query.to) throw new LedgerStoreError('NOT_FOUND', 'Invalid date range');
+    const cursor = query.cursor ? this.decodeCursor(query.cursor) : null;
+    return this.inScope(scope, async (tx) => {
+      const { rows } = await tx.query<Record<string, unknown>>(
+        `SELECT t.id,t.book_id,t.environment,t.effective_date::text,t.description,t.source,t.correlation_id,
+           t.reverses_id,r.id AS reversed_by_id,t.posted_by,t.posted_at
+         FROM ledger_transactions t LEFT JOIN ledger_transactions r
+           ON r.tenant_id=t.tenant_id AND r.workspace_id=t.workspace_id AND r.reverses_id=t.id
+         WHERE t.tenant_id=$1 AND t.workspace_id=$2 AND t.environment=$3
+           AND ($4::uuid IS NULL OR t.book_id=$4) AND ($5::uuid IS NULL OR t.correlation_id=$5)
+           AND ($6::date IS NULL OR t.effective_date >= $6) AND ($7::date IS NULL OR t.effective_date <= $7)
+           AND ($8::uuid IS NULL OR EXISTS (SELECT 1 FROM ledger_entries e WHERE e.tenant_id=t.tenant_id
+             AND e.workspace_id=t.workspace_id AND e.transaction_id=t.id AND e.account_id=$8))
+           AND ($9::date IS NULL OR (t.effective_date,t.id) < ($9::date,$10::uuid))
+         ORDER BY t.effective_date DESC,t.id DESC LIMIT $11`,
+        [scope.tenantId, scope.workspaceId, query.environment, query.bookId ?? null, query.correlationId ?? null,
+          query.from ?? null, query.to ?? null, query.accountId ?? null, cursor?.date ?? null, cursor?.id ?? null,
+          query.limit + 1],
+      );
+      const hasMore = rows.length > query.limit;
+      const pageRows = rows.slice(0, query.limit);
+      const items = [];
+      for (const row of pageRows) {
+        const entryResult = await tx.query<Record<string, unknown>>(
+          `SELECT id,transaction_id,line_no,account_id,asset,units::text,memo,external_ref FROM ledger_entries
+           WHERE tenant_id=$1 AND workspace_id=$2 AND transaction_id=$3 ORDER BY line_no`,
+          [scope.tenantId, scope.workspaceId, row['id']],
+        );
+        items.push(Transaction.parse({
+          id: row['id'], bookId: row['book_id'], environment: row['environment'],
+          effectiveDate: row['effective_date'], description: row['description'], source: row['source'],
+          correlationId: row['correlation_id'], reversesId: row['reverses_id'], reversedById: row['reversed_by_id'],
+          postedBy: row['posted_by'], postedAt: this.iso(row['posted_at']),
+          entries: entryResult.rows.map((entry) => ({
+            id: entry['id'], transactionId: entry['transaction_id'], lineNo: entry['line_no'],
+            accountId: entry['account_id'], asset: entry['asset'], units: String(entry['units']),
+            memo: entry['memo'], externalRef: entry['external_ref'],
+          })),
+        }));
+      }
+      const last = pageRows.at(-1);
+      const nextCursor = hasMore && last ? this.encodeCursor(String(last['effective_date']), String(last['id'])) : null;
+      return TransactionPage.parse({ items, nextCursor });
+    });
+  }
+
+  async trialBalance(scope: LedgerScope, value: TrialBalanceQuery): Promise<TrialBalanceType> {
+    const query = TrialBalanceQuery.parse(value);
+    return this.inScope(scope, async (tx) => {
+      const book = await tx.query(`SELECT 1 FROM ledger_books WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND environment=$4`,
+        [scope.tenantId, scope.workspaceId, query.bookId, query.environment]);
+      if (!book.rows.length) throw new LedgerStoreError('NOT_FOUND', 'Ledger book not found');
+      const { rows } = await tx.query<Record<string, unknown>>(
+        `SELECT a.id AS account_id,a.code AS account_code,a.name AS account_name,a.type AS account_type,
+          asst.code AS asset,asst.scale,COALESCE(sum(e.units),0)::text AS units
+         FROM ledger_accounts a JOIN ledger_assets asst ON asst.tenant_id=a.tenant_id AND asst.workspace_id=a.workspace_id
+         LEFT JOIN ledger_entries e ON e.tenant_id=a.tenant_id AND e.workspace_id=a.workspace_id AND e.account_id=a.id
+           AND e.book_id=a.book_id AND e.environment=a.environment AND e.asset=asst.code
+         WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.book_id=$3 AND a.environment=$4 AND a.deleted_hlc IS NULL
+         GROUP BY a.id,a.code,a.name,a.type,asst.code,asst.scale ORDER BY a.code,asst.code`,
+        [scope.tenantId, scope.workspaceId, query.bookId, query.environment],
+      );
+      const byAsset = new Map<string, { scale: number; debit: bigint; credit: bigint }>();
+      const mapped = rows.map((r) => {
+        const units = BigInt(String(r['units']));
+        const agg = byAsset.get(String(r['asset'])) ?? { scale: Number(r['scale']), debit: 0n, credit: 0n };
+        if (units > 0n) agg.debit += units; else agg.credit += -units;
+        byAsset.set(String(r['asset']), agg);
+        return { accountId: r['account_id'], accountCode: r['account_code'], accountName: r['account_name'],
+          accountType: r['account_type'], asset: r['asset'], scale: r['scale'], debit: (units > 0n ? units : 0n).toString(),
+          credit: (units < 0n ? -units : 0n).toString() };
+      });
+      return TrialBalance.parse({ environment: query.environment, bookId: query.bookId, rows: mapped,
+        totals: [...byAsset].map(([asset, x]) => ({ asset, scale: x.scale, debit: x.debit.toString(),
+          credit: x.credit.toString(), balanced: x.debit === x.credit })) });
+    });
+  }
+
+  async totals(scope: LedgerScope, value: TotalsQuery): Promise<TypeTotals> {
+    const query = TotalsQuery.parse(value);
+    return this.inScope(scope, async (tx) => {
+      const { rows } = await tx.query<Record<string, unknown>>(
+        `SELECT a.type,asst.scale,COALESCE(sum(e.units),0)::text AS units,count(DISTINCT b.id)::int AS book_count
+         FROM ledger_books b JOIN ledger_accounts a ON a.tenant_id=b.tenant_id AND a.workspace_id=b.workspace_id
+           AND a.book_id=b.id AND a.environment=b.environment AND a.deleted_hlc IS NULL
+         JOIN ledger_assets asst ON asst.tenant_id=b.tenant_id AND asst.workspace_id=b.workspace_id AND asst.code=$5
+         LEFT JOIN ledger_entries e ON e.tenant_id=a.tenant_id AND e.workspace_id=a.workspace_id AND e.account_id=a.id AND e.asset=$5
+         WHERE b.tenant_id=$1 AND b.workspace_id=$2 AND b.environment=$3 AND b.deleted_hlc IS NULL
+           AND ($4::uuid[] IS NULL OR b.id=ANY($4)) AND ($6::text IS NULL OR b.owner_module=$6)
+         GROUP BY a.type,asst.scale ORDER BY a.type`,
+        [scope.tenantId, scope.workspaceId, query.environment, query.bookIds?.length ? query.bookIds : null,
+          query.asset, query.ownerModule ?? null],
+      );
+      const bookCount = await tx.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM ledger_books b
+         WHERE b.tenant_id=$1 AND b.workspace_id=$2 AND b.environment=$3 AND b.deleted_hlc IS NULL
+           AND ($4::uuid[] IS NULL OR b.id=ANY($4)) AND ($5::text IS NULL OR b.owner_module=$5)
+           AND EXISTS (SELECT 1 FROM ledger_assets a WHERE a.tenant_id=b.tenant_id AND a.workspace_id=b.workspace_id AND a.code=$6)`,
+        [scope.tenantId, scope.workspaceId, query.environment, query.bookIds?.length ? query.bookIds : null,
+          query.ownerModule ?? null, query.asset],
+      );
+      const byType = Object.fromEntries(rows.map((r) => [String(r['type']), String(r['units'])]));
+      for (const type of ['asset', 'liability', 'equity', 'income', 'expense']) byType[type] ??= '0';
+      return TypeTotals.parse({ environment: query.environment, asset: query.asset, scale: rows[0]?.['scale'] ?? 0,
+        byType, bookCount: bookCount.rows[0]?.count ?? 0 });
+    });
+  }
+
+  async reconcile(scope: LedgerScope, actorId: string, value: ReconcileInput): Promise<ReconciliationRun> {
+    const input = ReconcileInput.parse(value);
+    return this.inScope(scope, async (tx) => {
+      const filter = [scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null];
+      const mismatches = await tx.query<Record<string, unknown>>(
+        `WITH truth AS (SELECT e.book_id,e.environment,e.account_id,e.asset,sum(e.units)::text AS units,count(*)::int AS entry_count
+          FROM ledger_entries e WHERE e.tenant_id=$1 AND e.workspace_id=$2 AND e.environment=$3
+            AND ($4::uuid IS NULL OR e.book_id=$4) GROUP BY e.book_id,e.environment,e.account_id,e.asset),
+         all_keys AS (SELECT book_id,environment,account_id,asset FROM truth UNION
+          SELECT book_id,environment,account_id,asset FROM ledger_balances WHERE tenant_id=$1 AND workspace_id=$2
+            AND environment=$3 AND ($4::uuid IS NULL OR book_id=$4))
+         SELECT k.book_id,k.environment,k.account_id,k.asset,t.units AS expected_units,b.units::text AS recorded_units,
+           t.entry_count,b.entry_count AS recorded_count,
+           CASE WHEN t.account_id IS NULL THEN 'orphan_balance' WHEN b.account_id IS NULL THEN 'missing_balance'
+             ELSE 'balance_mismatch' END AS kind
+         FROM all_keys k LEFT JOIN truth t USING(book_id,environment,account_id,asset)
+          LEFT JOIN ledger_balances b ON b.tenant_id=$1 AND b.workspace_id=$2 AND b.book_id=k.book_id
+            AND b.environment=k.environment AND b.account_id=k.account_id AND b.asset=k.asset
+         WHERE t.account_id IS NULL OR b.account_id IS NULL OR t.units<>b.units::text OR t.entry_count<>b.entry_count
+         ORDER BY k.book_id,k.account_id,k.asset`, filter);
+      const watermark = await tx.query<{ entry_count: number; latest_entry: string | null }>(
+        `SELECT count(*)::int AS entry_count,max(created_at)::text AS latest_entry FROM ledger_entries
+         WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::uuid IS NULL OR book_id=$4)`, filter);
+      const payload = JSON.stringify([scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null,
+        watermark.rows[0]?.entry_count ?? 0, watermark.rows[0]?.latest_entry ?? null]);
+      const runKey = createHash('sha256').update(payload).digest('hex');
+      const prior = await tx.query<Record<string, unknown>>(
+        `SELECT id,environment,book_id,run_key,checked_balances,discrepancy_count,status,started_at FROM ledger_reconciliation_runs
+         WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND book_id IS NOT DISTINCT FROM $4 AND run_key=$5`,
+        [scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null, runKey]);
+      if (prior.rows[0]) return this.runOut(prior.rows[0], true);
+      const id = randomUUID();
+      const status = mismatches.rows.length ? 'discrepancies' : 'clean';
+      const checked = await tx.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM (
+          SELECT e.book_id,e.account_id,e.asset FROM ledger_entries e WHERE e.tenant_id=$1 AND e.workspace_id=$2
+            AND e.environment=$3 AND ($4::uuid IS NULL OR e.book_id=$4) GROUP BY e.book_id,e.account_id,e.asset
+          UNION SELECT b.book_id,b.account_id,b.asset FROM ledger_balances b WHERE b.tenant_id=$1 AND b.workspace_id=$2
+            AND b.environment=$3 AND ($4::uuid IS NULL OR b.book_id=$4)) keys`, filter);
+      await tx.query(`INSERT INTO ledger_reconciliation_runs(id,tenant_id,workspace_id,environment,book_id,run_key,
+        checked_balances,discrepancy_count,status,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [id, scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null, runKey,
+          checked.rows[0]?.count ?? 0, mismatches.rows.length, status, actorId]);
+      for (const m of mismatches.rows) await tx.query(
+        `INSERT INTO ledger_discrepancies(id,tenant_id,workspace_id,run_id,kind,status,environment,book_id,account_id,asset,
+          expected_units,recorded_units,detail) VALUES($1,$2,$3,$4,$5,'open',$6,$7,$8,$9,$10,$11,$12)`,
+        [randomUUID(), scope.tenantId, scope.workspaceId, id, m['kind'], input.environment, m['book_id'], m['account_id'],
+          m['asset'], m['expected_units'], m['recorded_units'], 'Balance projection differs from immutable ledger entries']);
+      return ReconciliationRun.parse({ id, environment: input.environment, bookId: input.bookId ?? null, runKey,
+        checkedBalances: checked.rows[0]?.count ?? 0, discrepancyCount: mismatches.rows.length, status,
+        startedAt: new Date().toISOString(), reused: false });
+    });
+  }
+
+  async discrepancies(scope: LedgerScope, value: DiscrepancyQuery): Promise<Discrepancy[]> {
+    const query = DiscrepancyQuery.parse(value);
+    return this.inScope(scope, async (tx) => {
+      const { rows } = await tx.query<Record<string, unknown>>(
+        `SELECT id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
+           external_ref,detail,resolution,created_at,resolved_at FROM ledger_discrepancies
+         WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::text IS NULL OR status=$4)
+           AND ($5::uuid IS NULL OR book_id=$5) ORDER BY created_at DESC,id`,
+        [scope.tenantId, scope.workspaceId, query.environment, query.status ?? null, query.bookId ?? null]);
+      return rows.map((r) => this.discrepancyOut(r));
+    });
+  }
+
+  async assignDiscrepancy(scope: LedgerScope, actorId: string, value: AssignDiscrepancyInput): Promise<Discrepancy> {
+    const input = AssignDiscrepancyInput.parse(value);
+    return this.inScope(scope, async (tx) => {
+      const { rows } = await tx.query<Record<string, unknown>>(
+        `UPDATE ledger_discrepancies SET owner_id=$4,status='assigned',updated_at=now()
+         WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status<>'resolved'
+         RETURNING id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
+           external_ref,detail,resolution,created_at,resolved_at`,
+        [scope.tenantId, scope.workspaceId, input.discrepancyId, input.ownerId]);
+      if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Open discrepancy not found');
+      if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
+      return this.discrepancyOut(rows[0]);
+    });
+  }
+
+  async resolveDiscrepancy(scope: LedgerScope, actorId: string, value: ResolveDiscrepancyInput): Promise<Discrepancy> {
+    const input = ResolveDiscrepancyInput.parse(value);
+    return this.inScope(scope, async (tx) => {
+      const before = await tx.query<Record<string, unknown>>(
+        `SELECT id,book_id,environment,account_id,asset FROM ledger_discrepancies
+         WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status<>'resolved'`,
+        [scope.tenantId, scope.workspaceId, input.discrepancyId]);
+      const d = before.rows[0];
+      if (!d) throw new LedgerStoreError('NOT_FOUND', 'Open discrepancy not found');
+      if (input.rebuildProjection && d['account_id'] && d['asset']) {
+        await tx.query(`INSERT INTO ledger_balances(tenant_id,workspace_id,book_id,environment,account_id,asset,units,entry_count,as_of_hlc)
+          SELECT $1,$2,$5,$6,$3,$4,COALESCE(sum(units),0),count(*)::int,$7
+          FROM ledger_entries WHERE tenant_id=$1 AND workspace_id=$2 AND account_id=$3 AND asset=$4
+          ON CONFLICT(tenant_id,workspace_id,account_id,asset) DO UPDATE SET
+            units=EXCLUDED.units,entry_count=EXCLUDED.entry_count,as_of_hlc=GREATEST(ledger_balances.as_of_hlc,EXCLUDED.as_of_hlc)`,
+          [scope.tenantId, scope.workspaceId, d['account_id'], d['asset'], d['book_id'], d['environment'], scope.hlc ?? '']);
+      }
+      const { rows } = await tx.query<Record<string, unknown>>(
+        `UPDATE ledger_discrepancies SET status='resolved',resolution=$4,resolved_at=now(),updated_at=now()
+         WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3
+         RETURNING id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
+           external_ref,detail,resolution,created_at,resolved_at`,
+        [scope.tenantId, scope.workspaceId, input.discrepancyId, input.resolution]);
+      if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
+      return this.discrepancyOut(rows[0]);
+    });
+  }
+
+  private encodeCursor(date: string, id: string): string {
+    return Buffer.from(JSON.stringify({ date, id }), 'utf8').toString('base64url');
+  }
+
+  private decodeCursor(cursor: string): { date: string; id: string } {
+    try {
+      const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { date?: unknown; id?: unknown };
+      if (typeof decoded.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(decoded.date) ||
+        typeof decoded.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(decoded.id)) throw new Error('bad cursor');
+      return { date: decoded.date, id: decoded.id };
+    } catch {
+      throw new LedgerStoreError('NOT_FOUND', 'Invalid transaction cursor');
+    }
+  }
+
+  private iso(value: unknown): string {
+    return value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString();
+  }
+
+  private runOut(row: Record<string, unknown>, reused: boolean): ReconciliationRun {
+    return ReconciliationRun.parse({ id: row['id'], environment: row['environment'], bookId: row['book_id'],
+      runKey: row['run_key'], checkedBalances: row['checked_balances'], discrepancyCount: row['discrepancy_count'],
+      status: row['status'], startedAt: this.iso(row['started_at']), reused });
+  }
+
+  private discrepancyOut(row: Record<string, unknown>): Discrepancy {
+    return Discrepancy.parse({ id: row['id'], runId: row['run_id'], kind: row['kind'], status: row['status'],
+      ownerId: row['owner_id'], environment: row['environment'], bookId: row['book_id'], accountId: row['account_id'],
+      asset: row['asset'], expectedUnits: row['expected_units'] === null ? null : String(row['expected_units']),
+      recordedUnits: row['recorded_units'] === null ? null : String(row['recorded_units']), externalRef: row['external_ref'],
+      detail: row['detail'], resolution: row['resolution'], createdAt: this.iso(row['created_at']),
+      resolvedAt: row['resolved_at'] === null ? null : this.iso(row['resolved_at']) });
   }
 
   private bookOut(row: BookRow | undefined): unknown {
