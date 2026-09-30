@@ -201,6 +201,9 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
     ]);
     const store = new LocalScopedStore(fresh);
     const scope = { tenantId: tenantA, workspaceId: workspaceA };
+    await expect(
+      store.withServerScope(scope, 'test_ops', `${Date.now() + 61_000}-0001-testnode`, async () => 'unreachable'),
+    ).rejects.toThrow(/too far in the future/);
     const project = '019a0000-0000-7000-8000-000000000301';
     await store.query(
       scope,

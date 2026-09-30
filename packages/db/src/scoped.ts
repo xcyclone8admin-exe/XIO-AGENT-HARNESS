@@ -69,6 +69,9 @@ export class LocalScopedStore {
     if (hlc !== undefined && !/^\d{13}-[0-9a-f]{4}-[a-z0-9]{1,32}$/.test(hlc)) {
       throw new Error('Invalid workspace HLC');
     }
+    if (hlc !== undefined && Number(hlc.slice(0, 13)) > Date.now() + 60_000) {
+      throw new Error('Workspace HLC is too far in the future');
+    }
     if (!/^[a-z][a-z0-9_]{1,47}$/.test(capability)) throw new Error('Invalid server capability');
     const roleName = `xyra_cap_${capability}`;
     return this.db.transaction(async (tx) => {
