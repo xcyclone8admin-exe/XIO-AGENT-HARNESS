@@ -1,36 +1,16 @@
 import { DurableObject } from 'cloudflare:workers';
-import {
-  SYNC_PROTOCOL_VERSION,
-  SYNC_SCHEMA_VERSION,
-  type ConflictRecord,
-  type KillSwitchState,
-  type RowChange,
-  type SequencedChange,
-} from '@xyra/contracts';
+import type { KillSwitchState } from '@xyra/contracts';
 import { decideAccess, type AccessContext } from './access';
 import { acquireLease, mayRelease, parseLeaseInput, renewLease, type LeaseHolder } from './leases';
 import type { CandidateClaims, CurrentMembership, LeaseRecord } from './model';
 import {
   PRINCIPAL_QUOTA,
   ENDPOINT_QUOTA,
-  SKEW_QUARANTINE_MS,
-  SKEW_STRIKES,
-  SKEW_WINDOW_MS,
   WORKSPACE_QUOTA,
   consume,
   lowered,
   type QuotaWindow,
 } from './quota';
-import {
-  byteLength,
-  type IdempotencyEntry,
-  type Page,
-  type PageRequest,
-  type StoredConflict,
-  type StoredRow,
-  type SyncStorePort,
-} from './store';
-import { IdempotencyKeyReusedError, SyncAuthorityEngine, hashRequest, parseSyncPush } from './sync';
 import { MANIFESTS } from './tables';
 import type { Env } from './index';
 
@@ -44,209 +24,9 @@ const EMPTY_KILL_SWITCH: KillSwitchState = {
 
 const ROLES = ['owner', 'admin', 'manager', 'member', 'viewer', 'auditor'];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const TOMBSTONE = '\u0000delete';
 const CORE = MANIFESTS.find((manifest) => manifest.id === 'core');
 /** Housekeeping cadence while the hub holds leases or sockets. */
 const MAINTENANCE_INTERVAL_MS = 10 * 60_000;
-
-/** SQLite-backed store; every statement runs inside the caller's transactionSync. */
-class SqlSyncStore implements SyncStorePort {
-  constructor(private readonly sql: SqlStorage) {}
-
-  getRow(key: string): StoredRow | undefined {
-    const row = this.sql
-      .exec<{ fields: string; deleted_hlc: string | null }>(
-        'SELECT fields, deleted_hlc FROM sync_rows WHERE key = ?',
-        key,
-      )
-      .toArray()[0];
-    if (!row) return undefined;
-    return {
-      fields: JSON.parse(row.fields) as StoredRow['fields'],
-      ...(row.deleted_hlc ? { deletedHlc: row.deleted_hlc } : {}),
-    };
-  }
-  putRow(key: string, row: StoredRow): void {
-    this.sql.exec(
-      'INSERT OR REPLACE INTO sync_rows (key, fields, deleted_hlc) VALUES (?, ?, ?)',
-      key,
-      JSON.stringify(row.fields),
-      row.deletedHlc ?? null,
-    );
-  }
-  serverSeq(): bigint {
-    // sqlite_sequence survives compaction deleting the newest entries' predecessors.
-    const row = this.sql
-      .exec<{ seq: number | null }>("SELECT seq FROM sqlite_sequence WHERE name = 'sync_log'")
-      .toArray()[0];
-    return BigInt(row?.seq ?? 0);
-  }
-  appendLog(change: RowChange): bigint {
-    const rowKey = `${change.table}:${change.id}`;
-    const text = JSON.stringify(change);
-    const seq = this.sql
-      .exec<{ seq: number }>(
-        'INSERT INTO sync_log (tbl, row_key, change, bytes) VALUES (?, ?, ?, ?) RETURNING seq',
-        change.table,
-        rowKey,
-        text,
-        byteLength(text),
-      )
-      .one().seq;
-    if (change.op === 'append') return BigInt(seq);
-    if (change.op === 'delete') {
-      // A tombstone supersedes every earlier entry for the row (including an older tombstone).
-      this.sql.exec(
-        'DELETE FROM sync_log WHERE seq IN (SELECT DISTINCT seq FROM sync_field_seq WHERE row_key = ?)',
-        rowKey,
-      );
-      this.sql.exec('DELETE FROM sync_field_seq WHERE row_key = ?', rowKey);
-      this.sql.exec(
-        'INSERT INTO sync_field_seq (row_key, field, seq) VALUES (?, ?, ?)',
-        rowKey,
-        TOMBSTONE,
-        seq,
-      );
-      return BigInt(seq);
-    }
-    const strip = new Map<number, string[]>();
-    for (const field of Object.keys(change.fields)) {
-      const old = this.sql
-        .exec<{ seq: number }>(
-          'SELECT seq FROM sync_field_seq WHERE row_key = ? AND field = ?',
-          rowKey,
-          field,
-        )
-        .toArray()[0];
-      if (old) strip.set(old.seq, [...(strip.get(old.seq) ?? []), field]);
-      this.sql.exec(
-        'INSERT OR REPLACE INTO sync_field_seq (row_key, field, seq) VALUES (?, ?, ?)',
-        rowKey,
-        field,
-        seq,
-      );
-    }
-    for (const [oldSeq, fields] of strip) {
-      const entry = this.sql
-        .exec<{ change: string }>('SELECT change FROM sync_log WHERE seq = ?', oldSeq)
-        .toArray()[0];
-      if (!entry) continue;
-      const previous = JSON.parse(entry.change) as RowChange;
-      const kept = Object.fromEntries(
-        Object.entries(previous.fields).filter(([field]) => !fields.includes(field)),
-      );
-      if (Object.keys(kept).length === 0) {
-        this.sql.exec('DELETE FROM sync_log WHERE seq = ?', oldSeq);
-      } else {
-        const rewritten = JSON.stringify({ ...previous, fields: kept });
-        this.sql.exec(
-          'UPDATE sync_log SET change = ?, bytes = ? WHERE seq = ?',
-          rewritten,
-          byteLength(rewritten),
-          oldSeq,
-        );
-      }
-    }
-    return BigInt(seq);
-  }
-  readLogPage(request: PageRequest): Page<SequencedChange> {
-    return this.page(
-      'SELECT seq AS position, tbl, bytes FROM sync_log WHERE seq > ? ORDER BY seq LIMIT ?',
-      request,
-      (position) => {
-        const row = this.sql
-          .exec<{ change: string }>('SELECT change FROM sync_log WHERE seq = ?', position)
-          .one();
-        return { seq: String(position), change: JSON.parse(row.change) as RowChange };
-      },
-    );
-  }
-  readConflictPage(request: PageRequest): Page<StoredConflict> {
-    return this.page(
-      'SELECT id AS position, tbl, bytes FROM sync_conflicts WHERE id > ? ORDER BY id LIMIT ?',
-      request,
-      (position) => {
-        const row = this.sql
-          .exec<{ record: string }>('SELECT record FROM sync_conflicts WHERE id = ?', position)
-          .one();
-        return { id: position, record: JSON.parse(row.record) as ConflictRecord };
-      },
-    );
-  }
-  /** Scans light metadata only; payloads are loaded solely for delivered, readable entries. */
-  private page<T>(query: string, request: PageRequest, load: (position: number) => T): Page<T> {
-    const items: T[] = [];
-    let bytes = 0;
-    let lastExamined = request.after;
-    const candidates = this.sql.exec<{ position: number; tbl: string; bytes: number }>(
-      query,
-      Number(request.after),
-      request.maxScan + 1,
-    );
-    let scanned = 0;
-    for (const candidate of candidates) {
-      if (items.length >= request.maxRows || scanned >= request.maxScan)
-        return { items, lastExamined, exhausted: false };
-      scanned += 1;
-      if (request.readable(candidate.tbl)) {
-        // Account for seq/change wrappers and JSON punctuation as well as stored payload bytes.
-        const cost = candidate.bytes + 128;
-        if (items.length > 0 && bytes + cost > request.maxBytes)
-          return { items, lastExamined, exhausted: false };
-        bytes += cost;
-        items.push(load(candidate.position));
-      }
-      lastExamined = BigInt(candidate.position);
-    }
-    return { items, lastExamined, exhausted: true };
-  }
-  getIdempotency(key: string): IdempotencyEntry | undefined {
-    const row = this.sql
-      .exec<{ hash: string; response: string; at_ms: number }>(
-        'SELECT hash, response, at_ms FROM sync_idempotency WHERE key = ?',
-        key,
-      )
-      .toArray()[0];
-    return row
-      ? {
-          hash: row.hash,
-          response: JSON.parse(row.response) as IdempotencyEntry['response'],
-          atMs: row.at_ms,
-        }
-      : undefined;
-  }
-  putIdempotency(key: string, entry: IdempotencyEntry): void {
-    this.sql.exec(
-      'INSERT OR REPLACE INTO sync_idempotency (key, hash, response, at_ms) VALUES (?, ?, ?, ?)',
-      key,
-      entry.hash,
-      JSON.stringify(entry.response),
-      entry.atMs,
-    );
-  }
-  pruneIdempotency(beforeMs: number): void {
-    this.sql.exec('DELETE FROM sync_idempotency WHERE at_ms < ?', beforeMs);
-  }
-  addConflict(record: ConflictRecord): void {
-    const text = JSON.stringify(record);
-    this.sql.exec(
-      'INSERT INTO sync_conflicts (tbl, record, bytes) VALUES (?, ?, ?)',
-      record.table,
-      text,
-      byteLength(text),
-    );
-  }
-  setRefs(childKey: string, parentKeys: readonly string[]): void {
-    this.sql.exec('DELETE FROM sync_refs WHERE child_key = ?', childKey);
-    for (const parent of new Set(parentKeys))
-      this.sql.exec('INSERT INTO sync_refs (child_key, parent_key) VALUES (?, ?)', childKey, parent);
-  }
-  hasLiveChildren(parentKey: string): boolean {
-    return (
-      this.sql.exec('SELECT 1 FROM sync_refs WHERE parent_key = ? LIMIT 1', parentKey).toArray().length > 0
-    );
-  }
-}
 
 function isCandidateClaims(value: unknown): value is CandidateClaims {
   if (!value || typeof value !== 'object') return false;
@@ -307,37 +87,21 @@ function attachmentOf(socket: WebSocket): SocketAttachment | null {
     : null;
 }
 
-/**
- * One Durable Object per workspace: the strong-consistency boundary for membership revocation,
- * sync sequencing, leases, quotas and kill-switch fan-out. All state lives in SQLite; every
- * mutation is a synchronous transaction with no await inside. Every route requires the internal
- * service token and builds identity only from the Worker-verified `claims` (CLD-R-001).
- */
+/** One workspace coordinator for membership cache, leases, quotas and event fan-out. */
 export class WorkspaceHub extends DurableObject<Env> {
-  private readonly store: SqlSyncStore;
-
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = ctx.storage.sql;
-    // Never deployed before this schema; no migration of earlier local shapes is required.
     for (const statement of [
-      'CREATE TABLE IF NOT EXISTS sync_rows (key TEXT PRIMARY KEY, fields TEXT NOT NULL, deleted_hlc TEXT)',
-      'CREATE TABLE IF NOT EXISTS sync_log (seq INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, row_key TEXT NOT NULL, change TEXT NOT NULL, bytes INTEGER NOT NULL)',
-      'CREATE TABLE IF NOT EXISTS sync_field_seq (row_key TEXT NOT NULL, field TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (row_key, field))',
-      'CREATE TABLE IF NOT EXISTS sync_idempotency (key TEXT PRIMARY KEY, hash TEXT NOT NULL, response TEXT NOT NULL, at_ms INTEGER NOT NULL)',
-      'CREATE INDEX IF NOT EXISTS sync_idempotency_at ON sync_idempotency (at_ms)',
-      'CREATE TABLE IF NOT EXISTS sync_conflicts (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, record TEXT NOT NULL, bytes INTEGER NOT NULL)',
-      'CREATE TABLE IF NOT EXISTS sync_refs (child_key TEXT NOT NULL, parent_key TEXT NOT NULL, PRIMARY KEY (child_key, parent_key))',
-      'CREATE INDEX IF NOT EXISTS sync_refs_parent ON sync_refs (parent_key)',
       'CREATE TABLE IF NOT EXISTS hub_memberships (principal_id TEXT PRIMARY KEY, data TEXT NOT NULL)',
       'CREATE TABLE IF NOT EXISTS hub_leases (key TEXT PRIMARY KEY, data TEXT NOT NULL, expires_at_ms INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS hub_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS hub_quota (key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, requests INTEGER NOT NULL, bytes INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS hub_device_health (device_key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, strikes INTEGER NOT NULL, quarantined_until INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS hub_kill_switch (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS hub_sync_cache (id INTEGER PRIMARY KEY CHECK (id = 1), server_seq TEXT NOT NULL)',
     ])
       sql.exec(statement);
-    this.store = new SqlSyncStore(sql);
   }
 
   // ------------------------------------------------------------------ state helpers
@@ -449,6 +213,7 @@ export class WorkspaceHub extends DurableObject<Env> {
 
     const body = await readJson(request);
     if (!body) return response({ code: 'INVALID_REQUEST' }, 400);
+    if (url.pathname === '/internal/sync/cache/advance') return this.advanceSyncCache(body);
     switch (url.pathname) {
       case '/internal/membership/upsert':
         return this.upsertMembership(body);
@@ -485,33 +250,9 @@ export class WorkspaceHub extends DurableObject<Env> {
       case '/internal/kill-switch/get':
         return response({ killSwitch: this.killSwitch() });
       case '/internal/sync/push':
-        return this.push(claims, body['request']);
-      case '/internal/sync/pull': {
-        if (
-          body['protocolVersion'] !== SYNC_PROTOCOL_VERSION ||
-          body['schemaVersion'] !== SYNC_SCHEMA_VERSION
-        )
-          return response(
-            {
-              code: 'UPDATE_REQUIRED',
-              protocolVersion: SYNC_PROTOCOL_VERSION,
-              schemaVersion: SYNC_SCHEMA_VERSION,
-            },
-            426,
-          );
-        const cursor = typeof body['cursor'] === 'string' ? body['cursor'] : undefined;
-        const limit = typeof body['limit'] === 'number' ? body['limit'] : undefined;
-        const result = new SyncAuthorityEngine(this.store).pull(access, cursor, limit);
-        return result.ok
-          ? response(result.response)
-          : response({ code: result.code }, 409 - (result.code === 'INVALID_CURSOR' ? 9 : 0));
-      }
-      case '/internal/sync/conflicts': {
-        const after = typeof body['after'] === 'number' ? body['after'] : 0;
-        const limit = typeof body['limit'] === 'number' ? body['limit'] : 50;
-        const page = new SyncAuthorityEngine(this.store).conflictPage(access, after, limit);
-        return page ? response(page) : response({ code: 'INVALID_PAGE' }, 400);
-      }
+      case '/internal/sync/pull':
+      case '/internal/sync/conflicts':
+        return response({ code: 'NEON_SYNC_REQUIRED' }, 410);
       case '/internal/lease/acquire':
       case '/internal/lease/renew':
       case '/internal/lease/release':
@@ -520,86 +261,6 @@ export class WorkspaceHub extends DurableObject<Env> {
         return this.authorizeBlob(access, body['mode']);
     }
     return response({ code: 'HUB_ROUTE_NOT_FOUND' }, 404);
-  }
-
-  // ------------------------------------------------------------------ sync
-
-  private deviceKey(claims: CandidateClaims, nodeId: string): string {
-    return claims.deviceId ? `d:${claims.deviceId}` : `n:${claims.principalId}:${nodeId}`;
-  }
-
-  private quarantined(deviceKey: string, nowMs: number): boolean {
-    const row = this.ctx.storage.sql
-      .exec<{ quarantined_until: number }>(
-        'SELECT quarantined_until FROM hub_device_health WHERE device_key = ?',
-        deviceKey,
-      )
-      .toArray()[0];
-    return row !== undefined && row.quarantined_until > nowMs;
-  }
-
-  private recordSkew(deviceKey: string, strikes: number, nowMs: number): void {
-    if (strikes === 0) return;
-    const row = this.ctx.storage.sql
-      .exec<{ window_start: number; strikes: number }>(
-        'SELECT window_start, strikes FROM hub_device_health WHERE device_key = ?',
-        deviceKey,
-      )
-      .toArray()[0];
-    const fresh = !row || nowMs - row.window_start >= SKEW_WINDOW_MS;
-    const total = (fresh ? 0 : row.strikes) + strikes;
-    this.ctx.storage.sql.exec(
-      'INSERT OR REPLACE INTO hub_device_health (device_key, window_start, strikes, quarantined_until) VALUES (?, ?, ?, ?)',
-      deviceKey,
-      fresh ? nowMs : row.window_start,
-      total,
-      total >= SKEW_STRIKES ? nowMs + SKEW_QUARANTINE_MS : 0,
-    );
-  }
-
-  private async push(claims: CandidateClaims, raw: unknown): Promise<Response> {
-    if (
-      !raw ||
-      typeof raw !== 'object' ||
-      (raw as Record<string, unknown>)['protocolVersion'] !== SYNC_PROTOCOL_VERSION ||
-      (raw as Record<string, unknown>)['schemaVersion'] !== SYNC_SCHEMA_VERSION
-    )
-      return response(
-        {
-          code: 'UPDATE_REQUIRED',
-          protocolVersion: SYNC_PROTOCOL_VERSION,
-          schemaVersion: SYNC_SCHEMA_VERSION,
-        },
-        426,
-      );
-    const syncRequest = parseSyncPush(raw);
-    if (!syncRequest) return response({ code: 'INVALID_SYNC_REQUEST' }, 400);
-    const hash = await hashRequest(syncRequest);
-    // No await below this line: membership, kill switch, sequencing and persistence are one atomic step.
-    const nowMs = Date.now();
-    const access = this.accessFor(claims, nowMs);
-    if (!access) return response({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
-    if (claims.kind === 'agent' && access.killSwitchEngaged)
-      return response({ code: 'KILL_SWITCH_ENGAGED' }, 423);
-    const device = this.deviceKey(claims, syncRequest.nodeId);
-    if (this.quarantined(device, nowMs)) return response({ code: 'DEVICE_QUARANTINED' }, 403);
-    try {
-      const result = this.ctx.storage.transactionSync(() => {
-        const outcome = new SyncAuthorityEngine(this.store).push(access, syncRequest, nowMs, hash);
-        if (!outcome.replayed)
-          this.recordSkew(
-            device,
-            outcome.rejected.filter((item) => item.code === 'CLOCK_SKEW').length,
-            nowMs,
-          );
-        return outcome;
-      });
-      return response(result);
-    } catch (error) {
-      if (error instanceof IdempotencyKeyReusedError)
-        return response({ code: 'IDEMPOTENCY_KEY_REUSED' }, 409);
-      throw error;
-    }
   }
 
   // ------------------------------------------------------------------ leases
@@ -714,15 +375,21 @@ export class WorkspaceHub extends DurableObject<Env> {
     if (typeof principalId !== 'string' || !UUID.test(principalId))
       return response({ code: 'INVALID_MEMBERSHIP' }, 400);
     const existing = this.record(principalId);
+    let revokedAtMs: number | null = null;
     if (existing) {
+      // Queue redelivery is expected after a crash between the Hub call and DB acknowledgement.
+      // Preserve the first revocation instant so the operation is observably idempotent.
+      const nowMs = Date.now();
+      revokedAtMs =
+        existing.revokedAtMs !== undefined && existing.revokedAtMs <= nowMs ? existing.revokedAtMs : nowMs;
       this.ctx.storage.sql.exec(
         'UPDATE hub_memberships SET data = ? WHERE principal_id = ?',
-        JSON.stringify({ ...existing, revokedAtMs: Date.now() }),
+        JSON.stringify({ ...existing, revokedAtMs }),
         principalId,
       );
     }
     for (const socket of this.ctx.getWebSockets(principalId)) socket.close(1008, 'membership_revoked');
-    return response({ ok: true });
+    return response({ ok: true, revokedAtMs });
   }
 
   private setKillSwitch(body: Record<string, unknown>): Response {
@@ -749,6 +416,27 @@ export class WorkspaceHub extends DurableObject<Env> {
     );
     this.broadcast({ type: 'kill_switch', killSwitch: next });
     return response({ ok: true, killSwitch: next });
+  }
+
+  /** DO keeps only a monotonic cache watermark; Neon owns rows, history, conflicts and sequence. */
+  private advanceSyncCache(body: Record<string, unknown>): Response {
+    const serverSeq = body['serverSeq'];
+    if (typeof serverSeq !== 'string' || !/^\d{1,19}$/.test(serverSeq))
+      return response({ code: 'INVALID_SYNC_SEQUENCE' }, 400);
+    const applied = this.ctx.storage.transactionSync(() => {
+      const current =
+        this.ctx.storage.sql
+          .exec<{ server_seq: string }>('SELECT server_seq FROM hub_sync_cache WHERE id=1')
+          .toArray()[0]?.server_seq ?? '0';
+      if (BigInt(serverSeq) <= BigInt(current)) return false;
+      this.ctx.storage.sql.exec(
+        'INSERT INTO hub_sync_cache (id,server_seq) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET server_seq=excluded.server_seq',
+        serverSeq,
+      );
+      return true;
+    });
+    if (applied) this.broadcast({ type: 'sync_advanced', serverSeq });
+    return response({ ok: true, applied });
   }
 
   /**
@@ -892,7 +580,6 @@ export class WorkspaceHub extends DurableObject<Env> {
     const expiredLeases = this.ctx.storage.sql
       .exec('DELETE FROM hub_leases WHERE expires_at_ms <= ? RETURNING key', nowMs)
       .toArray().length;
-    this.store.pruneIdempotency(nowMs - 7 * 24 * 3_600_000);
     this.ctx.storage.sql.exec('DELETE FROM hub_quota WHERE window_start < ?', nowMs - 5 * 60_000);
     const nextLease = this.ctx.storage.sql
       .exec<{ at: number | null }>('SELECT MIN(expires_at_ms) AS at FROM hub_leases')

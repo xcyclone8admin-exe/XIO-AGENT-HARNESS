@@ -4,6 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { IdempotencyKeyReusedError, SyncAuthorityEngine, parseSyncPush } from './sync';
+import { MemorySyncStore } from './store';
+import { signBlobAccess } from './blobs';
+import type { AccessContext } from './access';
 
 /**
  * Drives the REAL bundled Worker and its SQLite-backed WorkspaceHub Durable Object on workerd
@@ -31,6 +35,7 @@ let privateKey: CryptoKey;
 const fixtureMemberships = new Map<string, Record<string, any>>();
 const fixtureDpopReplays = new Set<string>();
 const deviceKeyPairs = new Map<string, CryptoKeyPair>();
+const fixtureSyncStores = new Map<string, MemorySyncStore>();
 
 const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64url');
 async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
@@ -263,6 +268,45 @@ beforeAll(async () => {
       kvNamespaces: ['CACHE'],
       queueProducers: { JOBS: 'jobs' },
       serviceBindings: {
+        CLOUD_TEST_SYNC: async (request: Request) => {
+          const route = new URL(request.url).pathname;
+          const body = (await request.json()) as Record<string, any>;
+          const access = body['access'] as AccessContext;
+          const workspace = access.claims.activeWorkspaceId;
+          let store = fixtureSyncStores.get(workspace);
+          if (!store) {
+            store = new MemorySyncStore();
+            fixtureSyncStores.set(workspace, store);
+          }
+          const engine = new SyncAuthorityEngine(store);
+          try {
+            if (route === '/push') {
+              const parsed = parseSyncPush(body['request']);
+              if (!parsed) return Response.json({ code: 'INVALID_SYNC_REQUEST' }, { status: 400 });
+              return Response.json(await engine.push(access, parsed, body['nowMs'], body['requestHash']));
+            }
+            if (route === '/pull') {
+              const result = await engine.pull(access, body['cursor'], body['limit']);
+              return result.ok
+                ? Response.json(result.response)
+                : Response.json(
+                    { code: result.code },
+                    { status: result.code === 'INVALID_CURSOR' ? 400 : 409 },
+                  );
+            }
+            if (route === '/conflicts') {
+              const result = await engine.conflictPage(access, body['after'], body['limit']);
+              return result
+                ? Response.json(result)
+                : Response.json({ code: 'INVALID_PAGE' }, { status: 400 });
+            }
+            return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+          } catch (cause) {
+            if (cause instanceof IdempotencyKeyReusedError)
+              return Response.json({ code: 'IDEMPOTENCY_KEY_REUSED' }, { status: 409 });
+            return Response.json({ code: 'SYNC_FAILURE' }, { status: 500 });
+          }
+        },
         CLOUD_TEST_AUTHORITY: async (request: Request) => {
           let input: any;
           try {
@@ -384,6 +428,29 @@ describe('auth on the real Worker', () => {
       403,
     );
     expect((await hub('/internal/kill-switch/set', {}, {})).status).toBe(403);
+  });
+
+  it('F003 keeps the original revocation timestamp across duplicate Queue deliveries', async () => {
+    await seed(U2);
+    const first = await hub('/internal/membership/revoke', { principalId: U2 });
+    const firstBody = (await first.json()) as Record<string, any>;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const duplicate = await hub('/internal/membership/revoke', { principalId: U2 });
+    const duplicateBody = (await duplicate.json()) as Record<string, any>;
+    expect(firstBody).toMatchObject({ ok: true });
+    expect(duplicateBody).toEqual(firstBody);
+    expect(typeof firstBody['revokedAtMs']).toBe('number');
+  });
+
+  it('keeps the Hub sync cache watermark monotonic under duplicate and stale outbox delivery', async () => {
+    const first = await hub('/internal/sync/cache/advance', { serverSeq: '9' });
+    const duplicate = await hub('/internal/sync/cache/advance', { serverSeq: '9' });
+    const stale = await hub('/internal/sync/cache/advance', { serverSeq: '8' });
+    const invalid = await hub('/internal/sync/cache/advance', { serverSeq: '-1' });
+    expect(await first.json()).toMatchObject({ ok: true, applied: true });
+    expect(await duplicate.json()).toMatchObject({ ok: true, applied: false });
+    expect(await stale.json()).toMatchObject({ ok: true, applied: false });
+    expect(invalid.status).toBe(400);
   });
 });
 
@@ -643,6 +710,91 @@ describe('blob references on workerd', () => {
     await seed(U1, { revokedAtMs: Date.now() - 1 });
     expect((await mf.dispatchFetch(`${URL_BASE}${get.json?.['url']}`)).status).toBe(403);
     await seed(U1);
+  });
+});
+
+describe('development Worker configuration without R2', () => {
+  it('fails blob GET/PUT closed while authorized non-blob sync remains available', async () => {
+    const original = mf;
+    const signingJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', privateKey));
+    const noR2 = new Miniflare(
+      convertV4MiniflareOptions({
+        modules: true,
+        modulesRoot: outDir,
+        scriptPath: path.join(outDir, 'index.js'),
+        compatibilityDate: '2026-09-30',
+        compatibilityFlags: ['nodejs_compat'],
+        durableObjects: { HUB: { className: 'WorkspaceHub', useSQLite: true } },
+        bindings: {
+          AUTH_JWT_JWK: signingJwk,
+          AUTH_JWT_AUDIENCE: 'xyra-cloud',
+          AUTH_JWT_ISSUER: 'xyra-auth',
+          HUB_INTERNAL_TOKEN: INTERNAL,
+          BLOB_ACCESS_SECRET: 'blob-secret-for-no-r2-test',
+        },
+        serviceBindings: {
+          CLOUD_TEST_AUTHORITY: async (request: Request) => {
+            const path = new URL(request.url).pathname;
+            if (path === '/dpop') return Response.json({ ok: true });
+            if (path !== '/resolve') return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+            const body = (await request.json()) as { claims?: { principalId?: string } };
+            const membership = fixtureMemberships.get(body.claims?.principalId ?? '');
+            return membership
+              ? Response.json({ membership })
+              : Response.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, { status: 404 });
+          },
+          CLOUD_TEST_SYNC: async (request: Request) => {
+            const body = (await request.json()) as Record<string, any>;
+            const result = await new SyncAuthorityEngine(new MemorySyncStore()).pull(
+              body['access'] as AccessContext,
+              body['cursor'],
+              body['limit'],
+            );
+            return result.ok ? Response.json(result.response) : Response.json({ code: result.code }, { status: 400 });
+          },
+        },
+      }),
+    );
+    mf = noR2;
+    try {
+      const health = await noR2.dispatchFetch(`${URL_BASE}/v1/health`);
+      expect(health.status).toBe(200);
+      expect(await health.json()).toMatchObject({ status: 'ok', r2: 'unconfigured' });
+
+      for (const mode of ['GET', 'PUT'] as const) {
+        const token = await signBlobAccess(
+          {
+            key: `${T1}/${W1}/no-r2-${mode.toLowerCase()}`,
+            principalId: U2,
+            mode,
+            expiresAtMs: Date.now() + 60_000,
+          },
+          'blob-secret-for-no-r2-test',
+        );
+        const response = await noR2.dispatchFetch(`${URL_BASE}/v1/blobs/access/${token}`, {
+          method: mode,
+          ...(mode === 'PUT' ? { body: 'test blob', headers: { 'content-length': '9' } } : {}),
+        });
+        expect(response.status).toBe(503);
+        expect(await response.json()).toEqual({ code: 'BLOB_STORAGE_UNAVAILABLE' });
+      }
+
+      await seed(U2);
+      const token = await mint(U2);
+      const ref = await call('POST', '/v1/blobs/ref', token, {
+        mode: 'GET',
+        name: 'no-r2-reference',
+        expiresInSec: 60,
+      });
+      expect(ref.status).toBe(503);
+      expect(ref.json).toEqual({ code: 'BLOB_STORAGE_UNAVAILABLE' });
+      const pull = await call('GET', '/v1/sync/pull', token);
+      expect(pull.status).toBe(200);
+      expect(pull.json).toMatchObject({ changes: [], serverSeq: '0' });
+    } finally {
+      mf = original;
+      await noR2.dispose();
+    }
   });
 });
 

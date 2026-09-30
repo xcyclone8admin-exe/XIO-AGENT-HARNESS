@@ -208,9 +208,8 @@ function parentKeys(rule: TableRule, fields: Readonly<Record<string, FieldWrite>
 }
 
 /**
- * Pure field-LWW authority engine over a storage port. The caller (WorkspaceHub) must run push()
- * inside a single storage transaction so rows, log, seq, conflicts and the idempotency record
- * commit or roll back together.
+ * Pure field-LWW authority engine over a storage port. The Worker runs push() inside a single
+ * Neon transaction so rows, log, sequence, conflicts and idempotency commit or roll back together.
  */
 export class SyncAuthorityEngine {
   constructor(readonly store: SyncStorePort = new MemorySyncStore()) {}
@@ -221,21 +220,21 @@ export class SyncAuthorityEngine {
     return this.store.snapshot();
   }
 
-  private liveParent(key: string): boolean {
-    const parent = this.store.getRow(key);
+  private async liveParent(key: string): Promise<boolean> {
+    const parent = await this.store.getRow(key);
     return parent !== undefined && parent.deletedHlc === undefined;
   }
 
-  push(
+  async push(
     access: AccessContext,
     request: PushRequest,
     nowMs = Date.now(),
     requestHash = fallbackHash(request),
-  ): PushResponse {
+  ): Promise<PushResponse> {
     const store = this.store;
     const replayKey = idempotencyKey(access, request);
-    store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
-    const previous = store.getIdempotency(replayKey);
+    await store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
+    const previous = await store.getIdempotency(replayKey);
     if (previous) {
       if (previous.hash !== requestHash) throw new IdempotencyKeyReusedError();
       return { ...previous.response, replayed: true };
@@ -256,18 +255,18 @@ export class SyncAuthorityEngine {
       }
       const { rule } = validated;
       const rowKey = keyFor(change.table, change.id);
-      const current = store.getRow(rowKey);
+      const current = await store.getRow(rowKey);
 
       if (change.op === 'delete') {
         if (current?.deletedHlc && compareHlc(change.hlc, current.deletedHlc) <= 0) continue;
         // Parents referenced by live rows cannot be removed (the migration's ON DELETE RESTRICT).
-        if (store.hasLiveChildren(rowKey)) {
+        if (await store.hasLiveChildren(rowKey)) {
           reject(index, change, 'ORPHAN_REFERENCE', 'LIVE_CHILDREN');
           continue;
         }
-        store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
-        store.setRefs(rowKey, []);
-        store.appendLog({ ...change, fields: {} });
+        await store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
+        await store.setRefs(rowKey, []);
+        await store.appendLog({ ...change, fields: {} });
         accepted += 1;
         continue;
       }
@@ -329,7 +328,7 @@ export class SyncAuthorityEngine {
         continue;
       }
       const parents = parentKeys(rule, next);
-      if (parents.some((parent) => !this.liveParent(parent))) {
+      if (!(await Promise.all(parents.map((parent) => this.liveParent(parent)))).every(Boolean)) {
         reject(index, change, 'ORPHAN_REFERENCE');
         continue;
       }
@@ -339,12 +338,12 @@ export class SyncAuthorityEngine {
       }
       for (const conflict of rowConflicts) {
         conflicts.push(conflict);
-        store.addConflict(conflict);
+        await store.addConflict(conflict);
       }
       if (Object.keys(applied).length > 0) {
-        store.putRow(rowKey, { fields: next });
-        store.setRefs(rowKey, parents);
-        store.appendLog({ ...change, fields: applied });
+        await store.putRow(rowKey, { fields: next });
+        await store.setRefs(rowKey, parents);
+        await store.appendLog({ ...change, fields: applied });
         accepted += 1;
       }
     }
@@ -360,12 +359,12 @@ export class SyncAuthorityEngine {
     const response: PushResponse = {
       accepted,
       conflicts: conflicts.length,
-      serverSeq: store.serverSeq().toString(10),
+      serverSeq: (await store.serverSeq()).toString(10),
       rejected,
       conflictHistory: inline,
       replayed: false,
     };
-    store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
+    await store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
     return response;
   }
 
@@ -383,12 +382,12 @@ export class SyncAuthorityEngine {
    * The cursor advances past unreadable entries and carries the read scope, so a grant change
    * forces a resync (and local purge) instead of silently skipping or leaking rows (CLD-R-003).
    */
-  pull(
+  async pull(
     access: AccessContext,
     cursor: string | undefined,
     limit = MAX_PULL_ROWS,
     maxBytes = MAX_PULL_BYTES,
-  ): PullOutcome {
+  ): Promise<PullOutcome> {
     const decoded = decodeCursor(cursor);
     if (!decoded || !Number.isInteger(limit) || limit < 1 || limit > MAX_PULL_ROWS)
       return { ok: false, code: 'INVALID_CURSOR' };
@@ -396,8 +395,8 @@ export class SyncAuthorityEngine {
     const scope = scopeFingerprint(readable);
     if (decoded.scope !== null && decoded.scope !== scope) return { ok: false, code: 'RESYNC_REQUIRED' };
     const allowed = new Set(readable);
-    const serverSeq = this.store.serverSeq();
-    const page = this.store.readLogPage({
+    const serverSeq = await this.store.serverSeq();
+    const page = await this.store.readLogPage({
       after: decoded.seq,
       maxRows: limit,
       maxBytes,
@@ -419,16 +418,16 @@ export class SyncAuthorityEngine {
   }
 
   /** Conflict history is retained (REQ-DATA-008), read-filtered and paged by rows and bytes. */
-  conflictPage(
+  async conflictPage(
     access: AccessContext,
     afterId: number,
     limit: number,
     maxBytes = MAX_PULL_BYTES,
-  ): { items: StoredConflict[]; more: boolean; next: number } | null {
+  ): Promise<{ items: StoredConflict[]; more: boolean; next: number } | null> {
     if (!Number.isSafeInteger(afterId) || afterId < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200)
       return null;
     const allowed = new Set(this.readableTables(access));
-    const page = this.store.readConflictPage({
+    const page = await this.store.readConflictPage({
       after: BigInt(afterId),
       maxRows: limit,
       maxBytes,

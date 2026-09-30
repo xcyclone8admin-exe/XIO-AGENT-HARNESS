@@ -8,7 +8,10 @@
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "xyra-agent-os-local-blobs" }],
   "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
   "queues": {
-    "producers": [{ "binding": "JOBS", "queue": "xyra-agent-os-local-jobs" }],
+    "producers": [
+      { "binding": "JOBS", "queue": "xyra-agent-os-local-jobs" },
+      { "binding": "DEAD_LETTER_JOBS", "queue": "xyra-agent-os-local-jobs-dlq" },
+    ],
     "consumers": [
       {
         "queue": "xyra-agent-os-local-jobs",

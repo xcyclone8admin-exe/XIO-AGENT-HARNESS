@@ -125,5 +125,14 @@ export default defineModule({
     { name: 'cloud_queue_jobs', class: 'lww', authority: 'server' },
     { name: 'cloud_cron_runs', class: 'lww', authority: 'server' },
     { name: 'cloud_purge_markers', class: 'lww', authority: 'server' },
+    // Neon-owned canonical sync persistence; clients only sync the manifest business tables above.
+    { name: 'cloud_sync_sequences', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_rows', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_field_seq', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_changes', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_conflicts', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_idempotency', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_refs', class: 'lww', authority: 'server' },
+    { name: 'cloud_sync_outbox', class: 'lww', authority: 'server' },
   ],
 });

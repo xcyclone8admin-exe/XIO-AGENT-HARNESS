@@ -4,10 +4,22 @@ import { verifyAccessToken } from './auth';
 import { MAX_PUSH_BYTES, PullRequest, SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from '@xyra/contracts';
 import type { WorkspaceHub } from './hub';
 import { parseLeaseInput } from './leases';
-import { databaseUrl, recordDpopReplay, resolveCurrentAuthority } from './neon';
+import {
+  databaseUrl,
+  readCurrentAuthority,
+  recordDpopReplay,
+  resolveCurrentAuthority,
+  withNeonTransaction,
+  type CurrentAuthority,
+  type NeonQueryClient,
+} from './neon';
+import { lockWorkspaceSequence, NeonSyncStore } from './neon-sync-store';
+import { IdempotencyKeyReusedError, SyncAuthorityEngine, hashRequest, parseSyncPush } from './sync';
+import type { AccessContext } from './access';
 import { verifyDpopProof } from './dpop';
 import { consumeQueueBatch } from './jobs';
 import { runScheduledMaintenance } from './cron';
+import { drainSyncOutbox } from './sync-outbox';
 import { acceptMembershipRevokedWebhook, parseAndVerifyMembershipWebhook, WebhookError } from './webhooks';
 import {
   AuthFlowError,
@@ -27,8 +39,10 @@ export interface Env {
   /** Runtime app credential only; migrations use a separately held owner credential. */
   readonly NEON_DATABASE_URL?: string;
   readonly WEBHOOK_SECRET?: string;
-  readonly BLOBS: R2Bucket;
+  readonly BLOBS?: R2Bucket;
   readonly JOBS: Queue;
+  /** Required durable terminal handoff for poison and exhausted jobs. */
+  readonly DEAD_LETTER_JOBS: Queue;
   readonly HUB: DurableObjectNamespace<WorkspaceHub>;
   readonly CACHE: KVNamespace;
   readonly AUTH_JWT_JWK?: string;
@@ -43,6 +57,8 @@ export interface Env {
   readonly HUB_INTERNAL_TOKEN?: string;
   /** Miniflare-only fixture service; never configure this binding in Wrangler environments. */
   readonly CLOUD_TEST_AUTHORITY?: Fetcher;
+  /** Miniflare-only sync adapter; production sync always commits to Neon. */
+  readonly CLOUD_TEST_SYNC?: Fetcher;
   readonly BLOB_MAX_BYTES?: string;
   readonly QUOTA_PRINCIPAL_RPM?: string;
   readonly QUOTA_PRINCIPAL_BYTES?: string;
@@ -78,6 +94,8 @@ async function currentHub(
         readonly role: 'owner' | 'admin' | 'manager' | 'member' | 'viewer' | 'auditor';
         readonly permissions: readonly string[];
       };
+      readonly authority: CurrentAuthority;
+      readonly killSwitchEngaged: boolean;
     }
 > {
   if (!c.env.HUB_INTERNAL_TOKEN) return { response: error('HUB_NOT_CONFIGURED', 503) };
@@ -95,11 +113,11 @@ async function currentHub(
   if (!accessToken) return { response: error('DPOP_REQUIRED', 401) };
   const proof = await verifyDpopProof(c.req.raw, accessToken, authentication.claims);
   if (!proof) return { response: error('DPOP_INVALID', 401) };
-  let authority: { membership: Record<string, unknown>; delegator?: Record<string, unknown> } | null;
+  let authority: CurrentAuthority | null;
   const database = databaseUrl(c.env);
   if (database) {
     try {
-      authority = (await resolveCurrentAuthority(database, authentication.claims)) as typeof authority;
+      authority = await resolveCurrentAuthority(database, authentication.claims);
     } catch {
       return { response: error('AUTHORITY_UNAVAILABLE', 503) };
     }
@@ -146,9 +164,8 @@ async function currentHub(
     return { response: error('AUTHORITY_UNAVAILABLE', 503) };
   }
   if (!proofRecorded) return { response: error('DPOP_REPLAYED', 401) };
-  for (const membership of [authority.membership, authority.delegator].filter(
-    (value): value is Record<string, unknown> => !!value,
-  )) {
+  for (const membership of [authority.membership, authority.delegator]) {
+    if (!membership) continue;
     const refreshed = await hub.fetch('https://workspace-hub/internal/membership/upsert', {
       method: 'POST',
       body: JSON.stringify({ membership }),
@@ -163,7 +180,7 @@ async function currentHub(
   });
   if (authorization.status === 429) return { response: authorization };
   if (!authorization.ok) return { response: error('CURRENT_MEMBERSHIP_REQUIRED', 403) };
-  const body = (await authorization.json()) as { membership?: unknown };
+  const body = (await authorization.json()) as { membership?: unknown; killSwitchEngaged?: unknown };
   if (!body.membership || typeof body.membership !== 'object')
     return { response: error('CURRENT_MEMBERSHIP_REQUIRED', 403) };
   const membership = body.membership as { role?: unknown; permissions?: unknown };
@@ -177,6 +194,8 @@ async function currentHub(
   return {
     claims: authentication.claims,
     hub,
+    authority,
+    killSwitchEngaged: body['killSwitchEngaged'] === true,
     membership: {
       role: membership.role as 'owner' | 'admin' | 'manager' | 'member' | 'viewer' | 'auditor',
       permissions: membership.permissions,
@@ -195,6 +214,66 @@ async function forwardHub(
     body: JSON.stringify(payload),
     headers: { 'content-type': 'application/json', 'x-hub-internal-token': token ?? '' },
   });
+}
+
+type AuthorizedSyncRequest = {
+  readonly claims: CandidateClaims;
+  readonly authority: CurrentAuthority;
+  readonly killSwitchEngaged: boolean;
+};
+
+function accessContext(current: AuthorizedSyncRequest): AccessContext {
+  return {
+    claims: current.claims,
+    membership: current.authority.membership,
+    ...(current.authority.delegator ? { delegator: current.authority.delegator } : {}),
+    killSwitchEngaged: current.killSwitchEngaged,
+  };
+}
+
+async function recheckedAccess(
+  client: NeonQueryClient,
+  current: AuthorizedSyncRequest,
+): Promise<AccessContext | null> {
+  const authority = await readCurrentAuthority(client, current.claims);
+  if (!authority) return null;
+  return {
+    claims: current.claims,
+    membership: authority.membership,
+    ...(authority.delegator ? { delegator: authority.delegator } : {}),
+    killSwitchEngaged: current.killSwitchEngaged,
+  };
+}
+
+async function publishSyncCache(
+  env: Env,
+  current: AuthorizedSyncRequest & { readonly hub: DurableObjectStub<WorkspaceHub> },
+  serverSeq: string,
+): Promise<void> {
+  const connectionString = databaseUrl(env);
+  if (!connectionString || !/^\d{1,19}$/.test(serverSeq)) return;
+  try {
+    const advanced = await current.hub.fetch('https://workspace-hub/internal/sync/cache/advance', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-hub-internal-token': env.HUB_INTERNAL_TOKEN ?? '' },
+      body: JSON.stringify({ serverSeq }),
+    });
+    if (!advanced.ok) return;
+    await withNeonTransaction(
+      connectionString,
+      { tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId },
+      (client) =>
+        client
+          .query(
+            `UPDATE cloud_sync_outbox SET delivered_at=COALESCE(delivered_at,now()),attempts=attempts+1
+          WHERE tenant_id=$1 AND workspace_id=$2 AND server_seq <= $3 AND delivered_at IS NULL`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, serverSeq],
+          )
+          .then(() => undefined),
+    );
+  } catch {
+    // Neon committed already. Pending outbox rows are retried by the scheduled dispatcher.
+  }
 }
 
 /** Counts actual streamed transport bytes, including properties later discarded by parsing. */
@@ -242,7 +321,7 @@ app.get('/v1/health', (c) =>
   c.json({
     status: 'ok',
     neon: c.env.NEON_DATABASE_URL ? 'configured_unverified' : 'blocked_credentials',
-    r2: 'binding_configured_unverified',
+    r2: c.env.BLOBS ? 'binding_configured_unverified' : 'unconfigured',
     auth: c.env.AUTH_JWT_JWK ? 'verification_configured' : 'blocked_credentials',
   }),
 );
@@ -252,12 +331,51 @@ app.post('/v1/sync/push', async (c) => {
   if (incoming instanceof Response) return incoming;
   const current = await currentHub(c, incoming.bytes);
   if ('response' in current) return current.response;
-  return forwardHub(
-    current.hub,
-    '/internal/sync/push',
-    { claims: current.claims, request: incoming.value },
-    c.env.HUB_INTERNAL_TOKEN,
-  );
+  if (
+    !incoming.value ||
+    typeof incoming.value !== 'object' ||
+    (incoming.value as Record<string, unknown>)['protocolVersion'] !== SYNC_PROTOCOL_VERSION ||
+    (incoming.value as Record<string, unknown>)['schemaVersion'] !== SYNC_SCHEMA_VERSION
+  )
+    return c.json(
+      { code: 'UPDATE_REQUIRED', protocolVersion: SYNC_PROTOCOL_VERSION, schemaVersion: SYNC_SCHEMA_VERSION },
+      426,
+    );
+  const request = parseSyncPush(incoming.value);
+  if (!request) return c.json({ code: 'INVALID_SYNC_REQUEST' }, 400);
+  if (current.claims.kind === 'agent' && current.killSwitchEngaged)
+    return c.json({ code: 'KILL_SWITCH_ENGAGED' }, 423);
+  const access = accessContext(current);
+  try {
+    if (c.env.CLOUD_TEST_SYNC) {
+      return c.env.CLOUD_TEST_SYNC.fetch('https://sync.test/push', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ access, request, nowMs: Date.now(), requestHash: await hashRequest(request) }),
+      });
+    }
+    const connectionString = databaseUrl(c.env);
+    if (!connectionString) return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);
+    const outcome = await withNeonTransaction(
+      connectionString,
+      { tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId },
+      async (client) => {
+        const trusted = await recheckedAccess(client, current);
+        if (!trusted) return null;
+        await lockWorkspaceSequence(client, current.claims.tenantId, current.claims.activeWorkspaceId);
+        const engine = new SyncAuthorityEngine(
+          new NeonSyncStore(client, current.claims.tenantId, current.claims.activeWorkspaceId),
+        );
+        return engine.push(trusted, request, Date.now(), await hashRequest(request));
+      },
+    );
+    if (!outcome) return c.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
+    await publishSyncCache(c.env, current, outcome.serverSeq);
+    return c.json(outcome);
+  } catch (cause) {
+    if (cause instanceof IdempotencyKeyReusedError) return c.json({ code: 'IDEMPOTENCY_KEY_REUSED' }, 409);
+    return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);
+  }
 });
 
 app.get('/v1/sync/pull', async (c) => {
@@ -279,15 +397,34 @@ app.get('/v1/sync/pull', async (c) => {
     ...(c.req.query('limit') ? { limit: c.req.query('limit') } : {}),
   });
   if (!versions.success) return c.json({ code: 'INVALID_CURSOR' }, 400);
-  return forwardHub(
-    current.hub,
-    '/internal/sync/pull',
-    {
-      claims: current.claims,
-      ...versions.data,
-    },
-    c.env.HUB_INTERNAL_TOKEN,
-  );
+  const access = accessContext(current);
+  if (c.env.CLOUD_TEST_SYNC)
+    return c.env.CLOUD_TEST_SYNC.fetch('https://sync.test/pull', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ access, cursor: versions.data.cursor, limit: versions.data.limit }),
+    });
+  const connectionString = databaseUrl(c.env);
+  if (!connectionString) return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);
+  try {
+    const result = await withNeonTransaction(
+      connectionString,
+      { tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId },
+      async (client) => {
+        const trusted = await recheckedAccess(client, current);
+        if (!trusted) return null;
+        return new SyncAuthorityEngine(
+          new NeonSyncStore(client, current.claims.tenantId, current.claims.activeWorkspaceId),
+        ).pull(trusted, versions.data.cursor, versions.data.limit);
+      },
+    );
+    if (!result) return c.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
+    if (!result.ok) return c.json({ code: result.code }, result.code === 'INVALID_CURSOR' ? 400 : 409);
+    await publishSyncCache(c.env, current, result.response.serverSeq);
+    return c.json(result.response);
+  } catch {
+    return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);
+  }
 });
 
 for (const route of ['acquire', 'renew'] as const) {
@@ -319,12 +456,35 @@ app.get('/v1/sync/conflicts', async (c) => {
   if ('response' in current) return current.response;
   const after = Number(c.req.query('after') ?? '0');
   const limit = Number(c.req.query('limit') ?? '50');
-  return forwardHub(
-    current.hub,
-    '/internal/sync/conflicts',
-    { claims: current.claims, after, limit },
-    c.env.HUB_INTERNAL_TOKEN,
-  );
+  if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200)
+    return c.json({ code: 'INVALID_PAGE' }, 400);
+  const access = accessContext(current);
+  if (c.env.CLOUD_TEST_SYNC)
+    return c.env.CLOUD_TEST_SYNC.fetch('https://sync.test/conflicts', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ access, after, limit }),
+    });
+  const connectionString = databaseUrl(c.env);
+  if (!connectionString) return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);
+  try {
+    const page = await withNeonTransaction(
+      connectionString,
+      { tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId },
+      async (client) => {
+        const trusted = await recheckedAccess(client, current);
+        if (!trusted) return null;
+        return new SyncAuthorityEngine(
+          new NeonSyncStore(client, current.claims.tenantId, current.claims.activeWorkspaceId),
+        ).conflictPage(trusted, after, limit);
+      },
+    );
+    if (page === null) return c.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
+    if (!page) return c.json({ code: 'INVALID_PAGE' }, 400);
+    return c.json(page);
+  } catch {
+    return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);
+  }
 });
 
 /** Kill-switch fan-out channel. Clients send the bearer JWT in the Authorization header. */
@@ -355,6 +515,7 @@ app.get('/v1/kill-switch', async (c) => {
 app.post('/v1/blobs/ref', async (c) => {
   const current = await currentHub(c);
   if ('response' in current) return current.response;
+  if (!c.env.BLOBS) return c.json({ code: 'BLOB_STORAGE_UNAVAILABLE' }, 503);
   if (!c.env.BLOB_ACCESS_SECRET) return c.json({ code: 'BLOB_SIGNER_UNAVAILABLE' }, 503);
   let request: unknown;
   try {
@@ -397,6 +558,7 @@ app.all('/v1/blobs/access/:token', async (c) => {
   if (!c.env.BLOB_ACCESS_SECRET) return c.json({ code: 'BLOB_SIGNER_UNAVAILABLE' }, 503);
   const access = await verifyBlobAccess(c.req.param('token'), c.env.BLOB_ACCESS_SECRET);
   if (!access || access.mode !== c.req.method) return c.json({ code: 'INVALID_BLOB_REFERENCE' }, 403);
+  if (!c.env.BLOBS) return c.json({ code: 'BLOB_STORAGE_UNAVAILABLE' }, 503);
   if (!c.env.HUB_INTERNAL_TOKEN) return c.json({ code: 'BLOB_RECHECK_UNAVAILABLE' }, 503);
   let declaredBytes = 0;
   if (access.mode === 'PUT') {
@@ -634,5 +796,15 @@ export default {
     const database = databaseUrl(env);
     if (!database) throw new Error('CRON_DATABASE_UNAVAILABLE');
     await runScheduledMaintenance(database, event.scheduledTime);
+    if (!env.HUB_INTERNAL_TOKEN) throw new Error('SYNC_OUTBOX_HUB_AUTH_UNAVAILABLE');
+    await drainSyncOutbox(database, async (workspaceId, serverSeq) => {
+      const hub = env.HUB.get(env.HUB.idFromName(workspaceId));
+      const result = await hub.fetch('https://workspace-hub/internal/sync/cache/advance', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-hub-internal-token': env.HUB_INTERNAL_TOKEN ?? '' },
+        body: JSON.stringify({ serverSeq }),
+      });
+      return result.ok;
+    });
   },
 } satisfies ExportedHandler<Env>;
