@@ -92,7 +92,13 @@ function pgMessage(error: unknown): string {
 export class PGliteLedgerWriter implements LedgerApi {
   constructor(private readonly db: PGlite) {}
 
-  private async inScope<T>(scope: LedgerScope, work: (tx: TxContext) => Promise<T>): Promise<T> {
+  private async inScope<T>(
+    scope: LedgerScope,
+    work: (tx: TxContext) => Promise<T>,
+    // This writer is only installed behind authenticated Money capabilities; the app/sync role
+    // remains read-only on server-authority tables and is tested separately through LocalScopedStore.
+    role: 'xyra_app' | 'xyra_server' = 'xyra_server',
+  ): Promise<T> {
     if (!/^[0-9a-f-]{36}$/i.test(scope.tenantId) || !/^[0-9a-f-]{36}$/i.test(scope.workspaceId)) {
       throw new LedgerStoreError('NOT_FOUND', 'Invalid ledger scope');
     }
@@ -101,7 +107,7 @@ export class PGliteLedgerWriter implements LedgerApi {
     }
     try {
       return await this.db.transaction(async (tx) => {
-        await tx.exec('SET LOCAL ROLE xyra_app');
+        await tx.exec(`SET LOCAL ROLE ${role}`);
         await tx.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
         await tx.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
         await tx.query("SELECT set_config('app.hlc', $1, true)", [scope.hlc ?? '']);
@@ -652,7 +658,7 @@ export class PGliteLedgerWriter implements LedgerApi {
       return ReconciliationRun.parse({ id, environment: input.environment, bookId: input.bookId ?? null, runKey,
         checkedBalances: checked.rows[0]?.count ?? 0, discrepancyCount: mismatches.rows.length, status,
         startedAt: new Date().toISOString(), reused: false });
-    });
+    }, 'xyra_server');
   }
 
   async discrepancies(scope: LedgerScope, value: DiscrepancyQuery): Promise<Discrepancy[]> {
@@ -680,7 +686,7 @@ export class PGliteLedgerWriter implements LedgerApi {
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Open discrepancy not found');
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
       return this.discrepancyOut(rows[0]);
-    });
+    }, 'xyra_server');
   }
 
   async resolveDiscrepancy(scope: LedgerScope, actorId: string, value: ResolveDiscrepancyInput): Promise<Discrepancy> {
@@ -708,7 +714,7 @@ export class PGliteLedgerWriter implements LedgerApi {
         [scope.tenantId, scope.workspaceId, input.discrepancyId, input.resolution]);
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
       return this.discrepancyOut(rows[0]);
-    });
+    }, 'xyra_server');
   }
 
   private encodeCursor(date: string, id: string): string {

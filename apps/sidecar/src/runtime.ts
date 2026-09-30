@@ -2,7 +2,9 @@ import { randomBytes } from 'node:crypto';
 import { serve } from '@hono/node-server';
 import { applyPGliteMigrations, LocalScopedStore, prepareLocalAppRole } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
+import { PGliteLedgerWriter } from '@xyra/ledger';
 import { bootstrapLocalIdentity, CoreService } from '@xyra/mod-core/server';
+import { MoneyService } from '@xyra/mod-money/server';
 import { OpsService } from '@xyra/mod-ops/server';
 import { MIGRATIONS } from './generated/migrations';
 import { MANIFESTS } from './generated/modules';
@@ -50,6 +52,7 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       async () => new Set(),
     );
     registerFoundationCapabilities(bus, new CoreService(scoped), new OpsService(scoped));
+    new MoneyService(new PGliteLedgerWriter(db)).register(bus);
     const launchToken = options.launchToken ?? randomBytes(32).toString('base64url');
     const app = createSidecarApp({
       port: options.port,
