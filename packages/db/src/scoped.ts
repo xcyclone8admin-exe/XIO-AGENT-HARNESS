@@ -152,11 +152,12 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
   const existingCapabilities = await db.query<{ rolname: string }>(
     "SELECT rolname FROM pg_roles WHERE rolname LIKE 'xyra_cap_%'",
   );
-  const managedRoles = [
+  const managedRoles = [...new Set([
     'xyra_app',
     'xyra_server',
-    ...new Set([...existingCapabilities.rows.map((row) => row.rolname), ...[...capabilityTables.keys()].map((capability) => `xyra_cap_${capability}`)]),
-  ];
+    ...existingCapabilities.rows.map((row) => row.rolname),
+    ...[...capabilityTables.keys()].map((capability) => `xyra_cap_${capability}`),
+  ])];
   const columnsByTable = new Map<string, string[]>();
   const revokes: string[] = [];
   for (const name of names) {
@@ -170,11 +171,11 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
     columnsByTable.set(name, allColumns);
     // Privileges are additive. Clear table and column grants for both managed roles, including
     // stale server-role access, before reapplying the current declarations.
-    const capRoles = managedRoles;
-    revokes.push(`REVOKE INSERT, UPDATE, DELETE ON ${name} FROM xyra_app, xyra_server${capRoles.length ? `, ${capRoles.join(', ')}` : ''}`);
+    const roleList = managedRoles.join(', ');
+    revokes.push(`REVOKE INSERT, UPDATE, DELETE ON ${name} FROM ${roleList}`);
     if (allColumns.length) {
-      revokes.push(`REVOKE UPDATE (${allColumns.join(', ')}) ON ${name} FROM xyra_app, xyra_server${capRoles.length ? `, ${capRoles.join(', ')}` : ''}`);
-      revokes.push(`REVOKE INSERT (${allColumns.join(', ')}) ON ${name} FROM xyra_app, xyra_server${capRoles.length ? `, ${capRoles.join(', ')}` : ''}`);
+      revokes.push(`REVOKE UPDATE (${allColumns.join(', ')}) ON ${name} FROM ${roleList}`);
+      revokes.push(`REVOKE INSERT (${allColumns.join(', ')}) ON ${name} FROM ${roleList}`);
     }
   }
   const appGrants = [
@@ -209,6 +210,6 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
     END IF;
     ${[...capabilityTables.keys()].map((capability) => `IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='xyra_cap_${capability}') THEN CREATE ROLE xyra_cap_${capability} NOLOGIN; END IF;`).join('\n    ')}
   END $$;
-  GRANT USAGE ON SCHEMA public TO xyra_app, xyra_server;
+  GRANT USAGE ON SCHEMA public TO ${managedRoles.join(', ')};
   ${grants.join(';\n  ')}`);
 }

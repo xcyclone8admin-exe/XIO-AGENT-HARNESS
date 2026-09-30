@@ -189,6 +189,10 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
       { name: 'ops_projects', class: 'lww', authority: 'synced', guardedColumns: ['status'], serverWriteCapabilities: ['test_ops'] },
       { name: 'ops_tasks', class: 'lww', authority: 'synced' },
     ]);
+    const schemaAccess = await fresh.query<{ usage: boolean }>(
+      "SELECT has_schema_privilege('xyra_cap_test_ops', 'public', 'USAGE') AS usage",
+    );
+    expect(schemaAccess.rows[0]?.usage).toBe(true);
     await fresh.query('INSERT INTO tenants(id,name) VALUES ($1,$2)', [tenantA, 'A']);
     await fresh.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)', [
       workspaceA,
