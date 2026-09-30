@@ -4,7 +4,7 @@ import { verifyAccessToken } from './auth';
 import type { WorkspaceHub } from './hub';
 
 export { WorkspaceHub } from './hub';
-import type { CandidateClaims } from './model';
+import { MAX_BLOB_BYTES, MAX_BLOB_TTL_SEC, type CandidateClaims } from './model';
 import { hasPermission } from './tables';
 
 export interface Env {
@@ -140,6 +140,24 @@ for (const route of ['acquire', 'renew'] as const) {
   });
 }
 
+app.get('/v1/sync/conflicts', async (c) => {
+  const current = await currentHub(c);
+  if ('response' in current) return current.response;
+  const after = Number(c.req.query('after') ?? '0');
+  const limit = Number(c.req.query('limit') ?? '50');
+  return forwardHub(current.hub, '/internal/sync/conflicts', { claims: current.claims, after, limit });
+});
+
+/** Kill-switch fan-out channel. Clients send the bearer JWT in the Authorization header. */
+app.get('/v1/workspace/events', async (c) => {
+  if (c.req.header('upgrade') !== 'websocket') return c.json({ code: 'UPGRADE_REQUIRED' }, 426);
+  const current = await currentHub(c);
+  if ('response' in current) return current.response;
+  return current.hub.fetch('https://workspace-hub/internal/events', {
+    headers: { upgrade: 'websocket', 'x-hub-claims': JSON.stringify(current.claims) },
+  });
+});
+
 app.get('/v1/kill-switch', async (c) => {
   const current = await currentHub(c);
   if ('response' in current) return current.response;
@@ -173,7 +191,7 @@ app.post('/v1/blobs/ref', async (c) => {
     !name ||
     !Number.isInteger(expiresInSec) ||
     expiresInSec < 30 ||
-    expiresInSec > 900 ||
+    expiresInSec > MAX_BLOB_TTL_SEC ||
     !hasPermission(membership, permission)
   ) {
     return c.json({ code: 'BLOB_ACCESS_DENIED' }, 403);
@@ -181,7 +199,10 @@ app.post('/v1/blobs/ref', async (c) => {
   const key = tenantWorkspaceKey(current.claims.tenantId, current.claims.activeWorkspaceId, name);
   if (!key) return c.json({ code: 'INVALID_BLOB_NAME' }, 400);
   const expiresAtMs = Date.now() + expiresInSec * 1000;
-  const token = await signBlobAccess({ key, mode, expiresAtMs }, c.env.BLOB_ACCESS_SECRET);
+  const token = await signBlobAccess(
+    { key, principalId: current.claims.principalId, mode, expiresAtMs },
+    c.env.BLOB_ACCESS_SECRET,
+  );
   return c.json({ key, mode, expiresAtMs, url: `/v1/blobs/access/${token}` });
 });
 
@@ -189,7 +210,26 @@ app.all('/v1/blobs/access/:token', async (c) => {
   if (!c.env.BLOB_ACCESS_SECRET) return c.json({ code: 'BLOB_SIGNER_UNAVAILABLE' }, 503);
   const access = await verifyBlobAccess(c.req.param('token'), c.env.BLOB_ACCESS_SECRET);
   if (!access || access.mode !== c.req.method) return c.json({ code: 'INVALID_BLOB_REFERENCE' }, 403);
+  if (!c.env.HUB_INTERNAL_TOKEN) return c.json({ code: 'BLOB_RECHECK_UNAVAILABLE' }, 503);
+  // Redemption rechecks current membership and the kill switch; a bearer ref alone is not enough.
+  const workspaceId = access.key.split('/')[1] ?? '';
+  const recheck = await c.env.HUB.get(c.env.HUB.idFromName(workspaceId)).fetch(
+    'https://workspace-hub/internal/blob/check',
+    {
+      method: 'POST',
+      body: JSON.stringify({ principalId: access.principalId, key: access.key, mode: access.mode }),
+      headers: { 'content-type': 'application/json', 'x-hub-internal-token': c.env.HUB_INTERNAL_TOKEN },
+    },
+  );
+  if (!recheck.ok)
+    return c.json(
+      { code: recheck.status === 423 ? 'KILL_SWITCH_ENGAGED' : 'BLOB_ACCESS_DENIED' },
+      recheck.status === 423 ? 423 : 403,
+    );
   if (access.mode === 'PUT') {
+    const length = c.req.header('content-length');
+    if (!length || !/^d+$/.test(length)) return c.json({ code: 'LENGTH_REQUIRED' }, 411);
+    if (Number(length) > MAX_BLOB_BYTES) return c.json({ code: 'BLOB_TOO_LARGE' }, 413);
     await c.env.BLOBS.put(access.key, c.req.raw.body ?? new Uint8Array(), {
       httpMetadata: { contentType: c.req.header('content-type') ?? 'application/octet-stream' },
     });

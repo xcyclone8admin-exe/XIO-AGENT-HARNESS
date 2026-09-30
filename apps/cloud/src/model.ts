@@ -6,6 +6,10 @@ export const SYNC_SCHEMA_VERSION = 'cloud-sync-v1';
 export const MAX_PUSH_BYTES = 1_000_000;
 export const MAX_PULL_ROWS = 1_000;
 export const MAX_HLC_DRIFT_MS = 5 * 60_000;
+/** Idempotency records are kept 7 days; a later replay is re-applied (field-LWW makes that safe). */
+export const IDEMPOTENCY_RETENTION_MS = 7 * 24 * 3_600_000;
+export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
+export const MAX_BLOB_TTL_SEC = 300;
 
 export type CloudPrincipalKind = 'user' | 'agent';
 
@@ -51,6 +55,7 @@ export type RejectionCode =
   | 'UPSERT_REQUIRED'
   | 'PERMISSION_DENIED'
   | 'IMMUTABLE_FIELD'
+  | 'ACTOR_FIELD'
   | 'GUARDED_FIELD'
   | 'INVALID_ROW'
   | 'CLOCK_SKEW'

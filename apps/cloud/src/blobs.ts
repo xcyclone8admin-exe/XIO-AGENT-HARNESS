@@ -1,5 +1,7 @@
 export interface BlobAccess {
   readonly key: string;
+  /** Principal the ref was issued to; redemption rechecks their current membership. */
+  readonly principalId: string;
   readonly mode: 'GET' | 'PUT';
   readonly expiresAtMs: number;
 }
@@ -69,13 +71,20 @@ export async function verifyBlobAccess(
       typeof parsed.key !== 'string' ||
       !/^[0-9a-f-]{36}\/[0-9a-f-]{36}\/[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/i.test(parsed.key) ||
       (parsed.mode !== 'GET' && parsed.mode !== 'PUT') ||
+      typeof parsed.principalId !== 'string' ||
+      !/^[0-9a-f-]{36}$/i.test(parsed.principalId) ||
       typeof parsed.expiresAtMs !== 'number' ||
       !Number.isSafeInteger(parsed.expiresAtMs) ||
       parsed.expiresAtMs <= nowMs
     ) {
       return null;
     }
-    return { key: parsed.key, mode: parsed.mode, expiresAtMs: parsed.expiresAtMs };
+    return {
+      key: parsed.key,
+      principalId: parsed.principalId,
+      mode: parsed.mode,
+      expiresAtMs: parsed.expiresAtMs,
+    };
   } catch {
     return null;
   }

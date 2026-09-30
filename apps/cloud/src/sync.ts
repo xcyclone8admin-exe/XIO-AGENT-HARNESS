@@ -1,6 +1,7 @@
 import { PushRequest as PushRequestSchema } from '@xyra/contracts';
 import type { RowChange } from '@xyra/contracts';
 import {
+  IDEMPOTENCY_RETENTION_MS,
   MAX_HLC_DRIFT_MS,
   MAX_PULL_ROWS,
   MAX_PUSH_BYTES,
@@ -9,11 +10,11 @@ import {
   type ActivePrincipal,
   type ConflictRecord,
   type RejectionCode,
-  type SequencedChange,
   type SyncPullResponse,
   type SyncPushRequest,
   type SyncPushResponse,
 } from './model';
+import { MemorySyncStore, type FieldWrite, type StoredConflict, type SyncStorePort } from './store';
 import { TABLE_RULES, forbiddenField, hasPermission, type TableRule } from './tables';
 
 interface ParsedHlc {
@@ -22,23 +23,11 @@ interface ParsedHlc {
   readonly node: string;
 }
 
-type FieldWrite = RowChange['fields'][string];
-
-interface StoredRow {
-  readonly fields: Record<string, FieldWrite>;
-  readonly deletedHlc?: string;
-}
-
-export interface SyncSnapshot {
-  readonly seq: string;
-  readonly rows: Record<string, StoredRow>;
-  readonly log: readonly SequencedChange[];
-  readonly idempotency: Readonly<Record<string, SyncPushResponse>>;
-  readonly conflicts: readonly ConflictRecord[];
-}
-
-export function emptySyncSnapshot(): SyncSnapshot {
-  return { seq: '0', rows: {}, log: [], idempotency: {}, conflicts: [] };
+/** Same key, different payload (ADR-0003 idempotency): surfaced as HTTP 409 by the Hub. */
+export class IdempotencyKeyReusedError extends Error {
+  constructor() {
+    super('IDEMPOTENCY_KEY_REUSED');
+  }
 }
 
 function parseHlc(value: string): ParsedHlc | null {
@@ -52,7 +41,7 @@ function compareHlc(left: string, right: string): number {
   const a = parseHlc(left);
   const b = parseHlc(right);
   if (!a || !b) throw new Error('invalid HLC passed to comparator');
-  return a.physical - b.physical || a.logical - b.logical || a.node.localeCompare(b.node);
+  return a.physical - b.physical || a.logical - b.logical || (a.node < b.node ? -1 : a.node > b.node ? 1 : 0);
 }
 
 function keyFor(change: RowChange): string {
@@ -61,6 +50,30 @@ function keyFor(change: RowChange): string {
 
 function idempotencyKey(principal: ActivePrincipal, request: SyncPushRequest): string {
   return `${principal.tenantId}:${principal.activeWorkspaceId}:${principal.principalId}:${request.nodeId}:${request.idempotencyKey}`;
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** SHA-256 (hex) of the canonical request body, excluding the idempotency key itself. */
+export async function hashRequest(request: SyncPushRequest): Promise<string> {
+  const { idempotencyKey: _key, ...body } = request;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical(body)));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** Synchronous stand-in used when a caller has no precomputed hash (in-memory tests). */
+function fallbackHash(request: SyncPushRequest): string {
+  const { idempotencyKey: _key, ...body } = request;
+  return canonical(body);
 }
 
 function encodeCursor(seq: bigint): string {
@@ -81,7 +94,7 @@ function decodeCursor(cursor: string | undefined): bigint | null {
   }
 }
 
-function responseSize(request: SyncPushRequest): number {
+function requestSize(request: SyncPushRequest): number {
   return new TextEncoder().encode(JSON.stringify(request)).byteLength;
 }
 
@@ -89,34 +102,25 @@ export function parseSyncPush(input: unknown): SyncPushRequest | null {
   if (!input || typeof input !== 'object') return null;
   const candidate = input as Record<string, unknown>;
   if (
-    candidate.protocolVersion !== SYNC_PROTOCOL_VERSION ||
-    candidate.schemaVersion !== SYNC_SCHEMA_VERSION ||
-    typeof candidate.nodeId !== 'string' ||
-    !/^[A-Za-z0-9._-]{1,128}$/.test(candidate.nodeId) ||
-    typeof candidate.idempotencyKey !== 'string' ||
-    !/^[A-Za-z0-9._-]{16,256}$/.test(candidate.idempotencyKey)
+    candidate['protocolVersion'] !== SYNC_PROTOCOL_VERSION ||
+    candidate['schemaVersion'] !== SYNC_SCHEMA_VERSION ||
+    typeof candidate['nodeId'] !== 'string' ||
+    !/^[A-Za-z0-9._-]{1,128}$/.test(candidate['nodeId']) ||
+    typeof candidate['idempotencyKey'] !== 'string' ||
+    !/^[A-Za-z0-9._-]{16,256}$/.test(candidate['idempotencyKey'])
   ) {
     return null;
   }
-  const parsed = PushRequestSchema.safeParse({ nodeId: candidate.nodeId, changes: candidate.changes });
+  const parsed = PushRequestSchema.safeParse({ nodeId: candidate['nodeId'], changes: candidate['changes'] });
   if (!parsed.success) return null;
   const request: SyncPushRequest = {
-    protocolVersion: candidate.protocolVersion,
-    schemaVersion: candidate.schemaVersion,
-    nodeId: candidate.nodeId,
-    idempotencyKey: candidate.idempotencyKey,
+    protocolVersion: candidate['protocolVersion'],
+    schemaVersion: candidate['schemaVersion'],
+    nodeId: candidate['nodeId'],
+    idempotencyKey: candidate['idempotencyKey'],
     changes: parsed.data.changes,
   };
-  return responseSize(request) <= MAX_PUSH_BYTES ? request : null;
-}
-
-function reject(
-  rejected: { index: number; changeId: string; code: RejectionCode }[],
-  index: number,
-  change: RowChange,
-  code: RejectionCode,
-): void {
-  rejected.push({ index, changeId: change.id, code });
+  return requestSize(request) <= MAX_PUSH_BYTES ? request : null;
 }
 
 function validateChange(
@@ -143,40 +147,52 @@ function validateChange(
   return { rule };
 }
 
-function appendLog(log: SequencedChange[], seq: bigint, change: RowChange): void {
-  log.push({ seq: seq.toString(10), change });
+/** Server-stamped author and time make an appended row attributable to its real author. */
+function stampAppend(
+  change: RowChange,
+  rule: TableRule,
+  principal: ActivePrincipal,
+  nowMs: number,
+): RowChange {
+  if (!rule.stamp) return change;
+  return {
+    ...change,
+    fields: {
+      ...change.fields,
+      [rule.stamp.actor]: { value: principal.principalId, hlc: change.hlc, baseHlc: null },
+      [rule.stamp.time]: { value: new Date(nowMs).toISOString(), hlc: change.hlc, baseHlc: null },
+    },
+  };
 }
 
-/** Pure field-LWW authority engine. Its snapshot is persisted atomically by WorkspaceHub. */
+/**
+ * Pure field-LWW authority engine over a storage port. The caller (WorkspaceHub) must run
+ * push() inside a single storage transaction so rows, log, seq, conflicts and the
+ * idempotency record commit or roll back together.
+ */
 export class SyncAuthorityEngine {
-  private seq: bigint;
-  private readonly rows: Record<string, StoredRow>;
-  private readonly log: SequencedChange[];
-  private readonly idempotency: Record<string, SyncPushResponse>;
-  private readonly conflicts: ConflictRecord[];
+  constructor(readonly store: SyncStorePort = new MemorySyncStore()) {}
 
-  constructor(snapshot: SyncSnapshot = emptySyncSnapshot()) {
-    this.seq = BigInt(snapshot.seq);
-    this.rows = structuredClone(snapshot.rows);
-    this.log = [...structuredClone(snapshot.log)];
-    this.idempotency = { ...structuredClone(snapshot.idempotency) };
-    this.conflicts = [...structuredClone(snapshot.conflicts)];
+  /** Test helper; only meaningful for the in-memory store. */
+  snapshot(): ReturnType<MemorySyncStore['snapshot']> {
+    if (!(this.store instanceof MemorySyncStore)) throw new Error('snapshot() requires MemorySyncStore');
+    return this.store.snapshot();
   }
 
-  snapshot(): SyncSnapshot {
-    return {
-      seq: this.seq.toString(10),
-      rows: structuredClone(this.rows),
-      log: structuredClone(this.log),
-      idempotency: structuredClone(this.idempotency),
-      conflicts: structuredClone(this.conflicts),
-    };
-  }
-
-  push(principal: ActivePrincipal, request: SyncPushRequest, nowMs = Date.now()): SyncPushResponse {
+  push(
+    principal: ActivePrincipal,
+    request: SyncPushRequest,
+    nowMs = Date.now(),
+    requestHash = fallbackHash(request),
+  ): SyncPushResponse {
+    const store = this.store;
     const replayKey = idempotencyKey(principal, request);
-    const previous = this.idempotency[replayKey];
-    if (previous) return { ...previous, replayed: true };
+    store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
+    const previous = store.getIdempotency(replayKey);
+    if (previous) {
+      if (previous.hash !== requestHash) throw new IdempotencyKeyReusedError();
+      return { ...previous.response, replayed: true };
+    }
 
     const rejected: { index: number; changeId: string; code: RejectionCode }[] = [];
     const conflicts: ConflictRecord[] = [];
@@ -184,89 +200,98 @@ export class SyncAuthorityEngine {
     for (const [index, change] of request.changes.entries()) {
       const authorization = validateChange(principal, change, nowMs);
       if ('code' in authorization) {
-        reject(rejected, index, change, authorization.code);
+        rejected.push({ index, changeId: change.id, code: authorization.code });
         continue;
       }
+      const rowKey = keyFor(change);
+      const current = store.getRow(rowKey);
+
       if (authorization.rule.authority === 'append') {
-        const rowKey = keyFor(change);
-        if (!this.rows[rowKey]) {
-          this.rows[rowKey] = { fields: structuredClone(change.fields) };
-          this.seq += 1n;
-          appendLog(this.log, this.seq, change);
+        if (!current) {
+          const stamped = stampAppend(change, authorization.rule, principal, nowMs);
+          store.putRow(rowKey, { fields: stamped.fields });
+          store.appendLog(stamped);
           accepted += 1;
         }
         continue;
       }
 
-      const rowKey = keyFor(change);
-      const current = this.rows[rowKey];
       if (change.op === 'delete') {
-        const deleteChange: RowChange = { ...change, fields: {} };
-        if (!current || !current.deletedHlc || compareHlc(change.hlc, current.deletedHlc) > 0) {
-          this.rows[rowKey] = { fields: current?.fields ?? {}, deletedHlc: change.hlc };
-          this.seq += 1n;
-          appendLog(this.log, this.seq, deleteChange);
+        if (!current?.deletedHlc || compareHlc(change.hlc, current.deletedHlc) > 0) {
+          store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
+          store.appendLog({ ...change, fields: {} });
           accepted += 1;
         }
         continue;
       }
       if (current?.deletedHlc) {
-        reject(rejected, index, change, 'TOMBSTONED');
+        rejected.push({ index, changeId: change.id, code: 'TOMBSTONED' });
         continue;
       }
 
       const existingFields = current?.fields ?? {};
-      const nextFields = structuredClone(existingFields);
+      const nextFields: Record<string, FieldWrite> = { ...existingFields };
       const applied: Record<string, FieldWrite> = {};
       for (const [field, incoming] of Object.entries(change.fields)) {
         const existing = existingFields[field];
-        if (existing && compareHlc(incoming.hlc, existing.hlc) <= 0) {
-          const conflict: ConflictRecord = {
-            table: change.table,
-            rowId: change.id,
-            field,
-            winningHlc: existing.hlc,
-            losingHlc: incoming.hlc,
-            losingValue: incoming.value,
-          };
-          conflicts.push(conflict);
-          this.conflicts.push(conflict);
-          continue;
+        if (existing) {
+          const order = compareHlc(incoming.hlc, existing.hlc);
+          // An identical re-delivery (same HLC, same value) is a no-op, not a conflict.
+          if (order === 0 && canonical(incoming.value) === canonical(existing.value)) continue;
+          if (order <= 0) {
+            const conflict: ConflictRecord = {
+              table: change.table,
+              rowId: change.id,
+              field,
+              winningHlc: existing.hlc,
+              losingHlc: incoming.hlc,
+              losingValue: incoming.value,
+            };
+            conflicts.push(conflict);
+            store.addConflict(conflict);
+            continue;
+          }
         }
         nextFields[field] = incoming;
         applied[field] = incoming;
       }
       if (Object.keys(applied).length > 0) {
-        const acceptedChange: RowChange = { ...change, fields: applied };
-        this.rows[rowKey] = { fields: nextFields };
-        this.seq += 1n;
-        appendLog(this.log, this.seq, acceptedChange);
+        store.putRow(rowKey, { fields: nextFields });
+        store.appendLog({ ...change, fields: applied });
         accepted += 1;
       }
     }
     const response: SyncPushResponse = {
       accepted,
       conflicts: conflicts.length,
-      serverSeq: this.seq.toString(10),
+      serverSeq: store.serverSeq().toString(10),
       rejected,
       conflictHistory: conflicts,
       replayed: false,
     };
-    this.idempotency[replayKey] = response;
+    store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
     return response;
   }
 
   pull(cursor: string | undefined, pageSize = MAX_PULL_ROWS): SyncPullResponse | null {
     const after = decodeCursor(cursor);
     if (after === null || pageSize < 1 || pageSize > MAX_PULL_ROWS) return null;
-    const pending = this.log.filter((entry) => BigInt(entry.seq) > after);
-    const changes = pending.slice(0, pageSize);
+    const fetched = this.store.readLog(after, pageSize + 1);
+    const changes = fetched.slice(0, pageSize);
     const last = changes.at(-1);
     return {
       changes,
       cursor: encodeCursor(last ? BigInt(last.seq) : after),
-      more: pending.length > changes.length,
-      serverSeq: this.seq.toString(10),
+      more: fetched.length > changes.length,
+      serverSeq: this.store.serverSeq().toString(10),
     };
+  }
+
+  /** Conflict history is retained indefinitely (REQ-DATA-008) and read in pages. */
+  conflictPage(afterId: number, limit: number): { items: StoredConflict[]; more: boolean } | null {
+    if (!Number.isInteger(afterId) || afterId < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200)
+      return null;
+    const fetched = this.store.readConflicts(afterId, limit + 1);
+    return { items: fetched.slice(0, limit), more: fetched.length > limit };
   }
 }

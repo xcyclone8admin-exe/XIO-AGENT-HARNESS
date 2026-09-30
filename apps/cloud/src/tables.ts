@@ -9,10 +9,11 @@ export interface TableRule {
   readonly permission?: string;
   readonly guardedColumns?: readonly string[];
   readonly allowedColumns?: readonly string[];
+  /** Append tables: the server stamps the author and time columns; clients may not supply them. */
+  readonly stamp?: { readonly actor: string; readonly time: string };
 }
 
 const SERVER: TableRule = { class: 'lww', authority: 'server' };
-const APPEND: TableRule = { class: 'append', authority: 'append' };
 
 /**
  * The frozen platform + ops manifests available at Worker implementation start.
@@ -24,10 +25,25 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
   workspaces: SERVER,
   users: SERVER,
   memberships: SERVER,
-  approval_requests: APPEND,
-  approval_decisions: SERVER,
-  audit_events: APPEND,
-  domain_events: APPEND,
+  approval_requests: {
+    class: 'append',
+    authority: 'append',
+    allowedColumns: ['capability_id', 'input_hash', 'reason', 'expires_at'],
+    stamp: { actor: 'requested_by', time: 'created_at' },
+  },
+  approval_decisions: { class: 'append', authority: 'server' },
+  audit_events: {
+    class: 'append',
+    authority: 'append',
+    allowedColumns: ['action', 'target_type', 'target_id', 'detail'],
+    stamp: { actor: 'actor_id', time: 'occurred_at' },
+  },
+  domain_events: {
+    class: 'append',
+    authority: 'append',
+    allowedColumns: ['event_type', 'aggregate_id', 'payload'],
+    stamp: { actor: 'actor_id', time: 'occurred_at' },
+  },
   workspace_settings: SERVER,
   ops_projects: {
     class: 'lww',
@@ -70,7 +86,8 @@ export function hasPermission(membership: CurrentMembership, permission: string 
 export function forbiddenField(
   rule: TableRule,
   field: string,
-): 'IMMUTABLE_FIELD' | 'GUARDED_FIELD' | 'INVALID_ROW' | null {
+): 'IMMUTABLE_FIELD' | 'ACTOR_FIELD' | 'GUARDED_FIELD' | 'INVALID_ROW' | null {
+  if (rule.stamp && (field === rule.stamp.actor || field === rule.stamp.time)) return 'ACTOR_FIELD';
   if (IMMUTABLE.has(field)) return 'IMMUTABLE_FIELD';
   if (rule.guardedColumns?.includes(field)) return 'GUARDED_FIELD';
   if (rule.allowedColumns && !rule.allowedColumns.includes(field)) return 'INVALID_ROW';

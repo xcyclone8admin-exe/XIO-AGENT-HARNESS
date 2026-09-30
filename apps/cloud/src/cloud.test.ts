@@ -4,8 +4,8 @@ import { verifyAccessToken } from './auth';
 import { signBlobAccess, tenantWorkspaceKey, verifyBlobAccess } from './blobs';
 import { acquireLease, emptyLeaseBook, renewLease, type LeaseBook } from './leases';
 import type { ActivePrincipal, CurrentMembership } from './model';
-import { SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from './model';
-import { SyncAuthorityEngine, parseSyncPush } from './sync';
+import { IDEMPOTENCY_RETENTION_MS, SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from './model';
+import { IdempotencyKeyReusedError, SyncAuthorityEngine, parseSyncPush } from './sync';
 
 const T1 = '11111111-1111-4111-8111-111111111111';
 const T2 = '22222222-2222-4222-8222-222222222222';
@@ -292,12 +292,90 @@ describe('sync push authority', () => {
     expect(r.accepted).toBe(0);
     expect(e.snapshot().rows[`audit_events:${ROW}`]?.fields['action']?.value).toBe('a');
   });
-  it('survives snapshot round-trips (Durable Object persistence)', () => {
-    const a = new SyncAuthorityEngine();
-    a.push(principal(), push([change()], 'idem-persist-001'), NOW);
-    const b = new SyncAuthorityEngine(JSON.parse(JSON.stringify(a.snapshot())));
-    expect(b.push(principal(), push([change()], 'idem-persist-001'), NOW).replayed).toBe(true);
-    expect(b.pull(undefined)?.changes).toHaveLength(1);
+  it('rejects the same idempotency key with a different payload', () => {
+    const e = new SyncAuthorityEngine();
+    e.push(principal(), push([change()], 'idem-reuse-00001'), NOW);
+    const other = change({ fields: { title: { value: 'different', hlc: hlc(NOW, 2), baseHlc: null } } });
+    expect(() => e.push(principal(), push([other], 'idem-reuse-00001'), NOW)).toThrow(
+      IdempotencyKeyReusedError,
+    );
+    expect(e.snapshot().seq).toBe('1');
+  });
+  it('prunes idempotency records past the retention bound', () => {
+    const e = new SyncAuthorityEngine();
+    e.push(principal(), push([change()], 'idem-retain-0001'), NOW);
+    expect(e.snapshot().idempotencyCount).toBe(1);
+    e.push(principal(), push([change({ id: ROW2 })], 'idem-retain-0002'), NOW + IDEMPOTENCY_RETENTION_MS + 1);
+    expect(e.snapshot().idempotencyCount).toBe(1);
+  });
+  it('treats an identical redelivery as a no-op rather than a conflict', () => {
+    const e = new SyncAuthorityEngine();
+    e.push(principal(), push([change()]), NOW);
+    const r = e.push(principal(), push([change()]), NOW);
+    expect(r).toMatchObject({ accepted: 0, conflicts: 0 });
+  });
+  it('server-stamps actor and time on append rows and rejects client-supplied actor fields', () => {
+    const e = new SyncAuthorityEngine();
+    const w = (value: unknown) => ({ value, hlc: hlc(NOW), baseHlc: null });
+    const good = change({
+      table: 'audit_events',
+      op: 'append',
+      fields: { action: w('login'), target_type: w('user') },
+    });
+    const forged = change({
+      table: 'audit_events',
+      op: 'append',
+      id: ROW2,
+      fields: { action: w('x'), actor_id: w(T2) },
+    });
+    const forgedTime = change({
+      table: 'audit_events',
+      op: 'append',
+      id: ROW2,
+      fields: { action: w('x'), occurred_at: w('2000-01-01') },
+    });
+    const unlisted = change({
+      table: 'domain_events',
+      op: 'append',
+      fields: { event_type: w('e'), evil: w(1) },
+    });
+    const r = e.push(principal(), push([good, forged, forgedTime, unlisted]), NOW);
+    expect(r.rejected.map((x) => x.code)).toEqual(['ACTOR_FIELD', 'ACTOR_FIELD', 'INVALID_ROW']);
+    const stored = e.snapshot().log[0]?.change.fields;
+    expect(stored?.['actor_id']?.value).toBe(U1);
+    expect(stored?.['occurred_at']?.value).toBe(new Date(NOW).toISOString());
+  });
+  it('keeps approval_decisions server-only and denies read-only roles append', () => {
+    const e = new SyncAuthorityEngine();
+    const row = change({ table: 'approval_decisions', op: 'append', fields: {} });
+    expect(e.push(principal(), push([row]), NOW).rejected[0]?.code).toBe('SERVER_AUTHORITY');
+    const audit = change({
+      table: 'audit_events',
+      op: 'append',
+      fields: { action: { value: 'a', hlc: hlc(NOW), baseHlc: null } },
+    });
+    const viewer = principal({ membership: membership({ role: 'viewer', permissions: [] }) });
+    expect(e.push(viewer, push([audit]), NOW).rejected[0]?.code).toBe('PERMISSION_DENIED');
+  });
+  it('pages conflict history', () => {
+    const e = new SyncAuthorityEngine();
+    e.push(
+      principal(),
+      push([change({ fields: { title: { value: 'n', hlc: hlc(NOW, 9), baseHlc: null } } })]),
+      NOW,
+    );
+    for (let i = 0; i < 3; i += 1) {
+      e.push(
+        principal(),
+        push([change({ fields: { title: { value: `o${i}`, hlc: hlc(NOW, i), baseHlc: null } } })]),
+        NOW,
+      );
+    }
+    const first = e.conflictPage(0, 2);
+    expect(first?.items).toHaveLength(2);
+    expect(first?.more).toBe(true);
+    expect(e.conflictPage(first?.items.at(-1)?.id ?? 0, 2)?.more).toBe(false);
+    expect(e.conflictPage(-1, 2)).toBeNull();
   });
 });
 
@@ -350,7 +428,12 @@ describe('blob references', () => {
     expect(tenantWorkspaceKey(T1, W1, 'a/b')).toBeNull();
   });
   it('round-trips a signed ref and rejects tamper, wrong secret and expiry', async () => {
-    const access = { key: `${T1}/${W1}/a.png`, mode: 'GET' as const, expiresAtMs: NOW + 60_000 };
+    const access = {
+      key: `${T1}/${W1}/a.png`,
+      principalId: U1,
+      mode: 'GET' as const,
+      expiresAtMs: NOW + 60_000,
+    };
     const token = await signBlobAccess(access, secret);
     expect(await verifyBlobAccess(token, secret, NOW)).toEqual(access);
     expect(await verifyBlobAccess(token, 'other', NOW)).toBeNull();
