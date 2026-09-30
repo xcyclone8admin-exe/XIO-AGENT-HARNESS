@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { AdapterConfig, ContextCandidate, HierarchyNode, type ContextElementType, REVIEW_ROLES, SPEC_TEMPLATES } from '../contracts';
 import { compileContext, compileSpecCorpus } from '../server/compiler';
 import { authorizeChaosTarget, classifyDiscovery, createEvidence, evaluateGates, planSchedule, requestPromotion, rollbackPromotion } from '../server/engine';
+import { registerForge } from '../server';
+import type { AnyCapability, ModuleManifest } from '@xyra/contracts';
 import { renderAllGoldenBriefs } from '../server/specs';
 import { transitionEpic, transitionFinding, transitionPromotion, transitionTicket } from '../server/state-machine';
 
@@ -73,9 +75,33 @@ describe('approved bounded scheduler (planning only)', () => {
     expect(planSchedule({ epicId, approval, config, tickets: [ticket], spentUsd: 0, killSwitchEngaged: true }).state).toBe('stopped');
     expect(() => planSchedule({ epicId, approval, config: { ...config, substrateVerified: true }, tickets: [ticket], spentUsd: 0, killSwitchEngaged: false })).toThrow();
   });
+
+  it('returns an explicit empty plan for an approved epic with no tickets', () => {
+    const planned = planSchedule({ epicId, approval, config, tickets: [], spentUsd: 0, killSwitchEngaged: false });
+    expect(planned).toMatchObject({ state: 'blocked', runnableTicketIds: [], blockedTicketIds: [], reason: 'NO_RUNNABLE_TICKETS', externalExecution: false });
+  });
 });
 
 describe('review, gates, promotion and hard execution boundary', () => {
+  it('validates the gates envelope and registers evidence/review workflows through capabilities', async () => {
+    const registered = new Map<string, (input: unknown) => Promise<unknown>>();
+    const bus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown) => Promise<unknown>) => registered.set(descriptor.id, handler) };
+    registerForge(bus, {} as ModuleManifest);
+    expect([...registered.keys()]).toEqual(expect.arrayContaining([
+      'forge.evidence.create', 'forge.findings.create', 'forge.discoveries.classify', 'forge.promotions.rollback-record',
+    ]));
+    await expect(registered.get('forge.gates.evaluate')?.({})).rejects.toThrow();
+    await expect(registered.get('forge.gates.evaluate')?.({ gates: 'nope', riskAcceptances: [] })).rejects.toThrow();
+    const createdEvidence = await registered.get('forge.evidence.create')?.({ workspaceId, requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest', deterministic: true, result: 'pass', payload: { report: 'capability' } });
+    expect(createdEvidence).toMatchObject({ workspaceId, result: 'pass' });
+    const createdFinding = await registered.get('forge.findings.create')?.({ workspaceId, role: 'security', state: 'open', severity: 'low', title: 'Review note', evidenceIds: [evidenceId], affectedRequirements: ['XIO-REQ-FRG-007'], confidence: 0.9, reproduction: 'Observed in test', remediation: 'Track review', revalidation: 'Recheck' });
+    expect(createdFinding).toMatchObject({ workspaceId, role: 'security', state: 'open' });
+    const discovery = await registered.get('forge.discoveries.classify')?.({ ticket, summary: 'Contract impact', evidenceIds: [evidenceId], affectedTicketIds: [] });
+    expect(discovery).toMatchObject({ classification: 'material', escalated: true });
+    const rollback = await registered.get('forge.promotions.rollback-record')?.({ promotion: { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'promoted', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time }, rollbackEvidence: evidence });
+    expect(rollback).toMatchObject({ state: 'rolled-back', rollbackOf: '019a0000-0000-7000-8000-000000000081' });
+  });
+
   it('material discoveries escalate and all nine structured reviewer roles are present', () => {
     const material = classifyDiscovery(ticket, 'Architecture contract changed', [], [ticketId]);
     expect(material.classification).toBe('critical');

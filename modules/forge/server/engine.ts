@@ -13,7 +13,8 @@ export function planSchedule(input: unknown): zReturn<typeof ScheduleResult> {
   const request = ScheduleRequest.parse(input);
   if (request.killSwitchEngaged) return { runId: uuidv7(), state: 'stopped', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'KILL_SWITCH_ENGAGED', externalExecution: false };
   const approval = ApprovalRecord.parse(request.approval);
-  if (approval.epicId !== request.epicId || approval.workspaceId !== request.tickets[0]?.workspaceId || approval.status !== 'approved' || Date.parse(approval.expiresAt) <= Date.now()) {
+  const workspaceIds = new Set(request.tickets.map((ticket) => ticket.workspaceId));
+  if (approval.epicId !== request.epicId || (workspaceIds.size > 0 && (workspaceIds.size !== 1 || !workspaceIds.has(approval.workspaceId))) || approval.status !== 'approved' || Date.parse(approval.expiresAt) <= Date.now()) {
     return { runId: uuidv7(), state: 'blocked', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'VALID_EPIC_APPROVAL_REQUIRED', externalExecution: false };
   }
   if (request.spentUsd >= request.config.maxBudgetUsd) return { runId: uuidv7(), state: 'blocked', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'BUDGET_EXHAUSTED', externalExecution: false };
@@ -70,7 +71,7 @@ export function evaluateGates(rawGates: readonly unknown[], riskAcceptances: rea
   return GateEvaluation.parse({ gates, overall: deterministicFailure || failedHard ? 'fail' : pendingHard ? 'blocked' : 'pass', aiJudgmentAllowed: false, deterministicBeforeJudgment: true });
 }
 
-export function createEvidence(input: Omit<zReturn<typeof Evidence>, 'id' | 'verifiedAt' | 'sha256'> & { sha256?: string; payload?: unknown }) {
+export function createEvidence(input: Omit<zReturn<typeof Evidence>, 'id' | 'verifiedAt' | 'sha256'> & { sha256?: string | undefined; payload?: unknown }) {
   const { payload, ...metadata } = input;
   const sourceHash = metadata.sha256 ?? hash(payload ?? metadata);
   return Evidence.parse({ ...metadata, sha256: sourceHash, id: uuidv7(), verifiedAt: now() });
