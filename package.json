@@ -1,0 +1,45 @@
+{
+  "name": "xyra-agent-os",
+  "private": true,
+  "version": "0.1.0",
+  "description": "XYRA Agent OS — XIO end-state on the FounderOS + starnet basis (working name; see packages/brand).",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*",
+    "modules/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "gen": "node tools/gen-module-registry.mjs",
+    "typecheck": "npm run gen && npm run typecheck --workspaces --if-present",
+    "lint": "eslint . --max-warnings=0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "npm run gen && vitest run",
+    "checks": "node tools/checks.mjs",
+    "verify": "npm run typecheck && npm run lint && npm run test && npm run checks",
+    "dev:sidecar": "npm run dev -w @xyra/sidecar",
+    "dev:web": "npm run dev -w @xyra/web",
+    "build:web": "npm run gen && npm run build -w @xyra/web",
+    "build:sidecar": "npm run gen && npm run build -w @xyra/sidecar",
+    "e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0",
+    "@types/node": "24.10.1",
+    "eslint": "10.11.0",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.12.0",
+    "happy-dom": "20.14.5",
+    "prettier": "3.9.9",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.0",
+    "vitest": "5.0.2"
+  }
+}
