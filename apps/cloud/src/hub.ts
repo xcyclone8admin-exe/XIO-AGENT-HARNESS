@@ -452,6 +452,8 @@ export class WorkspaceHub extends DurableObject<Env> {
     switch (url.pathname) {
       case '/internal/membership/upsert':
         return this.upsertMembership(body);
+      case '/internal/membership/revoke':
+        return this.revokeMembership(body);
       case '/internal/kill-switch/set':
         return this.setKillSwitch(body);
       case '/internal/blob/check':
@@ -693,15 +695,33 @@ export class WorkspaceHub extends DurableObject<Env> {
       ...(m['workspaceKind'] === 'sample' ? { workspaceKind: 'sample' as const } : {}),
       ...(typeof m['revokedAtMs'] === 'number' ? { revokedAtMs: m['revokedAtMs'] } : {}),
     };
+    const previous = this.record(updated.principalId);
     this.ctx.storage.sql.exec(
       'INSERT OR REPLACE INTO hub_memberships (principal_id, data) VALUES (?, ?)',
       updated.principalId,
       JSON.stringify(updated),
     );
-    if (updated.revokedAtMs !== undefined && updated.revokedAtMs <= Date.now()) {
+    const changed = previous !== null && JSON.stringify(previous) !== JSON.stringify(updated);
+    if ((updated.revokedAtMs !== undefined && updated.revokedAtMs <= Date.now()) || changed) {
       for (const socket of this.ctx.getWebSockets(updated.principalId))
-        socket.close(1008, 'membership_revoked');
+        socket.close(1008, changed ? 'membership_changed' : 'membership_revoked');
     }
+    return response({ ok: true });
+  }
+
+  private revokeMembership(body: Record<string, unknown>): Response {
+    const principalId = body['principalId'];
+    if (typeof principalId !== 'string' || !UUID.test(principalId))
+      return response({ code: 'INVALID_MEMBERSHIP' }, 400);
+    const existing = this.record(principalId);
+    if (existing) {
+      this.ctx.storage.sql.exec(
+        'UPDATE hub_memberships SET data = ? WHERE principal_id = ?',
+        JSON.stringify({ ...existing, revokedAtMs: Date.now() }),
+        principalId,
+      );
+    }
+    for (const socket of this.ctx.getWebSockets(principalId)) socket.close(1008, 'membership_revoked');
     return response({ ok: true });
   }
 
@@ -799,6 +819,7 @@ export class WorkspaceHub extends DurableObject<Env> {
       activeWorkspaceId: membership.workspaceId,
       autonomy: 0,
       expiresAtMs: nowMs + 1,
+      deviceThumbprint: 'A'.repeat(43),
     };
     const decision = decideAccess(
       { claims, membership, killSwitchEngaged: false },

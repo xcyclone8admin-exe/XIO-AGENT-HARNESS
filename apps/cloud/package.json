@@ -8,11 +8,14 @@
     "build": "wrangler deploy --dry-run --outdir dist"
   },
   "dependencies": {
+    "@xyra/db": "0.1.0",
     "@xyra/contracts": "0.1.0",
     "@xyra/policy": "0.1.0",
     "hono": "4.12.8",
     "@xyra/mod-core": "0.1.0",
-    "@xyra/mod-ops": "0.1.0"
+    "@xyra/mod-swarm": "0.1.0",
+    "@xyra/mod-ops": "0.1.0",
+    "@simplewebauthn/server": "13.3.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20260930.2",

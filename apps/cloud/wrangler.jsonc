@@ -9,7 +9,14 @@
   "kv_namespaces": [{ "binding": "CACHE", "id": "00000000000000000000000000000000" }],
   "queues": {
     "producers": [{ "binding": "JOBS", "queue": "xyra-agent-os-local-jobs" }],
-    "consumers": [{ "queue": "xyra-agent-os-local-jobs", "max_batch_size": 10 }],
+    "consumers": [
+      {
+        "queue": "xyra-agent-os-local-jobs",
+        "max_batch_size": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "xyra-agent-os-local-jobs-dlq",
+      },
+    ],
   },
   "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "WorkspaceHub" }] },
   "exports": { "WorkspaceHub": { "type": "durable-object", "storage": "sqlite" } },

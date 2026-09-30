@@ -114,5 +114,16 @@ export default defineModule({
       },
     },
     { name: 'workspace_settings', class: 'lww', authority: 'server' },
+    // Cloud auth/security state is Worker-owned and never accepted from device sync.
+    { name: 'cloud_passkeys', class: 'lww', authority: 'server' },
+    { name: 'cloud_auth_transactions', class: 'lww', authority: 'server' },
+    { name: 'cloud_auth_codes', class: 'lww', authority: 'server' },
+    { name: 'cloud_refresh_families', class: 'lww', authority: 'server' },
+    { name: 'cloud_refresh_tokens', class: 'lww', authority: 'server' },
+    { name: 'cloud_dpop_replays', class: 'lww', authority: 'server' },
+    { name: 'cloud_webhook_receipts', class: 'lww', authority: 'server' },
+    { name: 'cloud_queue_jobs', class: 'lww', authority: 'server' },
+    { name: 'cloud_cron_runs', class: 'lww', authority: 'server' },
+    { name: 'cloud_purge_markers', class: 'lww', authority: 'server' },
   ],
 });

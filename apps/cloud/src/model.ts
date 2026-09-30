@@ -20,6 +20,8 @@ export interface CandidateClaims {
   readonly activeWorkspaceId: string;
   readonly autonomy: 0 | 1 | 2 | 3 | 4;
   readonly expiresAtMs: number;
+  /** RFC 7638 thumbprint of the non-exportable per-device DPoP public key. */
+  readonly deviceThumbprint: string;
   /** Authenticated device (issuer-bound); required for execution leases. */
   readonly deviceId?: string;
   /** Agents only: the delegating user; must match the Hub's current record. */

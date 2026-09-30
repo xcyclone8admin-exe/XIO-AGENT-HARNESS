@@ -28,13 +28,32 @@ const URL_BASE = 'http://cloud.test';
 
 let mf: Miniflare;
 let privateKey: CryptoKey;
+const fixtureMemberships = new Map<string, Record<string, any>>();
+const fixtureDpopReplays = new Set<string>();
+const deviceKeyPairs = new Map<string, CryptoKeyPair>();
 
 const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64url');
+async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
+  let pair = deviceKeyPairs.get(deviceId);
+  if (!pair) {
+    pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    deviceKeyPairs.set(deviceId, pair);
+  }
+  return pair;
+}
+
+async function thumbprint(deviceId: string): Promise<string> {
+  const jwk = await crypto.subtle.exportKey('jwk', (await deviceKey(deviceId)).publicKey);
+  const canonical = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk.x });
+  return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))));
+}
+
 const hlc = (ms: number, counter = 0) =>
   `${String(ms).padStart(13, '0')}-${counter.toString(16).padStart(4, '0')}-nodea`;
 
 async function mint(sub: string, over: Record<string, unknown> = {}, key = privateKey): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
+  const deviceId = typeof over['device_id'] === 'string' ? over['device_id'] : DEVICE_A;
   const head = b64(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' }));
   const body = b64(
     JSON.stringify({
@@ -46,6 +65,8 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
       autonomy_level: 1,
       iat: now,
       exp: now + 900,
+      device_id: deviceId,
+      cnf: { jkt: await thumbprint(deviceId) },
       aud: 'xyra-cloud',
       iss: 'xyra-auth',
       ...over,
@@ -55,6 +76,51 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
     await crypto.subtle.sign('Ed25519', key, new TextEncoder().encode(`${head}.${body}`)),
   );
   return `${head}.${body}.${b64(sig)}`;
+}
+
+async function dpop(token: string, method: string, route: string): Promise<string> {
+  let payload: { device_id: string };
+  try {
+    payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as {
+      device_id: string;
+    };
+  } catch {
+    return '';
+  }
+  if (typeof payload.device_id !== 'string') return '';
+  const pair = await deviceKey(payload.device_id);
+  const jwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+  const url = new URL(route, URL_BASE);
+  url.search = '';
+  url.hash = '';
+  const header = b64(
+    JSON.stringify({ typ: 'dpop+jwt', alg: 'EdDSA', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x } }),
+  );
+  const ath = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
+  const body = b64(
+    JSON.stringify({
+      htu: url.toString(),
+      htm: method.toUpperCase(),
+      iat: Math.floor(Date.now() / 1000),
+      jti: crypto.randomUUID(),
+      ath,
+    }),
+  );
+  const signature = new Uint8Array(
+    await crypto.subtle.sign('Ed25519', pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
+  );
+  return `${header}.${body}.${b64(signature)}`;
+}
+
+async function protectedHeaders(
+  method: string,
+  route: string,
+  token: string,
+): Promise<Record<string, string>> {
+  return {
+    authorization: `Bearer ${token}`,
+    dpop: await dpop(token, method, route),
+  };
 }
 
 async function hub(
@@ -68,17 +134,18 @@ async function hub(
     .fetch(`http://hub${path}`, { method: 'POST', body: JSON.stringify(body), headers });
 }
 
-const seed = (principalId: string, over: Record<string, unknown> = {}) =>
-  hub('/internal/membership/upsert', {
-    membership: {
-      principalId,
-      tenantId: T1,
-      workspaceId: W1,
-      role: 'owner',
-      permissions: [],
-      ...over,
-    },
-  });
+const seed = (principalId: string, over: Record<string, unknown> = {}) => {
+  const membership = {
+    principalId,
+    tenantId: T1,
+    workspaceId: W1,
+    role: 'owner',
+    permissions: [],
+    ...over,
+  };
+  fixtureMemberships.set(principalId, membership);
+  return hub('/internal/membership/upsert', { membership });
+};
 
 const setKill = (engaged: boolean) =>
   hub('/internal/kill-switch/set', {
@@ -101,7 +168,11 @@ async function call(
   if (route.startsWith('/v1/sync/pull') && !route.includes('protocolVersion='))
     route += `${route.includes('?') ? '&' : '?'}protocolVersion=1&schemaVersion=cloud-sync-v1`;
   const headers: Record<string, string> = { ...extra };
-  if (token) headers['authorization'] = `Bearer ${token}`;
+  if (token) {
+    headers['authorization'] = `Bearer ${token}`;
+    const proof = await dpop(token, method, route);
+    if (proof) headers['dpop'] = proof;
+  }
   if (body !== undefined) headers['content-type'] = 'application/json';
   const res = await mf.dispatchFetch(`${URL_BASE}${route}`, {
     method,
@@ -191,6 +262,52 @@ beforeAll(async () => {
       r2Buckets: ['BLOBS'],
       kvNamespaces: ['CACHE'],
       queueProducers: { JOBS: 'jobs' },
+      serviceBindings: {
+        CLOUD_TEST_AUTHORITY: async (request: Request) => {
+          let input: any;
+          try {
+            input = await request.json();
+          } catch {
+            return Response.json({ code: 'INVALID_REQUEST' }, { status: 400 });
+          }
+          const path = new URL(request.url).pathname;
+          if (path === '/dpop') {
+            const key = `${input?.tenantId}:${input?.deviceId}:${input?.jtiHashHex}`;
+            if (!input?.jtiHashHex || fixtureDpopReplays.has(key))
+              return Response.json({ code: 'DPOP_REPLAYED' }, { status: 409 });
+            fixtureDpopReplays.add(key);
+            return Response.json({ ok: true });
+          }
+          if (path !== '/resolve') return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+          const claims = input?.claims;
+          if (!claims || typeof claims.principalId !== 'string')
+            return Response.json({ code: 'INVALID_CLAIMS' }, { status: 400 });
+          const membership = fixtureMemberships.get(claims.principalId);
+          if (
+            !membership ||
+            (typeof membership.revokedAtMs === 'number' && membership.revokedAtMs <= Date.now()) ||
+            membership.tenantId !== claims.tenantId ||
+            membership.workspaceId !== claims.activeWorkspaceId ||
+            (membership.kind ?? 'user') !== claims.kind
+          ) {
+            return Response.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, { status: 404 });
+          }
+          const delegator =
+            typeof membership.delegatedBy === 'string'
+              ? fixtureMemberships.get(membership.delegatedBy)
+              : undefined;
+          if (
+            membership.kind === 'agent' &&
+            (!delegator ||
+              (typeof delegator.revokedAtMs === 'number' && delegator.revokedAtMs <= Date.now()) ||
+              delegator.tenantId !== membership.tenantId ||
+              delegator.workspaceId !== membership.workspaceId)
+          ) {
+            return Response.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, { status: 404 });
+          }
+          return Response.json({ membership, ...(delegator ? { delegator } : {}) });
+        },
+      },
       bindings: {
         AUTH_JWT_JWK: jwk,
         AUTH_JWT_AUDIENCE: 'xyra-cloud',
@@ -221,6 +338,22 @@ afterAll(async () => {
 });
 
 describe('auth on the real Worker', () => {
+  it('keeps PKCE/passkey and refresh issuance disabled without provisioned Neon and RP configuration', async () => {
+    for (const route of [
+      '/v1/auth/passkey/begin',
+      '/v1/auth/passkey/complete',
+      '/v1/auth/passkey/register/begin',
+      '/v1/auth/passkey/register/complete',
+      '/v1/auth/token',
+      '/v1/auth/refresh',
+    ]) {
+      const result = await call('POST', route, null, {});
+      expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
+    }
+    expect(
+      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(600_000) }),
+    ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
+  });
   it('fails closed without or with bad credentials', async () => {
     expect((await call('GET', '/v1/sync/pull', null)).status).toBe(401);
     expect((await call('GET', '/v1/sync/pull', 'a.b.c')).status).toBe(401);
@@ -234,6 +367,17 @@ describe('auth on the real Worker', () => {
   it('rejects a valid token when the Hub has no current membership', async () => {
     const res = await call('GET', '/v1/sync/pull', await mint('99999999-9999-4999-8999-999999999999'));
     expect(res.status).toBe(403);
+  });
+  it('rejects reuse of the same valid device proof at the HTTP boundary', async () => {
+    await seed(U1);
+    const token = await mint(U1);
+    const route = '/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1';
+    const headers = await protectedHeaders('GET', route, token);
+    const first = await mf.dispatchFetch(`${URL_BASE}${route}`, { headers });
+    expect(first.status).toBe(200);
+    const replay = await mf.dispatchFetch(`${URL_BASE}${route}`, { headers });
+    expect(replay.status).toBe(401);
+    expect(await replay.json()).toMatchObject({ code: 'DPOP_REPLAYED' });
   });
   it('protects internal Hub routes with the internal token', async () => {
     expect((await hub('/internal/membership/upsert', {}, { 'x-hub-internal-token': 'wrong' })).status).toBe(
@@ -415,8 +559,9 @@ describe('leases and kill switch on workerd', () => {
       headers: { upgrade: 'websocket' },
     });
     expect(denied.status).toBe(401);
+    const token = await mint(id);
     const res = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
-      headers: { upgrade: 'websocket', authorization: `Bearer ${await mint(id)}` },
+      headers: { upgrade: 'websocket', ...(await protectedHeaders('GET', '/v1/workspace/events', token)) },
     });
     expect(res.status).toBe(101);
     const socket = res.webSocket;
@@ -443,8 +588,12 @@ describe('leases and kill switch on workerd', () => {
     await setKill(true);
     await new Promise((r) => setTimeout(r, 500));
     expect(messages.length).toBe(before);
+    const retryToken = await mint(id);
     const retry = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
-      headers: { upgrade: 'websocket', authorization: `Bearer ${await mint(id)}` },
+      headers: {
+        upgrade: 'websocket',
+        ...(await protectedHeaders('GET', '/v1/workspace/events', retryToken)),
+      },
     });
     expect(retry.status).toBe(403);
     await setKill(false);
@@ -738,7 +887,10 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     });
     const rejected = await mf.dispatchFetch(`${URL_BASE}/v1/sync/push`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: {
+        ...(await protectedHeaders('POST', '/v1/sync/push', token)),
+        'content-type': 'application/json',
+      },
       body: stream,
       duplex: 'half',
     } as never);
@@ -763,7 +915,11 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const page = await mf.dispatchFetch(
       `${URL_BASE}/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1`,
       {
-        headers: { authorization: `Bearer ${readerToken}` },
+        headers: await protectedHeaders(
+          'GET',
+          '/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1',
+          readerToken,
+        ),
       },
     );
     const raw = await page.text();
@@ -785,12 +941,12 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const incompatible = await mf.dispatchFetch(
       `${URL_BASE}/v1/sync/pull?protocolVersion=99&schemaVersion=old`,
       {
-        headers: { authorization: `Bearer ${token}` },
+        headers: await protectedHeaders('GET', '/v1/sync/pull?protocolVersion=99&schemaVersion=old', token),
       },
     );
     expect(incompatible.status).toBe(426);
     const missing = await mf.dispatchFetch(`${URL_BASE}/v1/sync/pull`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: await protectedHeaders('GET', '/v1/sync/pull', token),
     });
     expect(missing.status).toBe(426);
     const supported = await call('GET', '/v1/sync/pull', token);
@@ -812,7 +968,7 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const expires = Math.floor(Date.now() / 1000) + 2;
     const token = await mint(id, { exp: expires });
     const response = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
-      headers: { upgrade: 'websocket', authorization: `Bearer ${token}` },
+      headers: { upgrade: 'websocket', ...(await protectedHeaders('GET', '/v1/workspace/events', token)) },
     });
     expect(response.status).toBe(101);
     const socket = response.webSocket;
