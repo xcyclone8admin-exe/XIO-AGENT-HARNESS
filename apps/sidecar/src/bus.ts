@@ -1,5 +1,6 @@
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import { decidePolicy } from '@xyra/policy';
+import { canonicalJson, sha256Hex } from '@xyra/core';
 
 export interface BusAudit {
   append(record: {
@@ -12,8 +13,8 @@ export interface BusAudit {
 }
 
 export interface BusIdempotency {
-  get(key: string): Promise<unknown | undefined>;
-  put(key: string, result: unknown): Promise<void>;
+  get(key: string): Promise<{ inputHash: string; result: unknown } | undefined>;
+  put(key: string, inputHash: string, result: unknown): Promise<void>;
 }
 
 export interface BusApproval {
@@ -56,6 +57,7 @@ interface Entry {
 /** All UI, agent, workflow and MCP calls share this path. */
 export class CapabilityBus {
   private readonly entries = new Map<string, Entry>();
+  private readonly inFlight = new Map<string, Promise<void>>();
   constructor(
     private readonly audit: BusAudit,
     private readonly idempotency: BusIdempotency,
@@ -75,7 +77,8 @@ export class CapabilityBus {
     this.entries.set(descriptor.id, { descriptor, manifest, handler });
   }
 
-  catalog(principal: Principal, workspaceId: string): AnyCapability[] {
+  async catalog(principal: Principal, workspaceId: string): Promise<AnyCapability[]> {
+    const delegatorPermissions = await this.delegatorPermissions(principal, workspaceId);
     return [...this.entries.values()]
       .filter(
         ({ descriptor, manifest }) =>
@@ -84,8 +87,13 @@ export class CapabilityBus {
             workspaceId,
             manifest,
             permission: descriptor.permission,
-            kind: 'read',
-            risk: 'low',
+            kind: descriptor.kind,
+            risk: descriptor.risk,
+            ...(descriptor.sampleOnly === undefined ? {} : { sampleOnly: descriptor.sampleOnly }),
+            ...(descriptor.approvalPolicy === undefined ? {} : { approvalPolicy: descriptor.approvalPolicy }),
+            approvalVerified: true,
+            delegatorPermissions,
+            killSwitchEngaged: this.killSwitch(),
           }).status === 'allow',
       )
       .map(({ descriptor }) => descriptor);
@@ -121,44 +129,61 @@ export class CapabilityBus {
       if (approved) decision = decidePolicy({ ...policyInput, approvalVerified: true });
     }
     if (decision.status !== 'allow') {
-      await this.audit.append({
-        principal: call.principal,
-        workspaceId: call.workspaceId,
-        capabilityId: descriptor.id,
-        result: decision.status,
-        detail: decision.status === 'deny' ? decision.reason : decision.policy,
-      });
+      // An out-of-scope workspace has no valid tenant-scoped audit destination.
+      if (call.principal.workspaces.some((w) => w.id === call.workspaceId)) {
+        await this.audit.append({
+          principal: call.principal,
+          workspaceId: call.workspaceId,
+          capabilityId: descriptor.id,
+          result: decision.status,
+          detail: decision.status === 'deny' ? decision.reason : decision.policy,
+        });
+      }
       if (decision.status === 'approval_required')
         throw new BusFault('APPROVAL_REQUIRED', 202, decision.policy);
       throw new BusFault(decision.reason, 403, 'Capability denied');
     }
     if (descriptor.kind !== 'read' && !call.idempotencyKey)
       throw new BusFault('IDEMPOTENCY_REQUIRED', 400, 'Idempotency-Key required');
+    if (call.idempotencyKey && (call.idempotencyKey.length > 200 || !/^[\x21-\x7e]+$/.test(call.idempotencyKey)))
+      throw new BusFault('INVALID_IDEMPOTENCY_KEY', 400, 'Invalid Idempotency-Key');
     const key = call.idempotencyKey
       ? `${call.principal.tenantId}:${call.workspaceId}:${descriptor.id}:${call.idempotencyKey}`
       : undefined;
-    if (key) {
-      const previous = await this.idempotency.get(key);
-      if (previous !== undefined) return previous;
-    }
-    try {
-      const result = descriptor.output.parse(await handler(parsed.data, call));
-      if (key) await this.idempotency.put(key, result);
-      await this.audit.append({
-        principal: call.principal,
-        workspaceId: call.workspaceId,
-        capabilityId: descriptor.id,
-        result: 'succeeded',
-      });
-      return result;
-    } catch (error) {
-      await this.audit.append({
-        principal: call.principal,
-        workspaceId: call.workspaceId,
-        capabilityId: descriptor.id,
-        result: 'failed',
-      });
-      throw error;
+    const invoke = async (): Promise<unknown> => {
+      const inputHash = await sha256Hex(canonicalJson(parsed.data));
+      if (key) {
+        const previous = await this.idempotency.get(key);
+        if (previous) {
+          if (previous.inputHash !== inputHash)
+            throw new BusFault('IDEMPOTENCY_CONFLICT', 409, 'Key reused with different input');
+          return previous.result;
+        }
+      }
+      try {
+        const result = descriptor.output.parse(await handler(parsed.data, call));
+        if (key) await this.idempotency.put(key, inputHash, result);
+        await this.audit.append({ principal: call.principal, workspaceId: call.workspaceId,
+          capabilityId: descriptor.id, result: 'succeeded' });
+        return result;
+      } catch (error) {
+        await this.audit.append({ principal: call.principal, workspaceId: call.workspaceId,
+          capabilityId: descriptor.id, result: 'failed' });
+        throw error;
+      }
+    };
+    if (!key) return invoke();
+    // One trusted sidecar process serializes duplicate keys before their handlers run.
+    const previous = this.inFlight.get(key) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const current = previous.then(() => gate);
+    this.inFlight.set(key, current);
+    await previous;
+    try { return await invoke(); }
+    finally {
+      release();
+      if (this.inFlight.get(key) === current) this.inFlight.delete(key);
     }
   }
 }

@@ -4,7 +4,7 @@
  */
 const HEX: string[] = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
 
-export type RandomSource = (bytes: Uint8Array) => Uint8Array;
+export type RandomSource = (bytes: Uint8Array<ArrayBuffer>) => Uint8Array<ArrayBuffer>;
 const defaultRandom: RandomSource = (b) => globalThis.crypto.getRandomValues(b);
 
 let lastMs = -1;

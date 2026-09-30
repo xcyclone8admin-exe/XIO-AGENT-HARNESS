@@ -15,12 +15,14 @@ export default defineModule({
     'core:approval:read',
     'core:approval:decide',
     'core:audit:read',
+    'core:settings:read',
+    'core:settings:write',
   ],
   roleGrants: {
-    manager: ['core:workspace:read', 'core:approval:read'],
-    member: ['core:workspace:read'],
-    viewer: ['core:workspace:read'],
-    auditor: ['core:workspace:read', 'core:audit:read'],
+    manager: ['core:workspace:read', 'core:approval:read', 'core:settings:read', 'core:settings:write'],
+    member: ['core:workspace:read', 'core:settings:read'],
+    viewer: ['core:workspace:read', 'core:settings:read'],
+    auditor: ['core:workspace:read', 'core:audit:read', 'core:settings:read'],
   },
   nav: [
     { path: '', title: 'Workspace', keywords: ['organization', 'members'] },
@@ -31,7 +33,7 @@ export default defineModule({
       permission: 'core:approval:read',
     },
     { path: 'audit', title: 'Audit', keywords: ['activity', 'history'], permission: 'core:audit:read' },
-    { path: 'settings', title: 'Settings', keywords: ['preferences'] },
+    { path: 'settings', title: 'Settings', keywords: ['preferences'], permission: 'core:settings:read' },
   ],
   tables: [
     { name: 'tenants', class: 'lww', authority: 'server' },
@@ -42,5 +44,6 @@ export default defineModule({
     { name: 'approval_decisions', class: 'append', authority: 'server' },
     { name: 'audit_events', class: 'append', authority: 'append' },
     { name: 'domain_events', class: 'append', authority: 'append' },
+    { name: 'workspace_settings', class: 'lww', authority: 'server' },
   ],
 });

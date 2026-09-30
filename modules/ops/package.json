@@ -11,17 +11,22 @@
   },
   "exports": {
     "./manifest": "./manifest.ts",
-    "./ui": "./ui/index.tsx"
+    "./ui": "./ui/index.tsx",
+    "./contracts": "./contracts.ts",
+    "./server": "./server/service.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@xyra/contracts": "0.1.0",
+    "@xyra/core": "0.1.0",
+    "@xyra/db": "0.1.0",
     "@xyra/sdk": "0.1.0",
     "@xyra/ui": "0.1.0",
     "lucide-react": "1.49.0",
-    "react": "19.3.0"
+    "react": "19.3.0",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@types/react": "19.3.0"

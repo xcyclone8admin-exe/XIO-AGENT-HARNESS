@@ -50,7 +50,7 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
     if (!workspace.success) return c.json({ code: 'INVALID_WORKSPACE' }, 400);
     const principal = await options.resolvePrincipal();
     return c.json(
-      options.bus.catalog(principal, workspace.data).map((cap) => ({
+      (await options.bus.catalog(principal, workspace.data)).map((cap) => ({
         id: cap.id,
         module: cap.module,
         title: cap.title,
