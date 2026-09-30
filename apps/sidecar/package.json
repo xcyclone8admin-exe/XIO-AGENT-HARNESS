@@ -1,0 +1,21 @@
+{
+  "name": "@xyra/sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hono/node-server": "1.19.6",
+    "@xyra/contracts": "0.1.0",
+    "@xyra/core": "0.1.0",
+    "@xyra/db": "0.1.0",
+    "@xyra/policy": "0.1.0",
+    "hono": "4.12.8",
+    "zod": "4.6.5"
+  }
+}

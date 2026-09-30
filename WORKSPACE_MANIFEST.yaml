@@ -1,0 +1,10 @@
+catalog:
+  manifest: factory/FACTORY_MANIFEST.yaml
+  project_index: projects/_project-index.yaml
+  project: projects/institutional-agent-os/XYRA_PROJECT.yaml
+  overrides: projects/institutional-agent-os/PROJECT_OVERRIDES.yaml
+  factory_skills: factory/skills
+bootstrap:
+  complete: true
+  never_rescan: true
+  legacy_sources: ignored

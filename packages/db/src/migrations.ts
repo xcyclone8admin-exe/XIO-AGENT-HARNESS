@@ -4,6 +4,7 @@ import type { PoolClient } from '@neondatabase/serverless';
 
 export interface Migration {
   readonly id: string;
+  readonly module?: string;
   readonly sql: string;
   readonly checksum: string;
 }
