@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { PGlite } from '@electric-sql/pglite';
+import { LocalScopedStore } from '@xyra/db';
 import {
   Account,
   Asset,
@@ -57,7 +58,6 @@ interface TxContext {
     sql: string,
     params?: unknown[],
   ): Promise<{ rows: T[] }>;
-  exec(sql: string): Promise<unknown>;
 }
 
 interface AccountRow {
@@ -90,29 +90,21 @@ function pgMessage(error: unknown): string {
  * scoped transaction. Higher-level aggregation/reconciliation and capability wiring build on this.
  */
 export class PGliteLedgerWriter implements LedgerApi {
-  constructor(private readonly db: PGlite) {}
+  private readonly scoped: LocalScopedStore;
+  constructor(private readonly db: PGlite) { this.scoped = new LocalScopedStore(db); }
 
-  private async inScope<T>(
-    scope: LedgerScope,
-    work: (tx: TxContext) => Promise<T>,
-    // This writer is only installed behind authenticated Money capabilities; the app/sync role
-    // remains read-only on server-authority tables and is tested separately through LocalScopedStore.
-    role: 'xyra_app' | 'xyra_server' = 'xyra_server',
-  ): Promise<T> {
+  private async inScope<T>(scope: LedgerScope, work: (tx: TxContext) => Promise<T>): Promise<T> {
     if (!/^[0-9a-f-]{36}$/i.test(scope.tenantId) || !/^[0-9a-f-]{36}$/i.test(scope.workspaceId)) {
       throw new LedgerStoreError('NOT_FOUND', 'Invalid ledger scope');
     }
     if (scope.hlc !== undefined && !/^\d{13}-[0-9a-f]{4}-[a-z0-9]{1,32}$/.test(scope.hlc)) {
       throw new LedgerStoreError('NOT_FOUND', 'Invalid workspace HLC');
     }
+    if (scope.hlc !== undefined && Number(scope.hlc.slice(0, 13)) > Date.now() + 60_000) {
+      throw new LedgerStoreError('NOT_FOUND', 'Workspace HLC is too far in the future');
+    }
     try {
-      return await this.db.transaction(async (tx) => {
-        await tx.exec(`SET LOCAL ROLE ${role}`);
-        await tx.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
-        await tx.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
-        await tx.query("SELECT set_config('app.hlc', $1, true)", [scope.hlc ?? '']);
-        return work(tx);
-      });
+      return await this.scoped.withServerScope(scope, 'money_ledger', scope.hlc, (tx) => work({ query: tx.query }));
     } catch (error) {
       const message = pgMessage(error);
       if (/LIVE_TRADING_DISABLED/.test(message)) throw new LedgerStoreError('LIVE_TRADING_DISABLED');
@@ -658,20 +650,18 @@ export class PGliteLedgerWriter implements LedgerApi {
       return ReconciliationRun.parse({ id, environment: input.environment, bookId: input.bookId ?? null, runKey,
         checkedBalances: checked.rows[0]?.count ?? 0, discrepancyCount: mismatches.rows.length, status,
         startedAt: new Date().toISOString(), reused: false });
-    }, 'xyra_server');
+    });
   }
 
   async discrepancies(scope: LedgerScope, value: DiscrepancyQuery): Promise<Discrepancy[]> {
     const query = DiscrepancyQuery.parse(value);
-    return this.inScope(scope, async (tx) => {
-      const { rows } = await tx.query<Record<string, unknown>>(
-        `SELECT id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
-           external_ref,detail,resolution,created_at,resolved_at FROM ledger_discrepancies
-         WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::text IS NULL OR status=$4)
-           AND ($5::uuid IS NULL OR book_id=$5) ORDER BY created_at DESC,id`,
-        [scope.tenantId, scope.workspaceId, query.environment, query.status ?? null, query.bookId ?? null]);
-      return rows.map((r) => this.discrepancyOut(r));
-    });
+    const result = await this.scoped.query<Record<string, unknown>>(scope,
+      `SELECT id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
+         external_ref,detail,resolution,created_at,resolved_at FROM ledger_discrepancies
+       WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::text IS NULL OR status=$4)
+         AND ($5::uuid IS NULL OR book_id=$5) ORDER BY created_at DESC,id`,
+      [scope.tenantId, scope.workspaceId, query.environment, query.status ?? null, query.bookId ?? null]);
+    return result.rows.map((r) => this.discrepancyOut(r));
   }
 
   async assignDiscrepancy(scope: LedgerScope, actorId: string, value: AssignDiscrepancyInput): Promise<Discrepancy> {
@@ -684,9 +674,8 @@ export class PGliteLedgerWriter implements LedgerApi {
            external_ref,detail,resolution,created_at,resolved_at`,
         [scope.tenantId, scope.workspaceId, input.discrepancyId, input.ownerId]);
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Open discrepancy not found');
-      if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
       return this.discrepancyOut(rows[0]);
-    }, 'xyra_server');
+    });
   }
 
   async resolveDiscrepancy(scope: LedgerScope, actorId: string, value: ResolveDiscrepancyInput): Promise<Discrepancy> {
@@ -714,7 +703,7 @@ export class PGliteLedgerWriter implements LedgerApi {
         [scope.tenantId, scope.workspaceId, input.discrepancyId, input.resolution]);
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
       return this.discrepancyOut(rows[0]);
-    }, 'xyra_server');
+    });
   }
 
   private encodeCursor(date: string, id: string): string {
