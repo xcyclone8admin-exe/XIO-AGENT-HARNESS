@@ -23,7 +23,22 @@ beforeAll(async () => {
     db,
     files.map((name) => migration(`platform/${name.slice(0, -4)}`, readFileSync(`${dir}${name}`, 'utf8'))),
   );
-  await prepareLocalAppRole(db);
+  // Mirrors the core and ops manifest declarations (the sidecar passes MANIFESTS).
+  await prepareLocalAppRole(db, [
+    ...[
+      'tenants',
+      'workspaces',
+      'users',
+      'memberships',
+      'workspace_settings',
+      'ops_projects',
+      'ops_tasks',
+    ].map((name) => ({ name, class: 'lww' as const })),
+    ...['approval_requests', 'approval_decisions', 'audit_events', 'domain_events'].map((name) => ({
+      name,
+      class: 'append' as const,
+    })),
+  ]);
   await db.query('INSERT INTO tenants(id,name) VALUES ($1,$2),($3,$4)', [tenantA, 'A', tenantB, 'B']);
   await db.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3),($4,$5,$6)', [
     workspaceA,

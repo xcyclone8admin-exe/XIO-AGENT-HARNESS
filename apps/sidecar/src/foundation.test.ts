@@ -8,6 +8,7 @@ import { CapabilityBus } from './bus';
 import { DurableBusAudit, DurableBusIdempotency } from './durable';
 import { registerFoundationCapabilities } from './foundation';
 import { MIGRATIONS } from './generated/migrations';
+import { MANIFESTS } from './generated/modules';
 
 let db: PGlite;
 let bus: CapabilityBus;
@@ -16,7 +17,10 @@ beforeAll(async () => {
   db = await openLocalStore();
   // The same generated list the bundled sidecar applies at startup.
   await applyPGliteMigrations(db, MIGRATIONS);
-  await prepareLocalAppRole(db);
+  await prepareLocalAppRole(
+    db,
+    MANIFESTS.flatMap((manifest) => manifest.tables),
+  );
   const scoped = new LocalScopedStore(db);
   bus = new CapabilityBus(
     new DurableBusAudit(scoped),

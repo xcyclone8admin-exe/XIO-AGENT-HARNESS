@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import type { PGlite } from '@electric-sql/pglite';
-import { applyPGliteMigrations, migration } from './migrations';
+import { applyPGliteMigrations, assertOrdered, migration } from './migrations';
 import { openLocalStore } from './pglite';
 
 const SQL = readFileSync(
@@ -97,4 +97,16 @@ test('every app-readable relation excludes tenant B under tenant A context', asy
   } finally {
     await db.exec('RESET ROLE');
   }
+});
+
+test('module blocks follow dependency order, not lexical order (ADR-0016)', () => {
+  const m = (id: string) => migration(id, `-- ${id}`);
+  expect(() =>
+    assertOrdered([m('platform/0001_a'), m('platform/0002_b'), m('money/0001_a'), m('invest/0001_a')]),
+  ).not.toThrow();
+  expect(() => assertOrdered([m('money/0001_a'), m('platform/0001_a')])).toThrow(/Platform/);
+  expect(() => assertOrdered([m('platform/0001_a'), m('platform/0003_c')])).toThrow(/sequence/);
+  expect(() =>
+    assertOrdered([m('platform/0001_a'), m('money/0001_a'), m('invest/0001_a'), m('money/0002_b')]),
+  ).toThrow(/contiguous/);
 });
