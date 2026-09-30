@@ -4,6 +4,7 @@ import { compileContext, compileSpecCorpus } from '../server/compiler';
 import { authorizeChaosTarget, classifyDiscovery, createEvidence, evaluateGates, planSchedule, requestPromotion, rollbackPromotion } from '../server/engine';
 import { registerForge } from '../server';
 import type { AnyCapability, ModuleManifest } from '@xyra/contracts';
+import type { ForgeCall } from '../server';
 import { renderAllGoldenBriefs } from '../server/specs';
 import { transitionEpic, transitionFinding, transitionPromotion, transitionTicket } from '../server/state-machine';
 
@@ -84,8 +85,8 @@ describe('approved bounded scheduler (planning only)', () => {
 
 describe('review, gates, promotion and hard execution boundary', () => {
   it('validates the gates envelope and registers evidence/review workflows through capabilities', async () => {
-    const registered = new Map<string, (input: unknown) => Promise<unknown>>();
-    const bus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown) => Promise<unknown>) => registered.set(descriptor.id, handler) };
+    const registered = new Map<string, (input: unknown, call?: ForgeCall) => Promise<unknown>>();
+    const bus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call?: ForgeCall) => Promise<unknown>) => registered.set(descriptor.id, handler) };
     registerForge(bus, {} as ModuleManifest);
     expect([...registered.keys()]).toEqual(expect.arrayContaining([
       'forge.evidence.create', 'forge.findings.create', 'forge.discoveries.classify', 'forge.promotions.rollback-record',
