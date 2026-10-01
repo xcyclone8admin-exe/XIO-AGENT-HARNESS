@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { NativeCloudTransport, type NativeCloudInvoker } from './native-cloud-transport';
 
 const ingestionId = '00000000-0000-4000-8000-000000000001';
+const syncPushBody = {
+  protocolVersion: 1,
+  schemaVersion: 'cloud-sync-v1',
+  nodeId: 'devicea',
+  idempotencyKey: 'push-sync-00000000001',
+  changes: [],
+};
 
 describe('NativeCloudTransport', () => {
   it('sends only the typed route and body to the native-owned authenticated command', async () => {
@@ -49,6 +56,27 @@ describe('NativeCloudTransport', () => {
     await expect(
       transport.request(`/v2/brain/ingestions/${ingestionId}`, { method: 'POST', body: '{}' }),
     ).rejects.toThrow('CLOUD_ROUTE_NOT_ALLOWED');
+  });
+
+  it('allows only fixed, versioned sync push/pull routes with bounded query shape', async () => {
+    const transport = new NativeCloudTransport(async () => ({ status: 200, body: {} }));
+    await expect(transport.request('/v1/sync/push', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(syncPushBody),
+    })).resolves.toBeInstanceOf(Response);
+    await expect(transport.request('/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1&limit=50&cursor=opaque', {
+      method: 'GET',
+    })).resolves.toBeInstanceOf(Response);
+    await expect(transport.request('/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1&cursor=a&cursor=b', {
+      method: 'GET',
+    })).rejects.toThrow('CLOUD_ROUTE_NOT_ALLOWED');
+    await expect(transport.request('/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1&unexpected=x', {
+      method: 'GET',
+    })).rejects.toThrow('CLOUD_ROUTE_NOT_ALLOWED');
+    await expect(transport.request('/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1&limit=1001', {
+      method: 'GET',
+    })).rejects.toThrow('CLOUD_ROUTE_NOT_ALLOWED');
+    await expect(transport.request('/v1/sync/push?unexpected=x', { method: 'POST', body: JSON.stringify(syncPushBody) }))
+      .rejects.toThrow('CLOUD_ROUTE_NOT_ALLOWED');
   });
 
   it('rejects caller-supplied auth headers and malformed body before IPC', async () => {

@@ -24,6 +24,8 @@ export interface LocalSidecarOptions {
   readonly allowedOrigins: readonly string[];
   /** Native host may generate it; otherwise a 256-bit token is made here. */
   readonly launchToken?: string;
+  /** Private native→sidecar callback token; must never be returned through LocalSidecarSession. */
+  readonly nativeSyncToken?: string;
 }
 
 export interface LocalSidecarSession {
@@ -62,6 +64,7 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       allowedOrigins: options.allowedOrigins,
       resolvePrincipal: async () => principal,
       bus,
+      ...(options.nativeSyncToken === undefined ? {} : { nativeSyncToken: options.nativeSyncToken }),
     });
     const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: options.port });
     return {
