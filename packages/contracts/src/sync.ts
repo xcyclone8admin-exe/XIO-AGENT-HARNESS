@@ -95,18 +95,114 @@ export const ConflictRecord = z.object({
 });
 export type ConflictRecord = z.infer<typeof ConflictRecord>;
 
+const ChangeFieldNames = z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).max(256).superRefine((fields, context) => {
+  if (new Set(fields).size !== fields.length) {
+    context.addIssue({ code: 'custom', message: 'Outcome field names must be unique' });
+  }
+  if (fields.some((field, index) => index > 0 && fields[index - 1]! >= field)) {
+    context.addIssue({ code: 'custom', message: 'Outcome field names must be sorted' });
+  }
+});
+
+/** Durable per-change result. `index` binds duplicate change IDs unambiguously to this request. */
+export const PushChangeOutcome = z.strictObject({
+  index: z.number().int().nonnegative(),
+  changeId: z.uuid(),
+  table: z.string().regex(/^[a-z][a-z0-9_]*$/),
+  rowId: z.uuid(),
+  outcome: z.enum(['committed', 'unchanged', 'conflict', 'rejected']),
+  appliedFields: ChangeFieldNames,
+  unchangedFields: ChangeFieldNames,
+  conflictedFields: ChangeFieldNames,
+  rejectionCode: SyncRejectionCode.optional(),
+}).superRefine((value, context) => {
+  const applied = new Set(value.appliedFields);
+  if (value.unchangedFields.some((field) => applied.has(field)) || value.conflictedFields.some((field) => applied.has(field))) {
+    context.addIssue({ code: 'custom', message: 'Outcome field dispositions must not overlap' });
+  }
+  if (value.unchangedFields.some((field) => value.conflictedFields.includes(field))) {
+    context.addIssue({ code: 'custom', message: 'Outcome field dispositions must not overlap' });
+  }
+  if (value.outcome === 'rejected') {
+    if (!value.rejectionCode || value.appliedFields.length || value.unchangedFields.length || value.conflictedFields.length) {
+      context.addIssue({ code: 'custom', message: 'Rejected outcome requires only a rejection code' });
+    }
+  } else if (value.rejectionCode !== undefined) {
+    context.addIssue({ code: 'custom', message: 'Non-rejected outcome cannot carry a rejection code' });
+  }
+  if (value.outcome === 'unchanged' && (value.appliedFields.length || value.conflictedFields.length)) {
+    context.addIssue({ code: 'custom', message: 'Unchanged outcome cannot apply or lose fields' });
+  }
+  if (value.outcome === 'conflict' && (value.appliedFields.length || !value.conflictedFields.length)) {
+    context.addIssue({ code: 'custom', message: 'Conflict outcome requires lost fields and no applied fields' });
+  }
+});
+export type PushChangeOutcome = z.infer<typeof PushChangeOutcome>;
+
 /** Server sequence numbers are decimal strings; they exceed 2^53 over a workspace's life. */
 const Seq = z.string().regex(/^\d{1,20}$/);
 
-export const PushResponse = z.object({
+export const PushResponse = z.strictObject({
   accepted: z.number().int().nonnegative(),
   conflicts: z.number().int().nonnegative(),
   serverSeq: Seq,
   rejected: z.array(SyncRejection),
   conflictHistory: z.array(ConflictRecord),
+  /** Additive during rollout; acknowledgement consumers fail closed when omitted. */
+  changeOutcomes: z.array(PushChangeOutcome).max(MAX_PUSH_ROWS).optional(),
   replayed: z.boolean(),
 });
 export type PushResponse = z.infer<typeof PushResponse>;
+
+/**
+ * Bind every row outcome to the exact request and ensure the aggregate summary agrees.
+ * This does not itself authorize a workflow: callers must also verify expected scope, rows,
+ * fields and digests and keep uncertain outcomes pending.
+ */
+export function assertPushResponseBoundToRequest(request: PushRequest, response: PushResponse): void {
+  const parsedResponse = PushResponse.parse(response);
+  if (!parsedResponse.changeOutcomes || parsedResponse.changeOutcomes.length !== request.changes.length) {
+    throw new TypeError('SYNC_OUTCOME_COVERAGE_MISMATCH');
+  }
+  const rejectedByIndex = new Map(parsedResponse.rejected.map((item) => [item.index, item]));
+  if (rejectedByIndex.size !== parsedResponse.rejected.length) throw new TypeError('SYNC_REJECTION_INDEX_DUPLICATE');
+  let committed = 0;
+  for (const [index, change] of request.changes.entries()) {
+    const outcome = parsedResponse.changeOutcomes[index];
+    if (
+      !outcome || outcome.index !== index || outcome.changeId !== change.id ||
+      outcome.table !== change.table || outcome.rowId !== change.id
+    ) throw new TypeError('SYNC_OUTCOME_REQUEST_MISMATCH');
+    const rejected = rejectedByIndex.get(index);
+    if (outcome.outcome === 'rejected') {
+      if (!rejected || rejected.changeId !== change.id || rejected.code !== outcome.rejectionCode) {
+        throw new TypeError('SYNC_OUTCOME_REJECTION_MISMATCH');
+      }
+      if (outcome.appliedFields.length || outcome.unchangedFields.length || outcome.conflictedFields.length) {
+        throw new TypeError('SYNC_REJECTED_FIELDS_MISMATCH');
+      }
+      continue;
+    }
+    if (rejected) throw new TypeError('SYNC_OUTCOME_REJECTION_MISMATCH');
+    const requestedFields = Object.keys(change.fields).sort();
+    const dispositions = [
+      ...outcome.appliedFields,
+      ...outcome.unchangedFields,
+      ...outcome.conflictedFields,
+    ].sort();
+    if (dispositions.length !== requestedFields.length || dispositions.some((field, i) => field !== requestedFields[i])) {
+      throw new TypeError('SYNC_OUTCOME_FIELDS_MISMATCH');
+    }
+    if (outcome.outcome === 'committed' && change.op !== 'delete' && outcome.appliedFields.length === 0) {
+      throw new TypeError('SYNC_COMMITTED_WITHOUT_APPLIED_FIELDS');
+    }
+    if (outcome.outcome === 'committed') committed += 1;
+  }
+  if (parsedResponse.rejected.some((item) => item.index >= request.changes.length)) {
+    throw new TypeError('SYNC_REJECTION_INDEX_OUT_OF_RANGE');
+  }
+  if (parsedResponse.accepted !== committed) throw new TypeError('SYNC_ACCEPTED_COUNT_MISMATCH');
+}
 
 export const SequencedChange = z.object({ seq: Seq, change: RowChange });
 export type SequencedChange = z.infer<typeof SequencedChange>;

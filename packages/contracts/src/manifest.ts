@@ -102,6 +102,12 @@ export const TableDecl = z
      * inserts that set them.
      */
     privilegedColumns: z.array(z.string().min(1)).default([]),
+    /** Named trusted-writer capabilities granted access to this local relation only. */
+    serverWriteCapabilities: z.array(z.string().regex(/^[a-z][a-z0-9_]{1,47}$/)).default([]),
+    /** Named trusted capabilities that may read this local relation without write privileges. */
+    serverReadCapabilities: z.array(z.string().regex(/^[a-z][a-z0-9_]{1,47}$/)).default([]),
+    /** Named trusted capabilities granted SELECT and INSERT only (for append-only relations). */
+    serverInsertCapabilities: z.array(z.string().regex(/^[a-z][a-z0-9_]{1,47}$/)).default([]),
     /**
      * Device-writable fields for `synced`/`append` tables. Absent means the Worker
      * rejects every field change (fail closed). Never lists server-stamped fields.

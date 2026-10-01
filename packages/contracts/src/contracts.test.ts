@@ -43,6 +43,27 @@ describe('TableDecl write surface', () => {
       TableDecl.parse({ name: 'memberships', class: 'lww', authority: 'server', allowedFields: ['role'] }),
     ).toThrow(/only to synced or append/);
   });
+  it('preserves explicit trusted writer capability declarations', () => {
+    const table = TableDecl.parse({
+      name: 'ledger_balances',
+      class: 'local',
+      authority: 'local',
+      serverWriteCapabilities: ['money_ledger'],
+      serverReadCapabilities: ['invest_paper_execution'],
+      serverInsertCapabilities: ['invest_paper_execution'],
+    });
+    expect(table.serverWriteCapabilities).toEqual(['money_ledger']);
+    expect(table.serverReadCapabilities).toEqual(['invest_paper_execution']);
+    expect(table.serverInsertCapabilities).toEqual(['invest_paper_execution']);
+    expect(() =>
+      TableDecl.parse({
+        name: 'ledger_balances',
+        class: 'local',
+        authority: 'local',
+        serverWriteCapabilities: ['Money Ledger'],
+      }),
+    ).toThrow();
+  });
 });
 
 describe('defineModule', () => {
