@@ -58,6 +58,12 @@ beforeAll(async () => {
 
 afterAll(async () => { await db?.close(); });
 
+test('UTC day key is independent of session timezone and rolls at the UTC boundary', async () => {
+  const result = await db.query<{ before_boundary:string; after_boundary:string }>(`SELECT invest_utc_risk_date('2026-10-01T00:15:00+02:00'::timestamptz)::text AS before_boundary,
+    invest_utc_risk_date('2026-09-30T23:59:59-01:00'::timestamptz)::text AS after_boundary`);
+  expect(result.rows[0]).toEqual({ before_boundary:'2026-09-30', after_boundary:'2026-10-01' });
+});
+
 test('trusted service creates, risk-sizes, approves and atomically fills a PAPER order', async () => {
   const scope = { tenantId, workspaceId };
   await writer.ensureAssets(scope, userId, [{ code: 'USD', scale: 2, kind: 'fiat', name: 'US dollar' }]);
@@ -94,6 +100,8 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   await service.voteMemo(scope, userCall(secondUserId), { memoId: memo.id, vote: 'approve', reason: 'Independent review' });
   const mandate = await service.activateMandate(scope, userCall(userId), { memoId: memo.id });
   expect(mandate.status).toBe('approved');
+  await db.query(`DELETE FROM invest_portfolio_risk_state WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,[tenantId,workspaceId,portfolioId]);
+  await expect(service.riskState(scope,{portfolioId})).resolves.toMatchObject({killSwitch:false,dailyLossUnits:'0'});
   const immutableVote = await db.query<{id:string}>(`SELECT id FROM invest_ic_votes WHERE tenant_id=$1 AND workspace_id=$2 AND memo_id=$3 ORDER BY created_at LIMIT 1`, [tenantId, workspaceId, memo.id]);
   await expect(db.query(`UPDATE invest_ic_votes SET reason='rewrite' WHERE id=$1`, [immutableVote.rows[0]?.id])).rejects.toThrow(/append-only/);
   const proposed = await service.propose(scope, userId, {
@@ -101,6 +109,9 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
     idempotencyKey: 'paper-order-service-test',
   });
   orderId = proposed.id;
+  const newUtcDay = await db.query<{day_open_nav_units:string}>(`SELECT day_open_nav_units::text FROM invest_portfolio_risk_state
+    WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,[tenantId,workspaceId,portfolioId]);
+  expect(newUtcDay.rows[0]?.day_open_nav_units).toBe('100000');
   expect(proposed.environment).toBe('paper');
   expect(proposed.quantity_units).toBe('500000');
   await service.approve(scope, userId, { orderId });
@@ -148,6 +159,13 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   expect(mismatched).toMatchObject({status:'needs_review',discrepancyCount:2});
   const diffs = await db.query<{kind:string;expected_units:string;observed_units:string;owner_id:string}>(`SELECT kind,expected_units::text,observed_units::text,owner_id FROM invest_reconciliation_discrepancies WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 ORDER BY kind`, [tenantId,workspaceId,mismatched.runId]);
   expect(diffs.rows).toEqual([{kind:'cash_mismatch',expected_units:'100000',observed_units:'99000',owner_id:userId},{kind:'unknown_position',expected_units:'0',observed_units:'20',owner_id:userId}]);
+  await db.query(`UPDATE invest_portfolio_risk_state SET risk_date=risk_date-1,kill_switch=true,kill_reason='prior day halt'
+    WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,[tenantId,workspaceId,portfolio.id]);
+  await service.fundPortfolio(scope,userId,{portfolioId:portfolio.id,units:'1000',reference:'post-midnight PAPER capital contribution'});
+  await expect(service.riskState(scope,{portfolioId:portfolio.id})).resolves.toMatchObject({killSwitch:true,killReason:'prior day halt',dailyLossUnits:'0'});
+  await expect(service.propose(scope,userId,{portfolioId:portfolio.id,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'halt-carries-over-utc-day'})).rejects.toThrow(/kill switch is engaged/);
+  await service.setKillSwitch(scope,userId,{portfolioId:portfolio.id,engaged:false,reason:'Owner explicitly resumed after UTC rollover'});
+  await expect(service.riskState(scope,{portfolioId:portfolio.id})).resolves.toMatchObject({killSwitch:false,killReason:null,dailyLossUnits:'0'});
 });
 
 test('a failing fill-event insert rolls back fill and ledger posting together', async () => {

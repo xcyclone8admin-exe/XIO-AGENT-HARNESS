@@ -6,7 +6,11 @@ Invest provides isolated PAPER portfolios and simulated order execution. It does
 
 Capability handlers derive tenant, workspace, actor, and authorization from the trusted sidecar call context. Payloads cannot select a tenant or workspace. UI and agents cannot call database transaction APIs directly.
 
-An approved PAPER fill, its balanced ledger posting, ledger projection updates, immutable fill row, order-state events, FIFO tax-lot changes, and post-trade monitoring share one transaction through `PaperTradeLedgerApi.withPaperTradeTransaction`. A thrown ledger, lot, or event write rolls back the fill and journal together. Statement imports and risk-control writes use the scoped `invest_paper` capability transaction; they never post actual or live ledger books.
+An approved PAPER fill, its balanced ledger posting, ledger projection updates, immutable fill row, order-state events, FIFO tax-lot changes, and post-trade monitoring share one transaction through `PaperTradeLedgerApi.withPaperTradeTransaction`. A thrown ledger, lot, or event write rolls back the fill and journal together. The simulator currently executes one all-or-nothing fill per approved order; the schema's partial-fill enum is reserved and no partial-fill execution is claimed. Statement imports and risk-control writes use the scoped `invest_paper` capability transaction; they never post actual or live ledger books.
+
+Risk-day rows use the database's UTC date function. A fresh row is opened lazily by the first funding, approved order, price mark, fill, or halt action observed on a new UTC day; day-open NAV is the ledger-derived NAV at that first observation and daily loss starts at zero. Subsequent same-day external funding adjusts the opening NAV as a contribution. Previous-day kill state is carried forward until an explicit human resume. Risk-state reads return a safe inactive/default snapshot if no day row has been created yet.
+
+FIFO basis uses integer proportional allocation rounded down for partial disposals. The final disposal of each lot receives all remaining basis units, so repeated partial disposals conserve the lot's original basis exactly without fractional or floating-point residue.
 
 Amounts and quantities crossing capabilities or SQL are canonical decimal strings. Financial arithmetic uses `bigint`; no floating-point calculation is used for money or units.
 
@@ -15,7 +19,7 @@ Amounts and quantities crossing capabilities or SQL are canonical decimal string
 | Requirement | State in this module | Evidence / limits |
 | --- | --- | --- |
 | REQ-INV-001 | Uses the shared immutable, per-asset double-entry ledger. | `@xyra/ledger`; fill atomicity test in `tests/service.test.ts`; 10,000 deterministic per-asset journal cases in `packages/ledger/src/contracts.test.ts`. |
-| REQ-INV-002 | PAPER portfolios, ledger-derived positions, stateful orders/fills, price receive/source times, market sessions, FIFO lots and immutable lot events. | `migrations/0001_investment_core.sql`, `0002_invest_controls.sql`; service buy/sell lot test. |
+| REQ-INV-002 | PAPER portfolios, ledger-derived positions, stateful all-or-nothing orders/fills, price receive/source times, market sessions, FIFO lots and immutable lot events. | `migrations/0001_investment_core.sql`, `0002_invest_controls.sql`; service buy/sell lot test and `tests/tax-lots.test.ts`. Partial fills are not implemented. |
 | REQ-INV-003 | Mandate drafts become effective-dated versions only after two independent direct owner/admin IC approvals. | `createMandate`, `voteMemo`, `activateMandate`; service test denies agent and single-voter approval. |
 | REQ-INV-004 | Deterministic pre-trade checks cover configured size, loss, order-rate, quote sanity/freshness, duplicate, restricted/watch, concentration, correlation, leverage, drawdown and volatility limits. | Golden cases in `tests/risk.test.ts`; limit-policy editing/approval is not yet exposed as a complete workflow. |
 | REQ-INV-005 | Price and fill marks persist breach alerts, auto-halt when configured limits are reached, and cancel open orders. Owners assign, acknowledge, then resolve with immutable audit events. | `invest_breach_events`; service integration test covers denial for unassigned user and the full owner flow. Alert delivery is the durable in-app queue; no external notification adapter is claimed. |
