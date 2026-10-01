@@ -9,6 +9,7 @@ import { LEDGER_TABLES } from '@xyra/ledger/contracts';
 import investManifest from '../manifest';
 import { InvestService } from '../server/service';
 import { investCapabilities } from '../server/capabilities';
+import type { TrustedFlowStepContext } from '../server/scheduled-reconciliation';
 
 const tenantId = '019a0000-0000-7000-8000-000000000501';
 const workspaceId = '019a0000-0000-7000-8000-000000000502';
@@ -296,6 +297,54 @@ test('a failing fill-event insert rolls back fill and ledger posting together', 
      FROM invest_orders o WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3`, [tenantId, workspaceId, retryOrder.id],
   );
   expect(rolledBack.rows[0]).toEqual({ status: 'approved', fills: 0, transactions: 0 });
+});
+
+test('trusted FLOW daily custody handler reconciles persisted inputs once and reports absent connector', async () => {
+  const scope={tenantId,workspaceId};
+  const statementDate=new Date().toISOString().slice(0,10);
+  const snapshot=await service.summary(scope,{portfolioId});
+  const statement={ id:'019a0000-0000-7000-8000-000000000711',ownerId:userId,portfolioId,sourceName:'Persisted custody inbox',
+    sourceRef:'custody://daily/fixture/1',statementDate,cashUnits:(BigInt(snapshot.cashUnits)-1n).toString(),
+    positions:snapshot.positions.map((position)=>({symbol:position.symbol,units:position.quantityUnits})) };
+  const input={...statement,statementHash:hashStatement(statement)};
+  const matching={...statement,id:'019a0000-0000-7000-8000-000000000715',sourceRef:'custody://daily/fixture/2',cashUnits:snapshot.cashUnits};
+  const matchingInput={...matching,statementHash:hashStatement(matching)};
+  const invalidInput={...matchingInput,id:'019a0000-0000-7000-8000-000000000716',sourceRef:'custody://daily/fixture/invalid',statementHash:'0'.repeat(64)};
+  let eligible=[input,invalidInput];
+  const inbox={listEligible:vi.fn(async()=>eligible),acknowledgeProcessed:vi.fn(async()=>{})};
+  const scheduledService=new InvestService(new LocalScopedStore(db),writer,writer,{
+    async getKillSwitch(){return{engaged:false,reason:null,changedBy:null,changedAt:null};},
+  },inbox);
+  const runId='019a0000-0000-7000-8000-000000000712';
+  const context:TrustedFlowStepContext={tenantId,workspaceId,principalId:userId,workflowId:'019a0000-0000-7000-8000-000000000713',runId,
+    trigger:'schedule',stepId:'custody-daily',stepIndex:0,attempt:0,scheduledFor:new Date().toISOString(),dispatchId:`${runId}:0:0`};
+  await expect(scheduledService.dispatchScheduledCustody(context)).rejects.toThrow(/content hash/);
+  const partial=await db.query<{status:string;attempts:number}>(`SELECT status,attempts FROM invest_custody_dispatches WHERE tenant_id=$1 AND workspace_id=$2 AND workflow_id=$3`,[tenantId,workspaceId,context.workflowId]);
+  expect(partial.rows).toEqual([{status:'failed',attempts:1}]);
+  const preserved=await db.query<{count:number}>(`SELECT count(*)::int AS count FROM invest_reconciliation_runs WHERE tenant_id=$1 AND workspace_id=$2 AND source_ref=$3`,[tenantId,workspaceId,statement.sourceRef]);
+  expect(preserved.rows[0]?.count).toBe(1);
+  eligible=[input,matchingInput];
+  const first=await scheduledService.dispatchScheduledCustody(context);
+  expect(first).toMatchObject({status:'completed',idempotent:false,inputs:[
+    {statementId:statement.id,reconciliation:'needs_review',discrepancyCount:1},
+    {statementId:matching.id,reconciliation:'matched',discrepancyCount:0},
+  ]});
+  const second=await scheduledService.dispatchScheduledCustody(context);
+  expect(second).toEqual({...first,idempotent:true});
+  expect(inbox.listEligible).toHaveBeenCalledTimes(2);
+  expect(inbox.acknowledgeProcessed).toHaveBeenCalledTimes(2);
+  const rows=await db.query<{status:string;attempts:number;discrepancies:number}>(`SELECT d.status,d.attempts,
+      (SELECT count(*)::int FROM invest_reconciliation_discrepancies x WHERE x.tenant_id=d.tenant_id AND x.workspace_id=d.workspace_id AND x.run_id=(d.result->'inputs'->0->>'runId')::uuid) AS discrepancies
+    FROM invest_custody_dispatches d WHERE d.tenant_id=$1 AND d.workspace_id=$2 AND d.workflow_id=$3`,[tenantId,workspaceId,context.workflowId]);
+  expect(rows.rows).toEqual([{status:'completed',attempts:2,discrepancies:1}]);
+
+  const missingAdapter=new InvestService(new LocalScopedStore(db),writer,writer,{
+    async getKillSwitch(){return{engaged:false,reason:null,changedBy:null,changedAt:null};},
+  });
+  const unavailableContext={...context,workflowId:'019a0000-0000-7000-8000-000000000714'};
+  await expect(missingAdapter.dispatchScheduledCustody(unavailableContext)).rejects.toThrow('INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
+  await expect(db.query<{status:string;error_code:string}>(`SELECT status,error_code FROM invest_custody_dispatches WHERE tenant_id=$1 AND workspace_id=$2 AND workflow_id=$3`,
+    [tenantId,workspaceId,unavailableContext.workflowId])).resolves.toMatchObject({rows:[{status:'connector_unavailable',error_code:'INVEST_CUSTODY_CONNECTOR_UNAVAILABLE'}]});
 });
 
 test('global kill reader absence, engagement and read failure all block new PAPER proposals', async () => {

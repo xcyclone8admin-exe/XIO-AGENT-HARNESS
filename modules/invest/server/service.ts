@@ -3,8 +3,6 @@ import { HybridClock, uuidv7 } from '@xyra/core';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
 import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/ledger/contracts';
-import type { KillSwitchReader } from '@xyra/mod-swarm/server';
-import type { StepContext } from '@xyra/mod-flow/server';
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
 import { allocateFifoTaxLots } from './tax-lots';
@@ -12,12 +10,14 @@ import { backtestStrategyIdentity, runMomentumStopTargetBacktest, type OhlcBar, 
 import { calculateTimeWeightedStatement, type PerformanceMark, type PerformanceStatement } from './performance';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
-import { validateScheduledCustodyContext, type PersistedCustodyStatementInbox, type PersistedCustodyStatement } from './scheduled-reconciliation';
+import { validateScheduledCustodyContext, type PersistedCustodyStatementInbox, type PersistedCustodyStatement, type TrustedFlowStepContext } from './scheduled-reconciliation';
 
 type Call = { readonly principal: Principal; readonly workspaceId: string };
 type Registrar = { register(manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: Call) => Promise<unknown>): void };
 type QueryTx = Pick<ScopedTransaction, 'query'>;
-type KillSwitchSnapshot = Awaited<ReturnType<KillSwitchReader['getKillSwitch']>>;
+type KillSwitchSnapshot = { readonly engaged: boolean; readonly reason: string | null; readonly changedBy: string | null; readonly changedAt: string | null };
+/** Structural boundary equivalent to SWARM's durable server reader contract. */
+export interface KillSwitchReader { getKillSwitch(scope: Scope): Promise<KillSwitchSnapshot> }
 type OrderRow = {
   id: string; portfolio_id: string; instrument_id: string; symbol: string; side: 'buy'|'sell'; order_type: 'market'|'limit';
   quantity_units: string; limit_price_units: string|null; status: 'proposed'|'approved'|'submitted'|'partially_filled'|'filled'|'cancelled'|'expired';
@@ -258,7 +258,7 @@ export class InvestService {
    * Callable only from the trusted FLOW host handler. FLOW derives scheduledFor
    * from persisted run detail; no schedule data is accepted from workflow input.
    */
-  async dispatchScheduledCustody(context: StepContext): Promise<{
+  async dispatchScheduledCustody(context: TrustedFlowStepContext): Promise<{
     status:'completed'; idempotent:boolean; utcDay:string;
     inputs:Array<{statementId:string;runId:string;reconciliation:'matched'|'needs_review';discrepancyCount:number}>;
   }> {
@@ -286,9 +286,13 @@ export class InvestService {
       await this.recordCustodyDispatchFailure(scope,dispatch,'connector_unavailable','INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
       throw new Error('INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
     }
-    if (statements.length > 500 || new Set(statements.map((statement)=>statement.id)).size !== statements.length) throw new Error('INVEST_CUSTODY_INPUT_SET_INVALID');
+    if (statements.length > 500 || new Set(statements.map((statement)=>statement.id)).size !== statements.length) {
+      await this.recordCustodyDispatchFailure(scope,dispatch,'failed','INVEST_CUSTODY_INPUT_SET_INVALID');
+      throw new Error('INVEST_CUSTODY_INPUT_SET_INVALID');
+    }
     for (const statement of statements) {
       if (![statement.id,statement.ownerId,statement.portfolioId].every((value)=>/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))) {
+        await this.recordCustodyDispatchFailure(scope,dispatch,'failed','INVEST_CUSTODY_INPUT_ID_INVALID');
         throw new Error('INVEST_CUSTODY_INPUT_ID_INVALID');
       }
     }
@@ -338,13 +342,13 @@ export class InvestService {
 
   private async recordCustodyDispatchFailure(scope:InvestScope,dispatch:ReturnType<typeof validateScheduledCustodyContext>,status:'connector_unavailable'|'failed',code:string):Promise<void>{
     await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,async(tx)=>{
-      await tx.query(`INSERT INTO invest_custody_dispatches(id,tenant_id,workspace_id,workflow_id,run_id,step_id,dispatch_id,idempotency_key,scheduled_for,status,result,error_code,attempts)
+      await tx.query(`INSERT INTO invest_custody_dispatches(id,tenant_id,workspace_id,workflow_id,run_id,step_id,dispatch_id,idempotency_key,scheduled_for,status,result,error_code,attempts,lease_until)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,$11,1,NULL)
         ON CONFLICT(tenant_id,workspace_id,idempotency_key) DO UPDATE SET workflow_id=EXCLUDED.workflow_id,run_id=EXCLUDED.run_id,
           step_id=EXCLUDED.step_id,dispatch_id=EXCLUDED.dispatch_id,scheduled_for=EXCLUDED.scheduled_for,
           status=EXCLUDED.status,error_code=EXCLUDED.error_code,lease_until=NULL,
-          attempts=invest_custody_dispatches.attempts+1,updated_at=now()
-        WHERE invest_custody_dispatches.status<>'completed' AND (invest_custody_dispatches.status<>'running' OR invest_custody_dispatches.lease_until<=now())`,
+          attempts=invest_custody_dispatches.attempts + CASE WHEN invest_custody_dispatches.dispatch_id=EXCLUDED.dispatch_id THEN 0 ELSE 1 END,updated_at=now()
+        WHERE invest_custody_dispatches.status<>'completed' AND (invest_custody_dispatches.status<>'running' OR invest_custody_dispatches.lease_until<=now() OR invest_custody_dispatches.dispatch_id=EXCLUDED.dispatch_id)`,
         [uuidv7(),scope.tenantId,scope.workspaceId,dispatch.workflowId,dispatch.runId,dispatch.stepId,dispatch.dispatchId,dispatch.idempotencyKey,dispatch.scheduledFor,status,code]);
     });
   }
