@@ -51,7 +51,12 @@ runNpm(['run', 'smoke:bundle', '-w', '@xyra/sidecar']);
 
 const bundle = await readFile(sidecarBundle);
 const bundleText = bundle.toString('utf8');
-for (const marker of ['xyra-native-bootstrap-v1', '/internal/native/cloud-sync/push']) {
+for (const marker of [
+  'xyra-native-bootstrap-v1',
+  '/internal/native/cloud-sync/push',
+  '/internal/native/invest/signals/consume',
+  'xyra.invest.envelope.digest.v1',
+]) {
   if (!bundleText.includes(marker)) {
     throw new Error(`Built sidecar is missing required integrated feature marker: ${marker}`);
   }
