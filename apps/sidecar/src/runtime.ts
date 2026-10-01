@@ -29,7 +29,7 @@ import { CapabilityBus } from './bus';
 import { DurableBusApproval, DurableBusAudit, DurableBusIdempotency } from './durable';
 import { registerBrainCapabilities } from './brain';
 import { registerFoundationCapabilities } from './foundation';
-import { createSidecarApp } from './http';
+import { createSidecarApp, type CloudInvestSignalClaim } from './http';
 import type { PushRequest as PushRequestValue, PushResponse as PushResponseValue } from '@xyra/contracts';
 
 export interface LocalSidecarOptions {
@@ -49,6 +49,12 @@ export interface LocalSidecarOptions {
     request: PushRequestValue,
     response: PushResponseValue,
   ) => Promise<void>;
+  /** Native-only Cloud signal consumer; must persist an advisory decision before returning. */
+  readonly acceptCloudInvestSignal?: (
+    scope: { readonly tenantId: string; readonly workspaceId: string },
+    claim: CloudInvestSignalClaim,
+    actorId: string,
+  ) => Promise<{ readonly decisionId: string }>;
 }
 
 export interface LocalSidecarSession {
@@ -87,7 +93,8 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
     swarm.register(bus, swarmManifest);
     const ledgerWriter = new PGliteLedgerWriter(db);
     new MoneyService(ledgerWriter).register(bus);
-    new InvestService(scoped, ledgerWriter, ledgerWriter, swarm.killSwitchReader).register(bus, investManifest);
+    const invest = new InvestService(scoped, ledgerWriter, ledgerWriter, swarm.killSwitchReader);
+    invest.register(bus, investManifest);
     const brain = new BrainService(scoped);
     registerBrainCapabilities(bus, brain);
     const forgeRepository = new ForgeRepository(scoped);
@@ -106,6 +113,8 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       ...(options.nativeSyncToken === undefined ? {} : { nativeSyncToken: options.nativeSyncToken }),
       acceptCloudSyncPush: options.acceptCloudSyncPush ?? ((scope, request, response) =>
         brain.acceptCloudReferenceSync(scope, request, response).then(() => undefined)),
+      acceptCloudInvestSignal: options.acceptCloudInvestSignal ?? ((scope, claim, actorId) =>
+        invest.consumeCloudInvestSignal(scope, claim.signal, claim.lease, actorId)),
     });
     const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: options.port });
     return {

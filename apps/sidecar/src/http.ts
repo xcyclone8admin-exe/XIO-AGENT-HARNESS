@@ -28,10 +28,49 @@ export interface SidecarHttpOptions {
     request: PushRequestValue,
     response: PushResponseValue,
   ) => Promise<void>;
+  /** Persists a Cloud-verified signal as a scoped advisory decision before native ACKs Cloud. */
+  readonly acceptCloudInvestSignal?: (
+    scope: { readonly tenantId: string; readonly workspaceId: string },
+    claim: CloudInvestSignalClaim,
+    actorId: string,
+  ) => Promise<{ readonly decisionId: string }>;
 }
 
 const NATIVE_SYNC_PATH = '/internal/native/cloud-sync/push';
+const NATIVE_INVEST_SIGNAL_PATH = '/internal/native/invest/signals/consume';
+const NATIVE_ONLY_PATHS = new Set([NATIVE_SYNC_PATH, NATIVE_INVEST_SIGNAL_PATH]);
 const MAX_NATIVE_SYNC_BODY_BYTES = 2_100_000;
+const MAX_NATIVE_INVEST_SIGNAL_BODY_BYTES = 40_000;
+const INVEST_SIGNAL_PROTOCOL = 'xyra.invest.signal.v1';
+
+const Uuid = z.uuid();
+const CloudInvestSignalEnvelope = z.strictObject({
+  protocol: z.literal(INVEST_SIGNAL_PROTOCOL),
+  eventId: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
+  sourceId: Uuid,
+  tenantId: Uuid,
+  workspaceId: Uuid,
+  receivedAt: z.iso.datetime({ offset: true }),
+  occurredAt: z.iso.datetime({ offset: true }),
+  expiresAt: z.iso.datetime({ offset: true }),
+  algorithmId: z.string().regex(/^[a-z0-9][a-z0-9._:-]{0,63}$/),
+  signalId: z.string().min(1).max(128),
+  symbol: z.string().regex(/^[A-Z0-9][A-Z0-9._/-]{0,31}$/),
+  side: z.enum(['buy', 'sell']),
+  quantity: z.string().regex(/^(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,12})?$/),
+  payloadDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  verification: z.strictObject({ signature: z.literal('verified'), keyId: Uuid }),
+});
+const CloudInvestSignalClaim = z.strictObject({
+  status: z.literal('claimed'),
+  lease: z.strictObject({
+    leaseId: Uuid,
+    fence: z.number().int().positive(),
+    expiresAt: z.iso.datetime({ offset: true }),
+  }),
+  signal: CloudInvestSignalEnvelope,
+});
+export type CloudInvestSignalClaim = z.infer<typeof CloudInvestSignalClaim>;
 
 async function boundedJson(
   request: Request,
@@ -94,7 +133,7 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
   app.use('*', async (c, next) => {
     if (c.req.header('host') !== `127.0.0.1:${options.port}`) return c.json({ code: 'HOST_REJECTED' }, 403);
     const origin = c.req.header('origin');
-    if (c.req.path === NATIVE_SYNC_PATH && (origin || c.req.method !== 'POST')) {
+    if (NATIVE_ONLY_PATHS.has(c.req.path) && (origin || c.req.method !== 'POST')) {
       return c.json({ code: 'NATIVE_SYNC_ONLY' }, 403);
     }
     if (origin && !options.allowedOrigins.includes(origin)) return c.json({ code: 'ORIGIN_REJECTED' }, 403);
@@ -105,7 +144,7 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
       c.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     }
     if (c.req.method === 'OPTIONS') return c.body(null, 204);
-    if (c.req.path === NATIVE_SYNC_PATH) {
+    if (NATIVE_ONLY_PATHS.has(c.req.path)) {
       if (
         !options.nativeSyncToken ||
         !nativeTokenMatches(c.req.header('x-xyra-native-sync-token'), options.nativeSyncToken)
@@ -157,6 +196,42 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
       return c.json({ status: 'recorded' });
     } catch {
       return c.json({ code: 'SYNC_ACK_REJECTED' }, 409);
+    }
+  });
+  app.post(NATIVE_INVEST_SIGNAL_PATH, async (c) => {
+    if (!options.nativeSyncToken) return c.json({ code: 'NATIVE_SYNC_UNAVAILABLE' }, 503);
+    if (!options.acceptCloudInvestSignal) return c.json({ code: 'INVEST_SIGNAL_HANDLER_UNAVAILABLE' }, 503);
+    const contentType = c.req.header('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+    if (contentType !== 'application/json') return c.json({ code: 'CONTENT_TYPE_REQUIRED' }, 415);
+    const raw = await boundedJson(c.req.raw, MAX_NATIVE_INVEST_SIGNAL_BODY_BYTES);
+    if (!raw.ok) return c.json({ code: raw.code }, raw.status);
+    const parsed = CloudInvestSignalClaim.safeParse(raw.value);
+    if (!parsed.success) return c.json({ code: 'INVEST_SIGNAL_CLAIM_INVALID' }, 400);
+    const { signal, lease } = parsed.data;
+    const principal = await options.resolvePrincipal();
+    const workspace = principal.workspaces.find((candidate) => candidate.id === signal.workspaceId);
+    if (principal.kind !== 'user' || principal.tenantId !== signal.tenantId || !workspace) {
+      return c.json({ code: 'INVEST_SIGNAL_SCOPE_MISMATCH' }, 403);
+    }
+    const now = Date.now();
+    const leaseExpiry = Date.parse(lease.expiresAt);
+    const signalExpiry = Date.parse(signal.expiresAt);
+    const occurredAt = Date.parse(signal.occurredAt);
+    if (
+      leaseExpiry <= now || leaseExpiry > now + 30_000 ||
+      signalExpiry <= now || occurredAt > now + 300_000
+    ) return c.json({ code: 'INVEST_SIGNAL_EXPIRED' }, 409);
+    try {
+      const result = await options.acceptCloudInvestSignal(
+        { tenantId: principal.tenantId, workspaceId: signal.workspaceId },
+        parsed.data,
+        principal.id,
+      );
+      const decisionId = Uuid.safeParse(result.decisionId);
+      if (!decisionId.success) return c.json({ code: 'INVEST_SIGNAL_DECISION_INVALID' }, 500);
+      return c.json({ decisionId: decisionId.data });
+    } catch {
+      return c.json({ code: 'INVEST_SIGNAL_DECISION_FAILED' }, 409);
     }
   });
   app.get('/api/v1/session', async (c) => {

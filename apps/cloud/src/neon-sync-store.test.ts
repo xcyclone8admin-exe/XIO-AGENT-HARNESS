@@ -70,6 +70,10 @@ const migrations = [
     'core/0011_cloud_invest_signals',
     sql('../../../modules/core/migrations/0011_cloud_invest_signals.sql'),
   ),
+  migration(
+    'core/0012_cloud_invest_signal_resolution',
+    sql('../../../modules/core/migrations/0012_cloud_invest_signal_resolution.sql'),
+  ),
 ];
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
@@ -1028,7 +1032,61 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
                ARRAY['paper-alpha'],ARRAY['ACME'])`,
       [TENANT_A, WORKSPACE_A, sourceId, keyId],
     );
+    await expect(
+      db.query(
+        `INSERT INTO cloud_invest_signal_sources
+          (tenant_id,workspace_id,source_id,key_id,signing_alg,public_jwk,allowed_algorithm_ids,allowed_symbols)
+         VALUES ($1,$2,$3,$4,'ES256',$5::jsonb,ARRAY['paper-alpha'],ARRAY['ACME'])`,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          sourceId,
+          crypto.randomUUID(),
+          JSON.stringify({
+            kty: 'EC',
+            crv: 'P-256',
+            x: 'a'.repeat(43),
+            y: 'b'.repeat(43),
+            d: 'c'.repeat(43),
+          }),
+        ],
+      ),
+    ).rejects.toThrow('cloud_invest_signal_sources_public_jwk_only');
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
+      const resolution = await client.query<Record<string, unknown>>(
+        `SELECT source_id::text,key_id::text,signing_alg,public_jwk,active
+           FROM cloud_invest_signal_resolution WHERE source_id=$1 AND key_id=$2`,
+        [sourceId, keyId],
+      );
+      expect(resolution.rows).toHaveLength(1);
+      expect(Object.keys(resolution.rows[0] ?? {}).sort()).toEqual([
+        'active',
+        'key_id',
+        'public_jwk',
+        'signing_alg',
+        'source_id',
+      ]);
+      expect(resolution.rows[0]).not.toHaveProperty('tenant_id');
+      expect(resolution.rows[0]).not.toHaveProperty('allowed_symbols');
+      const policyHidden = await client.query(
+        'SELECT tenant_id,allowed_symbols FROM cloud_invest_signal_sources WHERE source_id=$1 AND key_id=$2',
+        [sourceId, keyId],
+      );
+      expect(policyHidden.rows).toHaveLength(0);
+      await client.query("SELECT set_config('app.invest_signal_source_id',$1,true)", [sourceId]);
+      await client.query("SELECT set_config('app.invest_signal_key_id',$1,true)", [keyId]);
+      const policyScoped = await client.query(
+        'SELECT tenant_id::text,workspace_id::text,allowed_symbols,max_events_per_minute FROM cloud_invest_signal_sources WHERE source_id=$1 AND key_id=$2',
+        [sourceId, keyId],
+      );
+      expect(policyScoped.rows).toEqual([
+        {
+          tenant_id: TENANT_A,
+          workspace_id: WORKSPACE_A,
+          allowed_symbols: ['ACME'],
+          max_events_per_minute: 60,
+        },
+      ]);
       await client.query(
         `INSERT INTO cloud_invest_signal_rate_windows(tenant_id,workspace_id,source_id,window_start,request_count)
          VALUES ($1,$2,$3,date_trunc('minute',now()),1)`,
@@ -1072,6 +1130,17 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
         'UPDATE cloud_invest_signal_events SET queue_job_id=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3',
         [TENANT_A, WORKSPACE_A, eventRecordId, jobId],
       );
+      await client.query('SAVEPOINT invalid_signal_ack');
+      await expect(
+        client.query(
+          `UPDATE cloud_invest_signal_events
+              SET status='acked',claim_device_id=$3,lease_id=$4,lease_fence=1,
+                  lease_expires_at=now()+interval '1 minute',ack_idempotency_key=$5,acked_at=now()
+            WHERE id=$1 AND tenant_id=$2`,
+          [eventRecordId, TENANT_A, USER_A, crypto.randomUUID(), crypto.randomUUID()],
+        ),
+      ).rejects.toThrow('cloud_invest_signal_events_ack_decision_consistent');
+      await client.query('ROLLBACK TO SAVEPOINT invalid_signal_ack');
       const visible = await client.query('SELECT id FROM cloud_invest_signal_events WHERE tenant_id=$1', [
         TENANT_A,
       ]);
@@ -1103,15 +1172,40 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     // The denied UPDATE above aborts its transaction. Retire this RLS fixture as owner so
     // the later claim test cannot treat its intentionally minimal envelope as pending.
     await db.query("UPDATE cloud_invest_signal_events SET status='expired' WHERE id=$1", [eventRecordId]);
+    await db.query('UPDATE cloud_invest_signal_sources SET active=false WHERE source_id=$1 AND key_id=$2', [
+      sourceId,
+      keyId,
+    ]);
+    const inactiveResolution = await db.query<{ active: boolean }>(
+      'SELECT active FROM cloud_invest_signal_resolution WHERE source_id=$1 AND key_id=$2',
+      [sourceId, keyId],
+    );
+    expect(inactiveResolution.rows[0]?.active).toBe(false);
     const privileges = await db.query<{
       source_delete: boolean;
       event_delete: boolean;
       source_update: boolean;
+      resolution_select: boolean;
+      resolution_insert: boolean;
+      resolution_update: boolean;
+      resolution_delete: boolean;
     }>(`
       SELECT has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_sources','DELETE') AS source_delete,
              has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_events','DELETE') AS event_delete,
-             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_sources','UPDATE') AS source_update`);
-    expect(privileges.rows[0]).toEqual({ source_delete: false, event_delete: false, source_update: false });
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_sources','UPDATE') AS source_update,
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_resolution','SELECT') AS resolution_select,
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_resolution','INSERT') AS resolution_insert,
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_resolution','UPDATE') AS resolution_update,
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_resolution','DELETE') AS resolution_delete`);
+    expect(privileges.rows[0]).toEqual({
+      source_delete: false,
+      event_delete: false,
+      source_update: false,
+      resolution_select: true,
+      resolution_insert: false,
+      resolution_update: false,
+      resolution_delete: false,
+    });
   });
 
   it('commits signed inbox and ID-only outbox atomically, then fences claim replay and stale device ack', async () => {

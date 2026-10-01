@@ -10,6 +10,7 @@ import investManifest from '../manifest';
 import { InvestService } from '../server/service';
 import { investCapabilities } from '../server/capabilities';
 import type { TrustedFlowStepContext } from '../server/scheduled-reconciliation';
+import type { VerifiedInvestSignalV1 } from '../server/invest-signals';
 
 const tenantId = '019a0000-0000-7000-8000-000000000501';
 const workspaceId = '019a0000-0000-7000-8000-000000000502';
@@ -249,6 +250,45 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   const differentScale = await service.createInstrument(scope,userId,{symbol:'SCALETEST',assetClass:'equity',quantityScale:4,exchangeCode:null});
   await expect(service.runBacktest(scope,userId,{...backtestInput,instrumentId:differentScale.id,dataVersion:1})).rejects.toThrow(/strategy version already exists with different configuration/);
   await expect(db.query(`UPDATE invest_backtest_runs SET net_pnl_units=0 WHERE id=$1`,[backtest.runId])).rejects.toThrow(/append-only/);
+});
+
+test('Cloud signal claim becomes one immutable advisory decision before host ack', async () => {
+  const scope={tenantId,workspaceId};
+  const now=Date.now();
+  const envelope:VerifiedInvestSignalV1={protocol:'xyra.invest.signal.v1',eventId:'evt-invest-advisory-1',sourceId:'019a0000-0000-7000-8000-000000000801',
+    tenantId,workspaceId,receivedAt:new Date(now).toISOString(),occurredAt:new Date(now-1_000).toISOString(),expiresAt:new Date(now+60_000).toISOString(),
+    algorithmId:'trend-v1',signalId:'019a0000-0000-7000-8000-000000000802',symbol:'PAPERX',side:'buy',quantity:'0.5',payloadDigest:'c'.repeat(64),
+    verification:{signature:'verified',keyId:'019a0000-0000-7000-8000-000000000803'}};
+  const claim={leaseId:'019a0000-0000-7000-8000-000000000804',fence:1,expiresAt:new Date(now+25_000).toISOString()};
+  const before=(await service.orders(scope,{})).length;
+  const first=await service.consumeCloudInvestSignal(scope,envelope,claim,userId);
+  const duplicate=await service.consumeCloudInvestSignal(scope,envelope,claim,userId);
+  expect(duplicate).toEqual(first);
+  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,fence:9},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+  const reclaimed=await service.consumeCloudInvestSignal(scope,envelope,{...claim,leaseId:'019a0000-0000-7000-8000-000000000805',fence:2},userId);
+  expect(reclaimed).toEqual(first);
+  const claimHistory=await db.query<{lease_id:string;fence:number}>(`SELECT lease_id,fence FROM invest_signal_claims WHERE decision_id=$1 ORDER BY fence`,[first.decisionId]);
+  expect(claimHistory.rows).toEqual([{lease_id:claim.leaseId,fence:1},{lease_id:'019a0000-0000-7000-8000-000000000805',fence:2}]);
+  expect((await service.orders(scope,{}))).toHaveLength(before);
+  const row=await db.query<{decision_status:string;instrument_id:string;claim_fence:number;detail:Record<string,unknown>}>(
+    `SELECT decision_status,instrument_id,claim_fence,detail FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,[tenantId,workspaceId,first.decisionId]);
+  expect(row.rows[0]).toMatchObject({decision_status:'advisory',instrument_id:instrumentId,claim_fence:1,detail:{kind:'advisory_only',quantityUnits:'500000'}});
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,payloadDigest:'d'.repeat(64)},claim,userId)).rejects.toThrow('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+  await expect(service.consumeCloudInvestSignal({tenantId,workspaceId:'019a0000-0000-7000-8000-000000000899'},envelope,claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,payloadDigest:'invalid'},claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,extra:'forged'} as unknown as VerifiedInvestSignalV1,claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,verification:{signature:'unverified',keyId:envelope.verification.keyId}} as unknown as VerifiedInvestSignalV1,claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,verification:{signature:'verified',keyId:'invalid'}},claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,expiresAt:new Date(now-1).toISOString()},claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,expiresAt:new Date(now-1).toISOString()},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,fence:0},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(db.query(`UPDATE invest_signal_decisions SET symbol='OTHER' WHERE id=$1`,[first.decisionId])).rejects.toThrow(/append-only/);
+  await service.createInstrument(scope,userId,{symbol:'WHOLE',assetClass:'equity',quantityScale:0,exchangeCode:null});
+  const fractional={...envelope,eventId:'evt-invest-advisory-precision',signalId:'019a0000-0000-7000-8000-000000000806',symbol:'WHOLE',quantity:'0.5',payloadDigest:'e'.repeat(64)};
+  const rejected=await service.consumeCloudInvestSignal(scope,fractional,{...claim,leaseId:'019a0000-0000-7000-8000-000000000807'},userId);
+  const rejectedRow=await db.query<{decision_status:string;detail:Record<string,unknown>}>(`SELECT decision_status,detail FROM invest_signal_decisions WHERE id=$1`,[rejected.decisionId]);
+  expect(rejectedRow.rows[0]).toMatchObject({decision_status:'rejected',detail:{quantityUnits:null}});
+  expect(rejectedRow.rows[0]?.detail['decision']).toMatch(/exceeds the matched instrument precision/);
 });
 
 test('cancel and fill serialize on the locked order row', async () => {

@@ -206,3 +206,104 @@ test('Cloud sync result callback requires a separate native-only token and valid
   expect(wrongScope.status).toBe(403);
   expect(recorded).toBe(1);
 });
+
+test('Cloud Invest signal handoff is native-only, scope-bound, and returns only a durable decision id', async () => {
+  const path = '/internal/native/invest/signals/consume';
+  const decisionId = '019a0000-0000-7000-8000-000000000081';
+  const now = Date.now();
+  const iso = (milliseconds: number) => new Date(milliseconds).toISOString();
+  const claim = {
+    status: 'claimed',
+    lease: {
+      leaseId: '019a0000-0000-7000-8000-000000000082',
+      fence: 3,
+      expiresAt: iso(now + 20_000),
+    },
+    signal: {
+      protocol: 'xyra.invest.signal.v1',
+      eventId: 'feed:event-1',
+      sourceId: '019a0000-0000-7000-8000-000000000083',
+      tenantId: principal.tenantId,
+      workspaceId: WORKSPACE,
+      receivedAt: iso(now),
+      occurredAt: iso(now - 1_000),
+      expiresAt: iso(now + 60_000),
+      algorithmId: 'momentum-v1',
+      signalId: 'sig-1',
+      symbol: 'XYRA',
+      side: 'buy',
+      quantity: '2.5',
+      payloadDigest: 'a'.repeat(64),
+      verification: {
+        signature: 'verified',
+        keyId: '019a0000-0000-7000-8000-000000000084',
+      },
+    },
+  };
+  let accepted = 0;
+  const nativeApp = createSidecarApp({
+    port: 43119,
+    launchToken: TOKEN,
+    nativeSyncToken: NATIVE_SYNC_TOKEN,
+    allowedOrigins: ['http://tauri.localhost'],
+    resolvePrincipal: async () => principal,
+    bus,
+    acceptCloudInvestSignal: async (scope, receivedClaim, actorId) => {
+      expect(scope).toEqual({ tenantId: principal.tenantId, workspaceId: WORKSPACE });
+      expect(receivedClaim).toEqual(claim);
+      expect(actorId).toBe(principal.id);
+      accepted += 1;
+      return { decisionId };
+    },
+  });
+  const endpoint = `http://127.0.0.1:43119${path}`;
+  const headers = {
+    host: '127.0.0.1:43119',
+    'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+    'content-type': 'application/json',
+  };
+  const forgedRendererCall = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: { ...headers, origin: 'http://tauri.localhost' },
+    body: JSON.stringify(claim),
+  });
+  expect(forgedRendererCall.status).toBe(403);
+  const launchTokenCall = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: { host: '127.0.0.1:43119', authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify(claim),
+  });
+  expect(launchTokenCall.status).toBe(403);
+  const valid = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(claim),
+  });
+  expect(valid.status).toBe(200);
+  expect(await valid.json()).toEqual({ decisionId });
+  expect(accepted).toBe(1);
+
+  const badVerification = {
+    ...claim,
+    signal: { ...claim.signal, verification: { signature: 'unverified', keyId: claim.signal.verification.keyId } },
+  };
+  const rejected = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(badVerification),
+  });
+  expect(rejected.status).toBe(400);
+  expect(accepted).toBe(1);
+
+  const wrongScope = {
+    ...claim,
+    signal: { ...claim.signal, tenantId: '019a0000-0000-7000-8000-000000000099' },
+  };
+  const scopeRejected = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(wrongScope),
+  });
+  expect(scopeRejected.status).toBe(403);
+  expect(accepted).toBe(1);
+});

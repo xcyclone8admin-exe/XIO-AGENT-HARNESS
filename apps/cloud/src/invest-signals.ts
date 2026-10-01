@@ -14,6 +14,19 @@ const QUANTITY = /^(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,12})?$/;
 
 export type SignalSigningAlgorithm = 'ES256' | 'EdDSA';
 
+export interface InvestSignalVerificationKey {
+  readonly sourceId: string;
+  readonly keyId: string;
+  readonly signingAlg: SignalSigningAlgorithm;
+  readonly publicJwk: JsonWebKey;
+  readonly active: boolean;
+}
+
+type InvestSignalKeyMaterial = Pick<
+  InvestSignalVerificationKey,
+  'sourceId' | 'keyId' | 'signingAlg' | 'publicJwk'
+> & { readonly active?: boolean };
+
 export interface InvestSignalBody {
   readonly protocol: typeof INVEST_SIGNAL_PROTOCOL;
   readonly eventId: string;
@@ -172,15 +185,47 @@ export function parseInvestSignalBody(rawBody: Uint8Array): InvestSignalBody {
   };
 }
 
-export async function verifyInvestSignal(
+export async function verifyInvestSignalSignature(
   webhook: RawInvestWebhook,
-  source: InvestSignalSourceKey,
+  keySource: InvestSignalKeyMaterial,
   nowMs = Date.now(),
 ): Promise<{ readonly body: InvestSignalBody; readonly payloadDigest: string }> {
   const body = parseInvestSignalBody(webhook.rawBody);
   const nowSeconds = Math.floor(nowMs / 1000);
   if (Math.abs(nowSeconds - webhook.timestampSeconds) > 300)
     throw new InvestSignalError('SIGNAL_TIMESTAMP_STALE', 401);
+  if (
+    keySource.active === false ||
+    keySource.sourceId !== webhook.sourceId ||
+    keySource.keyId !== webhook.keyId
+  )
+    throw new InvestSignalError('SIGNAL_SOURCE_INVALID', 401);
+  const key = await importSigningKey(keySource);
+  const prefix = new TextEncoder().encode(`${webhook.timestampSeconds}.`);
+  const signed = new Uint8Array(prefix.byteLength + webhook.rawBody.byteLength);
+  signed.set(prefix);
+  signed.set(webhook.rawBody, prefix.byteLength);
+  let signatureValid = false;
+  try {
+    signatureValid = await crypto.subtle.verify(
+      keySource.signingAlg === 'EdDSA' ? 'Ed25519' : { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      arrayBuffer(webhook.signature),
+      arrayBuffer(signed),
+    );
+  } catch {
+    signatureValid = false;
+  }
+  if (!signatureValid) throw new InvestSignalError('SIGNAL_SIGNATURE_INVALID', 401);
+  return { body, payloadDigest: await sha256Hex(webhook.rawBody) };
+}
+
+export function validateInvestSignalPolicy(
+  verified: { readonly body: InvestSignalBody; readonly payloadDigest: string },
+  source: InvestSignalSourceKey,
+  nowMs = Date.now(),
+): void {
+  const body = verified.body;
   const occurredAt = Date.parse(body.occurredAt);
   const expiresAt = Date.parse(body.expiresAt);
   const maxAgeMs = source.maxAgeSeconds * 1000;
@@ -197,44 +242,54 @@ export async function verifyInvestSignal(
     throw new InvestSignalError('SIGNAL_ALGORITHM_NOT_ALLOWED', 403);
   if (!source.allowedSymbols.includes(body.symbol))
     throw new InvestSignalError('SIGNAL_SYMBOL_NOT_ALLOWED', 403);
-  if (source.sourceId.toLowerCase() !== webhook.sourceId || source.keyId.toLowerCase() !== webhook.keyId)
-    throw new InvestSignalError('SIGNAL_SOURCE_INVALID', 401);
-
-  const key = await importSigningKey(source);
-  const prefix = new TextEncoder().encode(`${webhook.timestampSeconds}.`);
-  const signed = new Uint8Array(prefix.byteLength + webhook.rawBody.byteLength);
-  signed.set(prefix);
-  signed.set(webhook.rawBody, prefix.byteLength);
-  let signatureValid = false;
-  try {
-    signatureValid = await crypto.subtle.verify(
-      source.signingAlg === 'EdDSA' ? 'Ed25519' : { name: 'ECDSA', hash: 'SHA-256' },
-      key,
-      arrayBuffer(webhook.signature),
-      arrayBuffer(signed),
-    );
-  } catch {
-    signatureValid = false;
-  }
-  if (!signatureValid) throw new InvestSignalError('SIGNAL_SIGNATURE_INVALID', 401);
-  return { body, payloadDigest: await sha256Hex(webhook.rawBody) };
 }
 
-export async function findInvestSignalSource(
+export async function verifyInvestSignal(
+  webhook: RawInvestWebhook,
+  source: InvestSignalSourceKey,
+  nowMs = Date.now(),
+): Promise<{ readonly body: InvestSignalBody; readonly payloadDigest: string }> {
+  const verified = await verifyInvestSignalSignature(webhook, source, nowMs);
+  validateInvestSignalPolicy(verified, source, nowMs);
+  return verified;
+}
+
+export async function findInvestSignalVerificationKey(
+  connectionString: string,
+  sourceId: string,
+  keyId: string,
+): Promise<InvestSignalVerificationKey | null> {
+  return withNeonTransaction(connectionString, {}, async (client) => {
+    const result = await client.query<ResolutionDbRow>(
+      `SELECT source_id::text,key_id::text,signing_alg,public_jwk,active
+         FROM cloud_invest_signal_resolution
+        WHERE source_id=$1 AND key_id=$2 AND active=true`,
+      [sourceId, keyId],
+    );
+    return result.rows[0] ? mapVerificationKey(result.rows[0]) : null;
+  });
+}
+
+/** Load policy only after the webhook signature has been verified against the global key tuple. */
+export async function findInvestSignalPolicy(
   connectionString: string,
   sourceId: string,
   keyId: string,
 ): Promise<InvestSignalSourceKey | null> {
-  return withNeonTransaction(connectionString, {}, async (client) => {
-    const result = await client.query<SourceDbRow>(
-      `SELECT tenant_id::text,workspace_id::text,source_id::text,key_id::text,signing_alg,public_jwk,
-              allowed_algorithm_ids,allowed_symbols,max_age_seconds,max_lifetime_seconds,max_events_per_minute
-         FROM cloud_invest_signal_sources
-        WHERE source_id=$1 AND key_id=$2 AND active=true`,
-      [sourceId, keyId],
-    );
-    return result.rows[0] ? mapSource(result.rows[0]) : null;
-  });
+  return withNeonTransaction(
+    connectionString,
+    { investSignalSourceId: sourceId, investSignalKeyId: keyId },
+    async (client) => {
+      const result = await client.query<SourceDbRow>(
+        `SELECT tenant_id::text,workspace_id::text,source_id::text,key_id::text,signing_alg,public_jwk,
+                active,allowed_algorithm_ids,allowed_symbols,max_age_seconds,max_lifetime_seconds,max_events_per_minute
+           FROM cloud_invest_signal_sources
+          WHERE source_id=$1 AND key_id=$2 AND active=true`,
+        [sourceId, keyId],
+      );
+      return result.rows[0] ? mapSource(result.rows[0]) : null;
+    },
+  );
 }
 
 export type AcceptSignalResult =
@@ -268,6 +323,8 @@ export async function acceptInvestSignalInTransaction(
   expectedSource: InvestSignalSourceKey,
   nowMs = Date.now(),
 ): Promise<AcceptSignalResult> {
+  await client.query("SELECT set_config('app.invest_signal_source_id',$1,true)", [webhook.sourceId]);
+  await client.query("SELECT set_config('app.invest_signal_key_id',$1,true)", [webhook.keyId]);
   // Serialize key rotations and duplicate deliveries for a source as one idempotency domain,
   // including retries that straddle a minute rate-window boundary.
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
@@ -670,7 +727,7 @@ function decodeBase64Url(value: string): Uint8Array | null {
   }
 }
 
-async function importSigningKey(source: InvestSignalSourceKey): Promise<CryptoKey> {
+async function importSigningKey(source: InvestSignalKeyMaterial): Promise<CryptoKey> {
   const jwk = source.publicJwk as JsonWebKey & Record<string, unknown>;
   if (
     'd' in jwk ||
@@ -739,6 +796,27 @@ interface SourceDbRow extends Record<string, unknown> {
   max_age_seconds: number;
   max_lifetime_seconds: number;
   max_events_per_minute: number;
+}
+
+interface ResolutionDbRow extends Record<string, unknown> {
+  source_id: string;
+  key_id: string;
+  signing_alg: string;
+  public_jwk: unknown;
+  active: boolean;
+}
+
+function mapVerificationKey(row: ResolutionDbRow): InvestSignalVerificationKey {
+  const jwk = objectValue(row.public_jwk);
+  if (!jwk || (row.signing_alg !== 'ES256' && row.signing_alg !== 'EdDSA') || typeof row.active !== 'boolean')
+    throw new InvestSignalError('SIGNAL_KEY_CONFIGURATION_INVALID', 503);
+  return {
+    sourceId: row.source_id.toLowerCase(),
+    keyId: row.key_id.toLowerCase(),
+    signingAlg: row.signing_alg,
+    publicJwk: jwk as JsonWebKey,
+    active: row.active,
+  };
 }
 
 function mapSource(row: SourceDbRow): InvestSignalSourceKey {
