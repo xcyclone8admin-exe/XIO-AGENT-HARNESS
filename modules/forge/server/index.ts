@@ -81,6 +81,7 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.sources, (_input, call) => requireRepository(repository).sources(actor(call)));
     bus.register(manifest, forgeCapabilities.createSource, (input, call) => requireRepository(repository).createSource(actor(call), forgeCapabilities.createSource.input.parse(input)));
     bus.register(manifest, forgeCapabilities.ingestSource, (input, call) => requireRepository(repository).ingestSource(actor(call), forgeCapabilities.ingestSource.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.compileTicketContext, (input, call) => requireRepository(repository).compileTicketContext(actor(call), forgeCapabilities.compileTicketContext.input.parse(input)));
     bus.register(manifest, forgeCapabilities.schedules, (_input, call) => requireRepository(repository).schedules(actor(call)));
     bus.register(manifest, forgeCapabilities.runs, (_input, call) => requireRepository(repository).runs(actor(call)));
     bus.register(manifest, forgeCapabilities.cancelSchedule, (input, call) => {
@@ -92,6 +93,7 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.gateMatrix, (input, call) => requireRepository(repository).gateMatrix(actor(call), forgeCapabilities.gateMatrix.input.parse(input)));
     bus.register(manifest, forgeCapabilities.promotionList, (_input, call) => requireRepository(repository).promotions(actor(call)));
     bus.register(manifest, forgeCapabilities.specs, (input, call) => { const request = forgeCapabilities.specs.input.parse(input); return requireRepository(repository).specs(actor(call), request.projectId); });
+    bus.register(manifest, forgeCapabilities.specLifecycle, (input, call) => requireRepository(repository).transitionSpec(actor(call), forgeCapabilities.specLifecycle.input.parse(input)));
     bus.register(manifest, forgeCapabilities.saveSpecs, (input, call) => { const request = forgeCapabilities.saveSpecs.input.parse(input); return requireRepository(repository).saveSpecs(actor(call), request.projectId, request.documents); });
     bus.register(manifest, forgeCapabilities.compileSpecs, (input, call) => { const request = forgeCapabilities.compileSpecs.input.parse(input); const corpus = compileSpecCorpus(request); return requireRepository(repository).saveSpecs(actor(call), request.projectId, corpus.documents); });
     bus.register(manifest, forgeCapabilities.startCouncil, (input, call) => requireRepository(repository).startCouncil(actor(call), forgeCapabilities.startCouncil.input.parse(input)));
