@@ -1,38 +1,272 @@
 import { createHash } from 'node:crypto';
-import { canonicalJson, sha256Hex, uuidv7 } from '@xyra/core';
+import { canonicalJson, uuidv7 } from '@xyra/core';
+import { assertBrainReferenceSyncAcknowledgement, PushRequest, PushResponse, type BrainReferenceSyncAcknowledgement, type BrainReferenceSyncExpectation, type PushChangeOutcome } from '@xyra/contracts';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ClaimDraft, ErasureRequestInput, ErasureRetryInput, ErasureStatusInput, IngestDraft, MemoryDraft, MemoryListInput, ProcedureListInput, SearchInput, type MemoryType } from '../contracts';
+import { ClaimDraft, CloudReferenceStageInput, IngestDraft, MemoryDraft, MemoryListInput, ProcedureListInput, SearchInput, type MemoryType } from '../contracts';
+import { BrainErasureService } from './brain-erasure-service';
+import type { CloudErasureClient } from './erasure-cloud';
+import { BrainIngestionBeginInput, BrainIngestionBeginResult, BrainIngestionFinalizeInput, BrainIngestionFinalizationReceipt, BrainIngestionStatus, type CloudBrainIngestionClient } from './cloud-ingestion';
+import { brainReferenceSetDigest, brainSourceVersionV2 } from './erasure-fingerprint';
 
 type IdRow = Record<string, unknown> & { id: string };
 type SearchRow = Record<string, unknown> & { source_id: string; source_version_id: string; chunk_id: string; content_text: string; rank: number };
+type BrainReferenceSyncEvidence = { acknowledgement: BrainReferenceSyncAcknowledgement; responseDigest: string; outcomes: PushChangeOutcome[] };
 const uuid = () => uuidv7();
 
 /** Source-backed BRAIN data access. Every read/write carries an explicit tenant/workspace scope. */
 export class BrainService {
-  constructor(private readonly store: LocalScopedStore) {}
+  private readonly erasures: BrainErasureService;
+
+  constructor(private readonly store: LocalScopedStore, cloud?: CloudErasureClient) {
+    this.erasures = new BrainErasureService(store, cloud);
+  }
+
+  requestSourceErasure(scope: Scope, actorId: string, verifiedApprovalId: string | undefined, input: unknown) {
+    return this.erasures.request(scope, actorId, verifiedApprovalId, input);
+  }
+
+  retrySourceErasure(scope: Scope, actorId: string, verifiedApprovalId: string | undefined, input: unknown) {
+    return this.erasures.retry(scope, actorId, verifiedApprovalId, input);
+  }
+
+  sourceErasureStatus(scope: Scope, input: unknown) {
+    return this.erasures.status(scope, input);
+  }
+
+  async beginCloudIngestion(scope: Scope, mode: 'with_objects' | 'text_only', cloud: CloudBrainIngestionClient, sourceId = uuid()) {
+    const result = BrainIngestionBeginResult.parse(await cloud.begin(BrainIngestionBeginInput.parse({ protocolVersion: 'cloud-ingest-v2', sourceId, mode })));
+    if (result.protocolVersion !== 'cloud-ingest-v2' || result.sourceId !== sourceId || result.tenantId !== scope.tenantId ||
+      result.workspaceId !== scope.workspaceId || result.mode !== mode) throw new Error('CLOUD_INGESTION_BINDING_MISMATCH');
+    return result;
+  }
+
+  /** Finalization is accepted only from the authenticated Cloud client and is persisted after local binding checks. */
+  async finalizeCloudIngestion(scope: Scope, sourceVersionId: string, ingestionId: string, cloud: CloudBrainIngestionClient) {
+    const local = await this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      const result = await tx.query<Record<string, unknown> & { id: string; source_id: string; content_digest: string; ingestion_id: string | null; status: string; object_ref_ids: string[] | null }>(
+        `SELECT id,source_id,content_digest,ingestion_id,status,object_ref_ids FROM brain_source_blob_reference_sets
+         WHERE tenant_id=$1 AND workspace_id=$2 AND source_version_id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
+      return result.rows[0];
+    });
+    if (!local || local.ingestion_id !== ingestionId || local.status !== 'sync_accepted') throw new Error('SOURCE_REFERENCE_SYNC_NOT_ACCEPTED');
+    const source = await this.store.query<Record<string, unknown> & { id: string; content_hash: string; cloud_object_ref_ids: string[] | null }>(scope,
+      `SELECT s.id,v.content_hash,s.cloud_object_ref_ids FROM brain_sources s JOIN brain_source_versions v
+       ON (v.tenant_id,v.workspace_id,v.source_id)=(s.tenant_id,s.workspace_id,s.id)
+       WHERE s.tenant_id=$1 AND s.workspace_id=$2 AND v.id=$3`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
+    if (!source.rows[0] || source.rows[0].id !== local.source_id || source.rows[0].content_hash !== local.content_digest) throw new Error('SOURCE_CONTENT_VERSION_MISMATCH');
+    const stagedRefs = local.object_ref_ids;
+    if (!stagedRefs || !source.rows[0].cloud_object_ref_ids || canonicalJson(stagedRefs) !== canonicalJson(source.rows[0].cloud_object_ref_ids))
+      throw new Error('SOURCE_REFERENCES_NOT_STAGED');
+    const finalize = BrainIngestionFinalizeInput.parse({ protocolVersion: 'cloud-ingest-v2', sourceVersionId, contentDigest: local.content_digest });
+    await cloud.finalize(ingestionId, finalize);
+    const state = BrainIngestionStatus.parse(await cloud.status(ingestionId));
+    if (state.status === 'invalidated') {
+      await this.markReferenceSetUnavailable(scope, sourceVersionId, 'CLOUD_INGESTION_INVALIDATED');
+      throw new Error('CLOUD_INGESTION_INVALIDATED');
+    }
+    if (state.status !== 'finalized') throw new Error('CLOUD_INGESTION_PENDING');
+    const receipt = BrainIngestionFinalizationReceipt.parse(state.receipt);
+    if (receipt.ingestionId !== ingestionId || receipt.sourceId !== local.source_id || receipt.sourceVersionId !== sourceVersionId ||
+      receipt.tenantId !== scope.tenantId || receipt.workspaceId !== scope.workspaceId || receipt.contentDigest !== local.content_digest ||
+      receipt.status !== 'finalized') throw new Error('CLOUD_INGESTION_RECEIPT_BINDING_MISMATCH');
+    const refs = [...receipt.objectRefIds].sort();
+    if (new Set(refs).size !== refs.length || canonicalJson(receipt.objectRefIds) !== canonicalJson(refs) ||
+      (receipt.referenceState === 'verified_empty') !== (refs.length === 0)) throw new Error('CLOUD_INGESTION_REFERENCE_SET_INVALID');
+    if (canonicalJson(stagedRefs) !== canonicalJson(refs)) throw new Error('CLOUD_INGESTION_STAGED_REFERENCE_MISMATCH');
+    const expectedReferenceDigest = await brainReferenceSetDigest(receipt.sourceId, receipt.sourceVersionId, refs);
+    if (receipt.referenceSetDigest !== expectedReferenceDigest) throw new Error('CLOUD_INGESTION_REFERENCE_DIGEST_MISMATCH');
+    const expectedSourceVersion = await brainSourceVersionV2({ sourceId: receipt.sourceId, sourceVersionId, tenantId: scope.tenantId,
+      workspaceId: scope.workspaceId, contentDigest: receipt.contentDigest, objectRefIds: refs, referenceStateVersion: receipt.referenceStateVersion });
+    if (receipt.sourceVersion !== expectedSourceVersion) throw new Error('CLOUD_INGESTION_SOURCE_VERSION_MISMATCH');
+    await this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      const current = await tx.query<Record<string, unknown> & { id: string; content_hash: string }>(`SELECT id,content_hash FROM brain_source_versions
+        WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 ORDER BY version DESC,id LIMIT 1 FOR UPDATE`,
+      [scope.tenantId, scope.workspaceId, local.source_id]);
+      const sourceRow = await tx.query<Record<string, unknown> & { cloud_object_ref_ids: string[] | null }>(`SELECT cloud_object_ref_ids FROM brain_sources
+        WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, local.source_id]);
+      const state = await tx.query<Record<string, unknown> & { content_digest: string; ingestion_id: string | null; object_ref_ids: string[] | null; status: string }>(`SELECT content_digest,ingestion_id,object_ref_ids,status
+        FROM brain_source_blob_reference_sets WHERE tenant_id=$1 AND workspace_id=$2 AND source_version_id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
+      if (!current.rows[0] || current.rows[0].id !== sourceVersionId || current.rows[0].content_hash !== receipt.contentDigest ||
+        !sourceRow.rows[0] || canonicalJson(sourceRow.rows[0].cloud_object_ref_ids) !== canonicalJson(refs) || !state.rows[0] || state.rows[0].status !== 'sync_accepted' ||
+        state.rows[0].content_digest !== receipt.contentDigest || state.rows[0].ingestion_id !== ingestionId ||
+        canonicalJson(state.rows[0].object_ref_ids) !== canonicalJson(refs)) throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
+      await tx.query(`UPDATE brain_sources SET cloud_object_ref_ids=$1::jsonb,updated_at=now() WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4`,
+        [JSON.stringify(refs), scope.tenantId, scope.workspaceId, local.source_id]);
+      await tx.query(`UPDATE brain_source_blob_reference_sets SET status=$1,object_ref_ids=$2::jsonb,source_version=$3,
+        reference_state_version=$4,reference_set_digest=$5,finalized_at=$6,attempts=attempts+1,last_error_code=NULL,updated_at=now()
+        WHERE tenant_id=$7 AND workspace_id=$8 AND source_version_id=$9`,
+      [receipt.referenceState, JSON.stringify(refs), receipt.sourceVersion, receipt.referenceStateVersion, receipt.referenceSetDigest,
+        receipt.finalizedAt, scope.tenantId, scope.workspaceId, sourceVersionId]);
+    });
+    return receipt;
+  }
+
+  private async markReferenceSetUnavailable(scope: Scope, sourceVersionId: string, code: string) {
+    await this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      await tx.query(`UPDATE brain_source_blob_reference_sets SET status='unavailable',attempts=LEAST(20,attempts+1),
+        last_error_code=$1,updated_at=now() WHERE tenant_id=$2 AND workspace_id=$3 AND source_version_id=$4`,
+      [code.slice(0,160).replace(/[^a-zA-Z0-9_.:-]/g,'_'), scope.tenantId, scope.workspaceId, sourceVersionId]);
+    });
+  }
+
+  /**
+   * Stages only references returned by the authenticated native Cloud upload flow.
+   * This is a normal write capability, not remote proof; sync acceptance and Cloud
+   * finalization are still required before the snapshot becomes verified.
+   */
+  async stageCloudReference(scope: Scope, input: unknown) {
+    const parsed = CloudReferenceStageInput.parse(input);
+    if (parsed.mode === 'with_objects' && parsed.objectRefId !== parsed.objectRefId.toLowerCase()) throw new Error('CLOUD_OBJECT_REF_ID_INVALID');
+    return this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      const sourceResult = await tx.query<Record<string, unknown> & { id: string; external_blob_refs: string[]; cloud_object_ref_ids: string[] | null }>(
+        `SELECT id,external_blob_refs,cloud_object_ref_ids FROM brain_sources
+         WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, parsed.sourceId]);
+      const source = sourceResult.rows[0];
+      if (!source) throw new Error('SOURCE_NOT_FOUND');
+      if (source.external_blob_refs?.length) throw new Error('SOURCE_REFERENCES_UNAVAILABLE');
+      const versionResult = await tx.query<Record<string, unknown> & { id: string; version: number; content_hash: string }>(
+        `SELECT id,version,content_hash FROM brain_source_versions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3
+         ORDER BY version DESC,id LIMIT 1 FOR UPDATE`, [scope.tenantId, scope.workspaceId, parsed.sourceId]);
+      const currentVersion = versionResult.rows[0];
+      if (!currentVersion || currentVersion.id !== parsed.sourceVersionId) throw new Error('SOURCE_VERSION_STALE');
+      const stateResult = await tx.query<Record<string, unknown> & { content_digest: string; ingestion_id: string | null; status: string; object_ref_ids: string[] | null }>(
+        `SELECT content_digest,ingestion_id,status,object_ref_ids FROM brain_source_blob_reference_sets
+         WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_version_id=$4 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, parsed.sourceId, parsed.sourceVersionId]);
+      const state = stateResult.rows[0];
+      if (!state || state.status !== 'pending' || state.ingestion_id !== parsed.ingestionId || state.content_digest !== currentVersion.content_hash)
+        throw new Error('CLOUD_INGESTION_BINDING_MISMATCH');
+      const sourceRefs = source.cloud_object_ref_ids;
+      const stateRefs = state.object_ref_ids;
+      if ((sourceRefs === null) !== (stateRefs === null) || (sourceRefs && stateRefs && canonicalJson(sourceRefs) !== canonicalJson(stateRefs)))
+        throw new Error('SOURCE_REFERENCE_SNAPSHOT_MISMATCH');
+      const refs = [...(stateRefs ?? [])];
+      if (parsed.mode === 'text_only' && refs.length) throw new Error('TEXT_ONLY_REFERENCE_SET_NOT_EMPTY');
+      if (parsed.mode === 'with_objects') {
+        if (!refs.includes(parsed.objectRefId)) refs.push(parsed.objectRefId);
+      }
+      refs.sort();
+      await tx.query(`UPDATE brain_sources SET cloud_object_ref_ids=$1::jsonb,updated_at=now()
+        WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4`, [JSON.stringify(refs), scope.tenantId, scope.workspaceId, parsed.sourceId]);
+      await tx.query(`UPDATE brain_source_blob_reference_sets SET object_ref_ids=$1::jsonb,updated_at=now()
+        WHERE tenant_id=$2 AND workspace_id=$3 AND source_id=$4 AND source_version_id=$5`,
+      [JSON.stringify(refs), scope.tenantId, scope.workspaceId, parsed.sourceId, parsed.sourceVersionId]);
+      const referenceSetDigest = await brainReferenceSetDigest(parsed.sourceId, parsed.sourceVersionId, refs);
+      return { sourceId: parsed.sourceId, sourceVersionId: parsed.sourceVersionId, ingestionId: parsed.ingestionId,
+        objectRefId: parsed.mode === 'with_objects' ? parsed.objectRefId : null, objectRefIds: refs,
+        contentDigest: currentVersion.content_hash, referenceSetDigest,
+        referenceState: 'pending' as const, syncRequired: true as const };
+    });
+  }
+
+  /**
+   * Records a sync acknowledgement only from the trusted native sync adapter.
+   * Expected bindings are loaded under row locks; callback input cannot choose them.
+   */
+  async acceptCloudReferenceSync(scope: Scope, request: PushRequest, response: PushResponse) {
+    return this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      const parsedRequest = PushRequest.parse(request);
+      const parsedResponse = PushResponse.parse(response);
+      // The source row is identified from the unique BRAIN source change in the request,
+      // then all authorization expectations are derived from the local locked snapshot.
+      const sourceChanges = parsedRequest.changes.filter((change) => change.table === 'brain_sources' && change.op === 'upsert' &&
+        change.tenantId === scope.tenantId && change.workspaceId === scope.workspaceId &&
+        Array.isArray(change.fields.cloud_object_ref_ids?.value));
+      const stagedSourceIds = new Set(sourceChanges.map((change) => change.id));
+      const versionChanges = parsedRequest.changes.filter((change) => change.table === 'brain_source_versions' &&
+        change.tenantId === scope.tenantId && change.workspaceId === scope.workspaceId && stagedSourceIds.has(String(change.fields.source_id?.value)) &&
+        Object.hasOwn(change.fields, 'source_id') && Object.hasOwn(change.fields, 'content_hash'));
+      if (sourceChanges.length !== 1 || versionChanges.length !== 1) throw new Error('SYNC_REFERENCE_ROWS_MISSING');
+      const sourceChange = sourceChanges[0]!;
+      const versionChange = versionChanges[0]!;
+      if (versionChange.id === sourceChange.id) throw new Error('SYNC_REFERENCE_SCOPE_MISMATCH');
+
+      const sourceResult = await tx.query<Record<string, unknown> & { cloud_object_ref_ids: string[] | null; external_blob_refs: string[] }>(
+        `SELECT cloud_object_ref_ids,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, sourceChange.id]);
+      const versionResult = await tx.query<Record<string, unknown> & { id: string; content_hash: string }>(
+        `SELECT id,content_hash FROM brain_source_versions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3
+         ORDER BY version DESC,id LIMIT 1 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceChange.id]);
+      const stateResult = await tx.query<Record<string, unknown> & { id: string; source_id: string; source_version_id: string; content_digest: string;
+        ingestion_id: string | null; status: string; object_ref_ids: string[] | null; sync_ack_id: string | null; sync_idempotency_key: string | null;
+        sync_server_seq: string | null; sync_request_digest: string | null; sync_outcome_evidence: BrainReferenceSyncEvidence | null }>(
+        `SELECT id,source_id,source_version_id,content_digest,ingestion_id,status,object_ref_ids,sync_ack_id,sync_idempotency_key,sync_server_seq,
+          sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets
+         WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_version_id=$4 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, sourceChange.id, versionChange.id]);
+      const state = stateResult.rows[0];
+      const sourceRow = sourceResult.rows[0];
+      const versionRow = versionResult.rows[0];
+      if (!state || state.status !== 'pending' && state.status !== 'sync_accepted' || !state.ingestion_id || !state.object_ref_ids)
+        throw new Error('SOURCE_REFERENCES_NOT_PENDING');
+      if (!sourceRow || sourceRow.external_blob_refs?.length || !sourceRow.cloud_object_ref_ids ||
+        canonicalJson(sourceRow.cloud_object_ref_ids) !== canonicalJson(state.object_ref_ids) || !versionRow ||
+        versionRow.id !== state.source_version_id || versionRow.content_hash !== state.content_digest)
+        throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
+      const refs = [...state.object_ref_ids];
+      if (refs.some((id, index) => id !== id.toLowerCase() || (index > 0 && refs[index - 1]! >= id))) throw new Error('SOURCE_REFERENCE_SET_INVALID');
+      const expectation: BrainReferenceSyncExpectation = {
+        tenantId: scope.tenantId, workspaceId: scope.workspaceId, sourceId: state.source_id,
+        sourceVersionId: state.source_version_id, contentDigest: state.content_digest,
+        objectRefIds: refs, referenceSetDigest: await brainReferenceSetDigest(state.source_id, state.source_version_id, refs),
+      };
+      if (parsedResponse.conflicts !== 0 || parsedResponse.rejected.length !== 0) throw new Error('SYNC_PUSH_NOT_FULLY_ACCEPTED');
+      const acknowledgement = await assertBrainReferenceSyncAcknowledgement(parsedRequest, parsedResponse, expectation);
+      const requestDigest = createHash('sha256').update(canonicalJson(parsedRequest), 'utf8').digest('hex');
+      if (acknowledgement.idempotencyKey !== parsedRequest.idempotencyKey || acknowledgement.serverSeq !== parsedResponse.serverSeq)
+        throw new Error('SYNC_ACKNOWLEDGEMENT_BINDING_MISMATCH');
+      const outcomes = [parsedResponse.changeOutcomes![acknowledgement.sourceChangeIndex]!, parsedResponse.changeOutcomes![acknowledgement.versionChangeIndex]!];
+      const responseDigest = createHash('sha256').update(canonicalJson({ accepted: parsedResponse.accepted, conflicts: parsedResponse.conflicts,
+        rejected: parsedResponse.rejected, serverSeq: parsedResponse.serverSeq, outcomes }), 'utf8').digest('hex');
+      if (state.status === 'sync_accepted') {
+        if (state.sync_idempotency_key !== parsedRequest.idempotencyKey || state.sync_server_seq !== acknowledgement.serverSeq ||
+          state.sync_request_digest !== requestDigest || !state.sync_outcome_evidence || state.sync_outcome_evidence.responseDigest !== responseDigest)
+          throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
+        if (!state.sync_ack_id) throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
+        return { ...state.sync_outcome_evidence.acknowledgement, ackId: state.sync_ack_id,
+          responseDigest, status: 'sync_accepted' as const };
+      }
+      const ackId = uuid();
+      const evidence: BrainReferenceSyncEvidence = { acknowledgement, responseDigest, outcomes };
+      await tx.query(`UPDATE brain_source_blob_reference_sets SET status='sync_accepted',sync_ack_id=$1,sync_idempotency_key=$2,
+        sync_server_seq=$3,sync_request_digest=$4,sync_outcome_evidence=$5::jsonb,sync_accepted_at=now(),updated_at=now()
+        WHERE tenant_id=$6 AND workspace_id=$7 AND id=$8 AND status='pending'`,
+      [ackId, parsedRequest.idempotencyKey, acknowledgement.serverSeq, requestDigest, JSON.stringify(evidence),
+        scope.tenantId, scope.workspaceId, state.id]);
+      return { ...acknowledgement, ackId, responseDigest, status: 'sync_accepted' as const };
+    });
+  }
 
   async ingest(scope: Scope, actorId: string, input: unknown) {
     const draft = IngestDraft.parse(input);
-    const sourceId = uuid();
+    const sourceId = draft.sourceId ?? uuid();
     const versionId = uuid();
     const now = draft.capturedAt ?? new Date().toISOString();
-    const hash = createHash('sha256').update(draft.content).digest('hex');
-    const chunks = splitChunks(draft.content, draft.chunkSize, draft.overlap);
+    const normalizedContent = draft.content.normalize('NFC').replace(/\r\n?/g, '\n');
+    const hash = createHash('sha256').update(normalizedContent, 'utf8').digest('hex');
+    const chunks = splitChunks(normalizedContent, draft.chunkSize, draft.overlap);
     if (draft.embeddings && draft.embeddings.length !== chunks.length) throw new Error('EMBEDDING_CHUNK_COUNT_MISMATCH');
     const dimension = draft.embeddings?.[0]?.length;
     if (draft.embeddings?.some((vector) => vector.length !== dimension)) throw new Error('EMBEDDING_DIMENSION_MISMATCH');
     const chunkIds = chunks.map(() => uuid());
-    await this.store.query(scope, `INSERT INTO brain_sources(id,tenant_id,workspace_id,source_type,title,uri,trust_level,retention,external_blob_refs,created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)`, [sourceId, scope.tenantId, scope.workspaceId, draft.source.sourceType, draft.source.title, draft.source.uri ?? null, draft.source.trustLevel, draft.source.retention, JSON.stringify(draft.source.externalBlobRefs), actorId]);
+    await this.store.query(scope, `INSERT INTO brain_sources(id,tenant_id,workspace_id,source_type,title,uri,trust_level,retention,external_blob_refs,cloud_object_ref_ids,created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NULL,$10)`, [sourceId, scope.tenantId, scope.workspaceId, draft.source.sourceType, draft.source.title, draft.source.uri ?? null, draft.source.trustLevel, draft.source.retention, JSON.stringify(draft.source.externalBlobRefs), actorId]);
     await this.store.query(scope, `INSERT INTO brain_source_versions(id,tenant_id,workspace_id,source_id,version,content_hash,content_type,content_text,captured_at,created_by)
-      VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9)`, [versionId, scope.tenantId, scope.workspaceId, sourceId, hash, draft.contentType, draft.content, now, actorId]);
+      VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9)`, [versionId, scope.tenantId, scope.workspaceId, sourceId, hash, draft.contentType, normalizedContent, now, actorId]);
     for (let i = 0; i < chunks.length; i++) {
       const content = chunks[i]!;
       const vector = draft.embeddings?.[i];
       await this.store.query(scope, `INSERT INTO brain_chunks(id,tenant_id,workspace_id,source_id,source_version_id,ordinal,content_hash,content_text,embedding,embedding_model,embedding_version,dim,created_by)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::vector,$10,$11,$12,$13)`, [chunkIds[i], scope.tenantId, scope.workspaceId, sourceId, versionId, i, createHash('sha256').update(content).digest('hex'), content, vector ? `[${vector.join(',')}]` : null, vector ? draft.embeddingModel : null, vector ? draft.embeddingVersion : null, vector?.length ?? null, actorId]);
     }
-    return { sourceId, versionId, chunkIds };
+    await this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      await tx.query(`INSERT INTO brain_source_blob_reference_sets(id,tenant_id,workspace_id,source_id,source_version_id,content_digest,
+        ingestion_id,status,attempts,last_error_code) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9)
+        ON CONFLICT (tenant_id,workspace_id,source_version_id) DO NOTHING`,
+      [uuid(), scope.tenantId, scope.workspaceId, sourceId, versionId, hash, draft.cloudIngestionId ?? null,
+        draft.cloudIngestionId ? 'pending' : 'unknown', draft.cloudIngestionId ? null : 'CLOUD_INGESTION_REQUIRED']);
+    });
+    return { sourceId, sourceVersionId: versionId, versionId, chunkIds, contentDigest: hash };
   }
 
   async search(scope: Scope, input: unknown) {
@@ -172,65 +406,6 @@ export class BrainService {
       ORDER BY created_at DESC,id DESC LIMIT $4`, [scope.tenantId, scope.workspaceId, parsed.status ?? null, parsed.limit])).rows;
   }
 
-  /** Persist an approved erasure intent. Blob and source bytes remain until CLOUD can safely coordinate deletion. */
-  async requestSourceErasure(scope: Scope, actorId: string, approvalRequestId: string | undefined, input: unknown) {
-    const request = ErasureRequestInput.parse(input);
-    if (!approvalRequestId) throw new Error('ERASURE_APPROVAL_REQUIRED');
-    // The CapabilityBus verifies exact capability/input/scope approval before invoking the handler.
-    // approvalRequestId is retained as evidence; the app role cannot read the protected approval tables.
-    const inputHash = await sha256Hex(canonicalJson(request));
-    const source = await this.store.query<Record<string, unknown> & { id: string; retention: string; external_blob_refs: string[] }>(scope,
-      'SELECT id,retention,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, request.sourceId]);
-    const row = source.rows[0];
-    if (!row) throw new Error('SOURCE_NOT_FOUND');
-    const id = uuid();
-    await this.store.query(scope, 'INSERT INTO brain_source_erasures(id,tenant_id,workspace_id,source_id,status,requested_by,approval_request_id,approval_input_hash,retention_policy,external_blob_refs,last_error_code) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11) ON CONFLICT DO NOTHING',
-    [id, scope.tenantId, scope.workspaceId, request.sourceId, 'waiting_cloud', actorId, approvalRequestId, inputHash, row.retention, JSON.stringify(row.external_blob_refs), 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE']);
-    const existing = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
-      'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND (source_id=$3 OR (approval_request_id=$4 AND approval_input_hash=$5)) ORDER BY created_at LIMIT 1', [scope.tenantId, scope.workspaceId, request.sourceId, approvalRequestId, inputHash]);
-    const erasure = existing.rows[0];
-    if (!erasure) throw new Error('ERASURE_INTENT_CREATE_FAILED');
-    if (erasure.attempts > 0) return erasureRequestView(erasure);
-    await this.store.query(scope, `INSERT INTO brain_source_erasure_attempts(id,tenant_id,workspace_id,erasure_id,actor_id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,error_code)
-      VALUES ($1,$2,$3,$4,$5,'waiting_cloud','[]'::jsonb,'[]'::jsonb,$6,'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE') ON CONFLICT DO NOTHING`,
-    [uuid(), scope.tenantId, scope.workspaceId, erasure.id, actorId, erasure.retention_policy]);
-    return erasureRequestView(erasure);
-  }
-
-  /** Retry is explicit and bounded. This records the dependency blocker; it never deletes a shared object itself. */
-  /** Call only after CapabilityBus has independently verified the retry capability approval. */
-  async retrySourceErasure(scope: Scope, actorId: string, approvalRequestId: string | undefined, input: unknown) {
-    if (!approvalRequestId) throw new Error('ERASURE_APPROVAL_REQUIRED');
-    const { erasureId } = ErasureRetryInput.parse(input);
-    const old = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
-      'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, erasureId]);
-    const row = old.rows[0];
-    if (!row) throw new Error('ERASURE_NOT_FOUND');
-    if (row.status === 'complete') return erasureView(row);
-    if (Number(row.attempts) >= 5) throw new Error('ERASURE_RETRY_LIMIT');
-    if (row.status !== 'waiting_cloud') throw new Error('ERASURE_PRIVILEGED_WORKFLOW_REQUIRED');
-    const attempts = Number(row.attempts) + 1;
-    await this.store.query(scope, `INSERT INTO brain_source_erasure_attempts(id,tenant_id,workspace_id,erasure_id,actor_id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,error_code)
-      VALUES ($1,$2,$3,$4,$5,'waiting_cloud','[]'::jsonb,'[]'::jsonb,$6,'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE')`, [uuid(), scope.tenantId, scope.workspaceId, erasureId, actorId, row.retention_policy]);
-    await this.store.query(scope, "UPDATE brain_source_erasures SET attempts=$1,last_error_code='PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE',updated_at=now() WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4", [attempts, scope.tenantId, scope.workspaceId, erasureId]);
-    return { ...erasureRequestView({ ...row, attempts }), status: 'waiting_cloud' as const, lastErrorCode: 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE', completionReceipt: null };
-  }
-
-  async sourceErasureStatus(scope: Scope, input: unknown) {
-    const { erasureId, limit, cursor } = ErasureStatusInput.parse(input);
-    const result = await this.store.query<Record<string, unknown> & { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }>(scope,
-      'SELECT id,source_id,status,attempts,retention_policy,external_blob_refs,last_error_code,completion_receipt FROM brain_source_erasures WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [scope.tenantId, scope.workspaceId, erasureId]);
-    if (!result.rows[0]) throw new Error('ERASURE_NOT_FOUND');
-    const attempts = await this.store.query<Record<string, unknown> & { id: string; occurred_at: string; checked_blob_refs: string[]; deleted_blob_refs: string[]; retention_policy: string; audit_reference: string | null; error_code: string | null; outcome: string }>(scope, `SELECT id,outcome,checked_blob_refs,deleted_blob_refs,retention_policy,audit_reference,error_code,occurred_at
-      FROM brain_source_erasure_attempts WHERE tenant_id=$1 AND workspace_id=$2 AND erasure_id=$3
-        AND ($4::timestamptz IS NULL OR (occurred_at,id)<($4,$5::uuid)) ORDER BY occurred_at DESC,id DESC LIMIT $6`,
-    [scope.tenantId, scope.workspaceId, erasureId, cursor?.occurredAt ?? null, cursor?.id ?? null, limit + 1]);
-    const hasMore = attempts.rows.length > limit;
-    const items = attempts.rows.slice(0, limit);
-    const last = items.at(-1);
-    return { ...erasureView(result.rows[0]), audit: { items, nextCursor: hasMore && last ? { occurredAt: new Date(last.occurred_at).toISOString(), id: last.id } : null } };
-  }
-
   async listMemories(scope: Scope, input: unknown = {}) {
     const parsed = MemoryListInput.parse(input);
     const limit = parsed.limit;
@@ -260,15 +435,6 @@ function splitChunks(text: string, size: number, overlap: number): string[] {
     start = Math.max(start + 1, end - overlap);
   }
   return parts;
-}
-
-function erasureView(row: { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null; completion_receipt: string | null }) {
-  return { id: row.id, sourceId: row.source_id, status: row.status as 'waiting_cloud' | 'retryable_failure' | 'local_purge_pending' | 'complete', attempts: Number(row.attempts), retentionPolicy: row.retention_policy, externalBlobRefs: row.external_blob_refs, lastErrorCode: row.last_error_code, completionReceipt: row.completion_receipt };
-}
-
-function erasureRequestView(row: { id: string; source_id: string; status: string; attempts: number; retention_policy: string; external_blob_refs: string[]; last_error_code: string | null }) {
-  if (row.status !== 'waiting_cloud') throw new Error('ERASURE_PRIVILEGED_WORKFLOW_REQUIRED');
-  return { id: row.id, sourceId: row.source_id, status: 'waiting_cloud' as const, attempts: Number(row.attempts), retentionPolicy: row.retention_policy, externalBlobRefs: row.external_blob_refs, lastErrorCode: row.last_error_code, completionReceipt: null };
 }
 
 function zProcedure(input: { title: string; type: 'skill' | 'sop' | 'xyra_pattern'; body: string; successfulRunId?: string }) {
