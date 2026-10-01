@@ -21,6 +21,13 @@ export function planSchedule(input: unknown): zReturn<typeof ScheduleResult> {
   const nodes = request.tickets.map((ticket) => HierarchyNode.parse(ticket));
   const done = new Set(nodes.filter((ticket) => ticket.state === 'done').map((ticket) => ticket.id));
   const reservations = new Set(request.reservedTicketIds);
+  const activeLocks = new Set(request.activeResourceLocks);
+  const requestedLocks = new Set(request.config.resourceLocks);
+  const lockConflict = [...requestedLocks].some((lock) => activeLocks.has(lock));
+  if (lockConflict) {
+    const ticketIds = nodes.filter((ticket) => ticket.kind === 'ticket' || ticket.kind === 'subtask').map((ticket) => ticket.id);
+    return { runId: uuidv7(), state: 'blocked', runnableTicketIds: [], blockedTicketIds: ticketIds, reason: 'RESOURCE_LOCK_CONFLICT', externalExecution: false };
+  }
   const blocked = new Set<string>();
   const runnable = nodes.filter((ticket) => {
     if (ticket.kind !== 'ticket' && ticket.kind !== 'subtask') return false;

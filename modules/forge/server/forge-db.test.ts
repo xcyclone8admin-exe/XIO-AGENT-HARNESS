@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { uuidv7 } from '@xyra/core';
 import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole, type Migration } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -148,20 +149,24 @@ describe('Forge schema and workspace isolation', () => {
     }
     expect((await forge.councils(actorA)).find((item) => item.id === council.id)?.status).toBe('complete');
     expect(await forge.councils({ id: actor, tenantId: tenantB, workspaceId: workspaceB })).toEqual([]);
-    const plannerInput = { epicId: epic.id, approval: approvedRequest, config: { maxConcurrency: 1, maxBudgetUsd: 10, resourceLocks: [], substrateVerified: false, externalAdaptersEnabled: false }, tickets: await forge.nodes(actorA, project.id), spentUsd: 0, killSwitchEngaged: false };
+    const plannerInput = { epicId: epic.id, approval: approvedRequest, config: { maxConcurrency: 1, maxBudgetUsd: 10, resourceLocks: ['workspace:forge-test-lock'], substrateVerified: false, externalAdaptersEnabled: false }, tickets: await forge.nodes(actorA, project.id), spentUsd: 0, killSwitchEngaged: false };
     const handlers = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
     registerForge({ register: (_manifest, descriptor: AnyCapability, handler) => { handlers.set(descriptor.id, handler); } }, manifest, forge);
     const capabilityCall: ForgeCall = { principal: { id: actor, tenantId: tenantA }, workspaceId: workspaceA };
-    const plan = await handlers.get('forge.schedule.plan')?.({ epicId: epic.id, approvalId: approvedRequest.id, config: plannerInput.config, spentUsd: 0 }, capabilityCall) as { runId: string; runnableTicketIds: string[]; blockedTicketIds: string[] };
+    const plan = await handlers.get('forge.schedule.plan')?.({ epicId: epic.id, approvalId: approvedRequest.id, config: plannerInput.config, spentUsd: 0 }, capabilityCall) as { id: string; state: string; runnableTicketIds: string[]; blockedTicketIds: string[] };
     expect(plan.runnableTicketIds).toContain(task.id);
     expect(plan.blockedTicketIds).toEqual([dependent.id]);
-    const schedule = (await forge.schedules(actorA)).find((item) => item.id === plan.runId);
+    const schedule = (await forge.schedules(actorA)).find((item) => item.id === plan.id);
     expect(schedule).toBeDefined();
     if (!schedule) throw new Error('test schedule missing');
     expect(schedule.state).toBe('queued');
+    expect((await scoped.query(scopeA, "SELECT resource_key FROM forge_resource_lock_leases WHERE status='active'")).rows).toEqual([{ resource_key: 'workspace:forge-test-lock' }]);
+    const raced = await forge.persistSchedule(actorA, { epicId: epic.id, approval: approvedRequest, config: plannerInput.config, spentUsd: 0 }, { runId: uuidv7(), state: 'queued', runnableTicketIds: [dependent.id], blockedTicketIds: [], reason: null });
+    expect(raced).toMatchObject({ state: 'blocked', runnableTicketIds: [], blockedTicketIds: [dependent.id], reason: 'RESOURCE_LOCK_CONFLICT' });
     const duplicatePlan = await handlers.get('forge.schedule.plan')?.({ epicId: epic.id, approvalId: approvedRequest.id, config: plannerInput.config, spentUsd: 0 }, capabilityCall) as { state: string; runnableTicketIds: string[]; reason: string | null };
-    expect(duplicatePlan).toMatchObject({ state: 'blocked', runnableTicketIds: [], reason: 'NO_RUNNABLE_TICKETS' });
+    expect(duplicatePlan).toMatchObject({ state: 'blocked', runnableTicketIds: [], reason: 'RESOURCE_LOCK_CONFLICT' });
     expect((await forge.cancelSchedule(actorA, schedule.id, 'User canceled')).state).toBe('canceled');
+    expect((await scoped.query(scopeA, "SELECT id FROM forge_resource_lock_leases WHERE status='active'")).rows).toEqual([]);
     expect((await forge.runs(actorA)).some((event) => event.ticketId === task.id && event.state === 'canceled' && event.externalExecution === false)).toBe(true);
     const escalation = await forge.recordDiscovery(actorA, { ticketId: task.id, summary: 'Contract change affects this work', evidenceIds: [evidenceRecord.id], affectedTicketIds: [] });
     expect(escalation.discovery.classification).toBe('material');

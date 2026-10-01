@@ -42,10 +42,9 @@ const ForgeRegistration = {
       const request = forgeCapabilities.schedule.input.parse(input);
       const trusted = await requireRepository(repository).approvedPlanData(actor(call), request.approvalId);
       if (trusted.approval.epicId !== request.epicId || trusted.approval.workspaceId !== actor(call).workspaceId) throw new Error('FORGE_APPROVAL_SCOPE_MISMATCH');
-      const plannerRequest = { ...request, approval: trusted.approval, tickets: trusted.tickets, reservedTicketIds: trusted.reservedTicketIds, killSwitchEngaged: false };
+      const plannerRequest = { ...request, approval: trusted.approval, tickets: trusted.tickets, reservedTicketIds: trusted.reservedTicketIds, activeResourceLocks: trusted.activeResourceLocks, killSwitchEngaged: false };
       const result = planSchedule(plannerRequest);
-      await requireRepository(repository).persistSchedule(actor(call), plannerRequest, result);
-      return result;
+      return requireRepository(repository).persistSchedule(actor(call), plannerRequest, result);
     });
     bus.register(manifest, forgeCapabilities.gates, async (input, call) => {
       const request = forgeCapabilities.gates.input.parse(input);

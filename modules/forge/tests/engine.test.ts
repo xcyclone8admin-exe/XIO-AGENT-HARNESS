@@ -82,6 +82,11 @@ describe('approved bounded scheduler (planning only)', () => {
     const planned = planSchedule({ epicId, approval, config, tickets: [], spentUsd: 0, killSwitchEngaged: false });
     expect(planned).toMatchObject({ state: 'blocked', runnableTicketIds: [], blockedTicketIds: [], reason: 'NO_RUNNABLE_TICKETS', externalExecution: false });
   });
+
+  it('blocks planning when a requested resource lock is already active', () => {
+    const planned = planSchedule({ epicId, approval, config: { ...config, resourceLocks: ['workspace:shared-db'] }, tickets: [ticket], activeResourceLocks: ['workspace:shared-db'], spentUsd: 0, killSwitchEngaged: false });
+    expect(planned).toMatchObject({ state: 'blocked', runnableTicketIds: [], blockedTicketIds: [ticketId], reason: 'RESOURCE_LOCK_CONFLICT', externalExecution: false });
+  });
 });
 
 describe('review, gates, promotion and hard execution boundary', () => {
