@@ -1,4 +1,5 @@
-import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
+import { hashApprovalInput, hashApprovalScope } from '@xyra/contracts';
+import type { AnyCapability, ModuleManifest, Principal, VerifiedCapabilityApproval } from '@xyra/contracts';
 import { decidePolicy } from '@xyra/policy';
 import { canonicalJson, sha256Hex } from '@xyra/core';
 
@@ -17,6 +18,20 @@ export interface BusIdempotency {
   put(key: string, inputHash: string, result: unknown): Promise<void>;
 }
 
+/** Backwards-readable local name for the shared server-only proof contract. */
+export type VerifiedBusApproval = VerifiedCapabilityApproval;
+
+/** Trusted context assembled by CapabilityBus; never parsed from a WebView or agent payload. */
+export interface CapabilityExecutionContext {
+  readonly principal: Principal;
+  readonly actorId: string;
+  readonly tenantId: string;
+  readonly workspaceId: string;
+  readonly capabilityId: string;
+  readonly permission: string;
+  readonly approval: VerifiedCapabilityApproval | null;
+}
+
 export interface BusApproval {
   /** Verifies expiry, scope hash, approver authority and single use against durable state. */
   verify(
@@ -25,7 +40,8 @@ export interface BusApproval {
     capabilityId: string,
     input: unknown,
     approvalId: string | undefined,
-  ): Promise<boolean>;
+    idempotencyKey: string | undefined,
+  ): Promise<VerifiedBusApproval | null>;
 }
 
 export interface BusCall {
@@ -47,7 +63,7 @@ export class BusFault extends Error {
   }
 }
 
-type Handler = (input: unknown, call: BusCall) => Promise<unknown>;
+type Handler = (input: unknown, call: BusCall, context: CapabilityExecutionContext) => Promise<unknown>;
 interface Entry {
   readonly descriptor: AnyCapability;
   readonly manifest: ModuleManifest;
@@ -103,6 +119,8 @@ export class CapabilityBus {
     const entry = this.entries.get(call.capabilityId);
     if (!entry) throw new BusFault('CAPABILITY_NOT_FOUND', 404, 'Capability not found');
     const { descriptor, manifest, handler } = entry;
+    if (call.principal.kind === 'agent' && !descriptor.agentCallable)
+      throw new BusFault('AGENT_CALL_NOT_ALLOWED', 403, 'Capability is not available to agents');
     const parsed = descriptor.input.safeParse(call.input);
     if (!parsed.success) throw new BusFault('INVALID_INPUT', 400, 'Capability input failed validation');
     const policyInput = {
@@ -118,15 +136,44 @@ export class CapabilityBus {
       killSwitchEngaged: this.killSwitch(),
     };
     let decision = decidePolicy(policyInput);
+    let verifiedApproval: VerifiedBusApproval | null = null;
     if (decision.status === 'approval_required') {
-      const approved = await this.approvals.verify(
+      const approval = await this.approvals.verify(
         call.principal,
         call.workspaceId,
         descriptor.id,
         parsed.data,
         call.approvalId,
+        call.idempotencyKey,
       );
-      if (approved) decision = decidePolicy({ ...policyInput, approvalVerified: true });
+      if (approval) {
+        const inputDigest = await hashApprovalInput(parsed.data);
+        const { scopeHash: _scopeHash, ...scopeBinding } = approval;
+        const expectedScopeHash = await hashApprovalScope(scopeBinding);
+        const expectedRequesterId = call.principal.kind === 'user'
+          ? call.principal.id
+          : call.principal.kind === 'agent'
+            ? call.principal.delegatedBy
+            : undefined;
+        const expiresAt = Date.parse(approval.expiresAt);
+        const issuedAt = Date.parse(approval.issuedAt);
+        if (
+          approval.approvalId !== call.approvalId ||
+          approval.tenantId !== call.principal.tenantId ||
+          approval.workspaceId !== call.workspaceId ||
+          approval.principalId !== call.principal.id ||
+          !expectedRequesterId || approval.requestedBy !== expectedRequesterId ||
+          approval.approverId === approval.requestedBy ||
+          approval.capabilityId !== descriptor.id ||
+          approval.inputDigest !== inputDigest ||
+          approval.scopeHash !== expectedScopeHash ||
+          !approval.approverId || !approval.decisionId ||
+          !Number.isFinite(expiresAt) || expiresAt <= Date.now() ||
+          !Number.isFinite(issuedAt) || issuedAt > Date.now() + 60_000
+        ) throw new BusFault('APPROVAL_PROOF_SCOPE_MISMATCH', 403, 'Approval proof does not match this call');
+        verifiedApproval = approval;
+        decision = decidePolicy({ ...policyInput, approvalVerified: true });
+      }
     }
     if (decision.status !== 'allow') {
       // An out-of-scope workspace has no valid tenant-scoped audit destination.
@@ -161,7 +208,16 @@ export class CapabilityBus {
         }
       }
       try {
-        const result = descriptor.output.parse(await handler(parsed.data, call));
+        const context: CapabilityExecutionContext = {
+          principal: call.principal,
+          actorId: call.principal.id,
+          tenantId: call.principal.tenantId,
+          workspaceId: call.workspaceId,
+          capabilityId: descriptor.id,
+          permission: descriptor.permission,
+          approval: verifiedApproval,
+        };
+        const result = descriptor.output.parse(await handler(parsed.data, call, context));
         if (key) await this.idempotency.put(key, inputHash, result);
         await this.audit.append({ principal: call.principal, workspaceId: call.workspaceId,
           capabilityId: descriptor.id, result: 'succeeded' });

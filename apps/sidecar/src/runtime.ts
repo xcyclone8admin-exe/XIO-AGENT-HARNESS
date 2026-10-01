@@ -2,12 +2,16 @@ import { randomBytes } from 'node:crypto';
 import { serve } from '@hono/node-server';
 import { applyPGliteMigrations, LocalScopedStore, prepareLocalAppRole } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
+import { PGliteLedgerWriter } from '@xyra/ledger';
 import { bootstrapLocalIdentity, CoreService } from '@xyra/mod-core/server';
+import { MoneyService } from '@xyra/mod-money/server';
 import { OpsService } from '@xyra/mod-ops/server';
+import { BrainService } from '@xyra/mod-brain/server';
 import { MIGRATIONS } from './generated/migrations';
 import { MANIFESTS } from './generated/modules';
 import { CapabilityBus } from './bus';
-import { DurableBusAudit, DurableBusIdempotency } from './durable';
+import { DurableBusApproval, DurableBusAudit, DurableBusIdempotency } from './durable';
+import { registerBrainCapabilities } from './brain';
 import { registerFoundationCapabilities } from './foundation';
 import { createSidecarApp } from './http';
 
@@ -44,12 +48,13 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
     const bus = new CapabilityBus(
       new DurableBusAudit(scoped),
       new DurableBusIdempotency(scoped),
-      // Consequential capabilities stay disabled until the approval service is wired.
-      { verify: async () => false },
+      new DurableBusApproval(scoped),
       () => false,
       async () => new Set(),
     );
     registerFoundationCapabilities(bus, new CoreService(scoped), new OpsService(scoped));
+    new MoneyService(new PGliteLedgerWriter(db)).register(bus);
+    registerBrainCapabilities(bus, new BrainService(scoped));
     const launchToken = options.launchToken ?? randomBytes(32).toString('base64url');
     const app = createSidecarApp({
       port: options.port,

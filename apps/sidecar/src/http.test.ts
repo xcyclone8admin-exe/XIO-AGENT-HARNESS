@@ -37,7 +37,7 @@ const bus = new CapabilityBus(
     },
   },
   { get: async () => undefined, put: async () => {} },
-  { verify: async () => false },
+  { verify: async () => null },
   () => false,
   async () => new Set(),
 );
