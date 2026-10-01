@@ -26,6 +26,15 @@ const QueueAdmission = z.object({
   state: z.enum(['queued', 'claimed', 'running', 'completed', 'failed', 'canceled', 'refused']).nullable(),
   reason: z.string().nullable(),
 });
+const QueuedRun = z.object({
+  runId: z.uuid(),
+  profileId: z.uuid(),
+  principalId: z.uuid(),
+  state: z.enum(['queued', 'claimed', 'running', 'completed', 'failed', 'canceled', 'refused']),
+  cancellationRequested: z.boolean(),
+  errorCode: z.string().nullable(),
+  createdAt: z.iso.datetime({ offset: true }),
+});
 
 /**
  * Privilege-bearing and server-derived profile fields (manifest guardedColumns). Device and agent
@@ -84,6 +93,15 @@ export const swarmCapabilities = {
     permission: 'swarm:run:read',
     input: Empty,
     output: z.array(AgentRunSummary),
+  }),
+  queuedRuns: defineCapability({
+    id: 'swarm.runs.queue',
+    title: 'List durable agent queue entries',
+    description: 'List queued and terminal run admission records in the current workspace',
+    kind: 'read',
+    permission: 'swarm:run:read',
+    input: z.object({ limit: z.number().int().min(1).max(500).optional() }),
+    output: z.array(QueuedRun),
   }),
   enqueueRun: defineCapability({
     id: 'swarm.runs.enqueue',

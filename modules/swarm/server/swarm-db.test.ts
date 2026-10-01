@@ -10,6 +10,7 @@ import manifest from '../manifest';
 import { GUARDED_PROFILE_FIELDS } from '../contracts';
 import { SwarmProfileService } from './profile-service';
 import { SwarmKillSwitchService, SwarmRunQueueService, type SwarmTrustedCallContext } from './runtime-service';
+import { makeSwarmServer, type SwarmCapabilityExecutionContext } from './index';
 
 type Db = Awaited<ReturnType<typeof openLocalStore>>;
 
@@ -250,6 +251,38 @@ function trustedContext(capabilityId: string, approval: Awaited<ReturnType<typeo
 }
 
 describe('durable SWARM admission and workspace kill switch', () => {
+  it('registers safe capabilities with trusted execution context and exposes host services', async () => {
+    const server = makeSwarmServer(scoped, { maxPendingPerWorkspace: 20, maxQueuedPayloadBytes: 100_000, maxResultPayloadBytes: 200_000, maxRunDurationMs: 120_000 });
+    expect(server.queueService).toBeInstanceOf(SwarmRunQueueService);
+    expect(server.killSwitchReader).toBe(server.killSwitchService);
+    const handlers = new Map<string, (input: unknown, call: { principal: Principal; workspaceId: string; capabilityId: string }, context: SwarmCapabilityExecutionContext) => Promise<unknown>>();
+    const bus = { register: (_manifest: unknown, descriptor: { id: string }, handler: (input: unknown, call: { principal: Principal; workspaceId: string; capabilityId: string }, context: SwarmCapabilityExecutionContext) => Promise<unknown>) => handlers.set(descriptor.id, handler) };
+    server.register(bus as never, manifest);
+
+    const principal: Principal = { kind: 'user', id: actor, tenantId: tenantA, workspaces: [{ id: workspaceA, role: 'owner', kind: 'standard' }], grants: [] };
+    const input = { engaged: true, reason: 'Registrar integration check.' };
+    const setContext: SwarmCapabilityExecutionContext = {
+      principal, actorId: actor, tenantId: tenantA, workspaceId: workspaceA,
+      capabilityId: 'swarm.kill-switch.set', permission: 'swarm:kill-switch:manage', approval: await approvalFor('swarm.kill-switch.set', input),
+    };
+    const call = { principal, workspaceId: workspaceA, capabilityId: 'swarm.kill-switch.set' };
+    const set = handlers.get('swarm.kill-switch.set');
+    expect(set).toBeDefined();
+    const forgedInput = { ...input, approval: await approvalFor('swarm.kill-switch.set', input) };
+    expect(() => set?.(forgedInput, call, setContext)).toThrow();
+    await expect(set?.(input, call, { ...setContext, approval: null })).rejects.toThrow('SWARM_KILL_SWITCH_APPROVAL_REQUIRED');
+    await expect(set?.(input, call, setContext)).resolves.toMatchObject({ engaged: true, reason: input.reason, changedBy: actor });
+
+    const read = handlers.get('swarm.kill-switch.read');
+    const readContext = { ...setContext, capabilityId: 'swarm.kill-switch.read', permission: 'swarm:kill-switch:read', approval: null };
+    await expect(read?.({}, { ...call, capabilityId: readContext.capabilityId }, readContext)).resolves.toMatchObject({ engaged: true });
+    const list = handlers.get('swarm.runs.queue');
+    await expect(list?.({ limit: 5 }, { ...call, capabilityId: 'swarm.runs.queue' }, { ...readContext, capabilityId: 'swarm.runs.queue' })).resolves.toEqual([]);
+    expect(handlers.has('swarm.runs.enqueue')).toBe(false);
+    const releaseInput = { engaged: false, reason: null };
+    await expect(set?.(releaseInput, call, { ...setContext, approval: await approvalFor('swarm.kill-switch.set', releaseInput) })).resolves.toMatchObject({ engaged: false });
+  });
+
   it('commits queue row and immutable event atomically, enforces approval digest and idempotency', async () => {
     const prepared = await prepareApprovedRun('Review the exact commit and linked artifacts.');
     const admitted = await queue.enqueue(prepared, 'run-admission-1');
@@ -370,7 +403,7 @@ describe('durable SWARM admission and workspace kill switch', () => {
     const events = await scoped.query(scopeA, 'SELECT event_type,from_state,to_state FROM swarm_run_queue_events WHERE run_id=$1 ORDER BY created_at,id', [prepared.input.runId]);
     expect(events.rows).toEqual([{ event_type: 'queued', from_state: null, to_state: 'queued' }, { event_type: 'refused', from_state: 'queued', to_state: 'refused' }]);
     const killEvents = await scoped.query(scopeA, 'SELECT engaged,reason,changed_by FROM swarm_kill_switch_events WHERE workspace_id=$1', [workspaceA]);
-    expect(killEvents.rows).toEqual([{ engaged: true, reason: input.reason, changed_by: actor }]);
+    expect(killEvents.rows).toContainEqual({ engaged: true, reason: input.reason, changed_by: actor });
     await expect(db.query("UPDATE swarm_kill_switch_events SET reason='tampered' WHERE workspace_id=$1", [workspaceA])).rejects.toThrow(/append-only/);
   });
 
