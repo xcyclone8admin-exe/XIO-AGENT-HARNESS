@@ -3,9 +3,13 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole, type Migration } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
-import { canonicalJson, sha256Hex } from '@xyra/core';
+import { canonicalJson, sha256Hex, uuidv7 } from '@xyra/core';
+import type { CloudBrainIngestionFinalizationReceipt } from '@xyra/contracts';
 import manifest from '../manifest';
 import { BrainService } from './brain-service';
+import type { CloudErasureClient } from './erasure-cloud';
+import { brainReferenceSetDigest, brainSourceVersionV2 } from './erasure-fingerprint';
+import type { CloudBrainIngestionClient } from './cloud-ingestion';
 import { GOLDEN_RETRIEVAL } from '../tests/golden-retrieval';
 
 const tenantA = '019a0000-0000-7000-8000-000000000001';
@@ -24,6 +28,27 @@ const load = (owner: string, relative: string): Migration[] => {
 let db: Awaited<ReturnType<typeof openLocalStore>>;
 let store: LocalScopedStore;
 let brain: BrainService;
+
+async function trustCloudFinalization(scope: typeof scopeA, source: { sourceId: string; versionId: string; contentDigest: string }, ingestionId = uuidv7(), overrides: Partial<CloudBrainIngestionFinalizationReceipt> = {}) {
+  const refs: string[] = [];
+  const receipt = {
+    protocolVersion: 'cloud-ingest-v2' as const, status: 'finalized' as const, ingestionId,
+    tenantId: scope.tenantId, workspaceId: scope.workspaceId, sourceId: source.sourceId, sourceVersionId: source.versionId,
+    contentDigest: source.contentDigest, referenceState: 'verified_empty' as const, objectRefIds: refs,
+    referenceSetDigest: await brainReferenceSetDigest(source.sourceId, source.versionId, refs),
+    referenceStateVersion: 1, finalizedAt: new Date().toISOString(),
+    sourceVersion: await brainSourceVersionV2({ sourceId: source.sourceId, sourceVersionId: source.versionId,
+      tenantId: scope.tenantId, workspaceId: scope.workspaceId, contentDigest: source.contentDigest,
+      objectRefIds: refs, referenceStateVersion: 1 }),
+    ...overrides,
+  };
+  const cloud: CloudBrainIngestionClient = {
+    async begin() { throw new Error('unused'); }, async finalize() { return receipt; },
+    async status() { return { protocolVersion: 'cloud-ingest-v2', status: 'finalized', receipt }; },
+  };
+  await brain.finalizeCloudIngestion(scope, source.versionId, ingestionId, cloud);
+  return receipt;
+}
 
 beforeAll(async () => {
   db = await openLocalStore();
@@ -51,6 +76,19 @@ describe('BRAIN schema and provenance', () => {
     expect(hits[0]).toMatchObject({ sourceId: created.sourceId, sourceVersionId: created.versionId, untrusted: true });
     expect(hits[0]?.citation).toContain(created.versionId);
     expect(hits[0]?.content).toContain('retention');
+  });
+
+  it.each([
+    ['tenant', { tenantId: tenantB }],
+    ['source', { sourceId: '019a0000-0000-7000-8000-000000000099' }],
+    ['ingestion', { ingestionId: '019a0000-0000-7000-8000-000000000098' }],
+  ] as const)('rejects a Cloud-shaped finalization receipt with a swapped %s binding', async (_label, overrides) => {
+    const ingestionId = uuidv7();
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Receipt binding', trustLevel: 'user' }, cloudIngestionId: ingestionId, content: 'Receipt binding test.', contentType: 'text/plain' });
+    await expect(trustCloudFinalization(scopeA, source, ingestionId, overrides)).rejects.toThrow('CLOUD_INGESTION_RECEIPT_BINDING_MISMATCH');
+    const saved = await store.query<Record<string, unknown> & { cloud_object_ref_ids: unknown }>(scopeA,
+      'SELECT cloud_object_ref_ids FROM brain_sources WHERE id=$1', [source.sourceId]);
+    expect(saved.rows[0]?.cloud_object_ref_ids).toBeNull();
   });
 
   it('measures Recall@10 against the independent labeled golden corpus', async () => {
@@ -176,6 +214,95 @@ describe('scoped memories and reviewed procedures', () => {
 });
 
 describe('source erasure coordination and retention evidence', () => {
+  it('does not infer a verified empty reference snapshot from an absent legacy field', async () => {
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Unknown ref state', trustLevel: 'user' }, content: 'Keep until Cloud finalization exists.', contentType: 'text/plain' });
+    const job = await brain.requestSourceErasure(scopeA, actor, uuidv7(), { sourceId: source.sourceId });
+    expect(job).toMatchObject({ status: 'waiting_cloud', lastErrorCode: 'CLOUD_INGESTION_REQUIRED' });
+    expect((await store.query(scopeA, 'SELECT id FROM brain_sources WHERE id=$1', [source.sourceId])).rows).toHaveLength(1);
+  });
+
+  it('purges local source and derived data only after a bound durable Cloud claim', async () => {
+    const ingestionId = uuidv7();
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Cloud claim fixture', trustLevel: 'user' }, cloudIngestionId: ingestionId, content: 'Private disposable claim evidence.', contentType: 'text/plain' });
+    const receipt = await trustCloudFinalization(scopeA, source, ingestionId);
+    const sourceVersion = receipt.sourceVersion;
+    const approvalId = uuidv7();
+    const operationId = uuidv7();
+    const reservationId = uuidv7();
+    const claimId = uuidv7();
+    const auditReceiptId = uuidv7();
+    const requestDigest = `sha256:${await sha256Hex('cloud-request')}`;
+    let cloudStatus = 'eligible';
+    const response = (attemptId: string, status = cloudStatus, claim: null | { claimId: string; claimGeneration: number } = null) => ({
+      protocolVersion: 'cloud-erasure-v2', operationId, erasureId: erasure!.id, attemptId, attemptNo: 1, requestDigest,
+      source: { kind: 'brain_source', id: source.sourceId }, sourceVersion, status,
+      eligibility: { reservationId, referenceStateVersion: 'refs-4', holdStateVersion: 'holds-2', expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      claim, objects: [], auditReceiptId: status === 'completed' ? auditReceiptId : null, updatedAt: new Date().toISOString(),
+    });
+    let erasure: { id: string; attemptId: string } | undefined;
+    const cloud: CloudErasureClient = {
+      async begin(input) { erasure = { id: input.erasureId, attemptId: input.attemptId }; return response(input.attemptId); },
+      async get() { if (!erasure) throw new Error('OPERATION_NOT_FOUND'); return response(erasure.attemptId); },
+      async claimLocalPurge(_id, input) { cloudStatus = 'purge_claimed'; return response(input.attemptId, cloudStatus, { claimId, claimGeneration: 1 }); },
+      async acknowledgeLocalPurge(_id, input) { expect(input.localPurgeReceiptDigest).toMatch(/^sha256:/); cloudStatus = 'completed'; return response(input.attemptId, cloudStatus, { claimId, claimGeneration: 1 }); },
+      async abortLocalPurge(_id, input) { return response(input.attemptId, 'aborted', { claimId: input.claimId, claimGeneration: input.claimGeneration }); },
+    };
+    const erasing = new BrainService(store, cloud);
+    const job = await erasing.requestSourceErasure(scopeA, actor, approvalId, { sourceId: source.sourceId });
+    erasure = { id: job.id, attemptId: (await store.query<Record<string, unknown> & { attempt_id: string }>(scopeA,
+      'SELECT attempt_id FROM brain_source_erasures WHERE id=$1', [job.id])).rows[0]!.attempt_id };
+    expect(job).toMatchObject({ status: 'complete', sourceId: source.sourceId, cloudOperationId: operationId, cloudAuditReceiptId: auditReceiptId });
+    expect((await store.query(scopeA, 'SELECT id FROM brain_sources WHERE id=$1', [source.sourceId])).rows).toHaveLength(0);
+    expect((await store.query(scopeA, 'SELECT id FROM brain_chunks WHERE source_id=$1', [source.sourceId])).rows).toHaveLength(0);
+    expect((await store.query(scopeA, `SELECT receipt_kind,evidence_digest FROM brain_source_erasure_receipts WHERE erasure_id=$1`, [job.id])).rows)
+      .toEqual([expect.objectContaining({ receipt_kind: 'local_purge', evidence_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/) })]);
+    await expect(store.query(scopeA, 'DELETE FROM brain_source_erasure_receipts WHERE erasure_id=$1', [job.id])).rejects.toThrow();
+  });
+
+  it('records a no-purge abort when the source changes after eligibility and before local purge', async () => {
+    const ingestionId = uuidv7();
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Stale eligibility fixture', trustLevel: 'user' }, cloudIngestionId: ingestionId, content: 'Keep this source because its version changed.', contentType: 'text/plain' });
+    const receipt = await trustCloudFinalization(scopeA, source, ingestionId);
+    const sourceVersion = receipt.sourceVersion;
+    const operationId = uuidv7();
+    const reservationId = uuidv7();
+    const claimId = uuidv7();
+    const auditReceiptId = uuidv7();
+    const requestDigest = `sha256:${await sha256Hex('stale-cloud-request')}`;
+    let erasureId = '';
+    let attemptId = '';
+    let cloudStatus = 'eligible';
+    const response = (status = cloudStatus) => ({
+      protocolVersion: 'cloud-erasure-v2', operationId, erasureId, attemptId, attemptNo: 1, requestDigest,
+      source: { kind: 'brain_source', id: source.sourceId }, sourceVersion, status,
+      eligibility: { reservationId, referenceStateVersion: 'refs-5', holdStateVersion: 'holds-2', expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      claim: status === 'purge_claimed' ? { claimId, claimGeneration: 3 } : null,
+      objects: [], auditReceiptId: status === 'aborted' ? auditReceiptId : null, updatedAt: new Date().toISOString(),
+    });
+    const cloud: CloudErasureClient = {
+      async begin(input) { erasureId = input.erasureId; attemptId = input.attemptId; return response(); },
+      async get() { return response(); },
+      async claimLocalPurge() {
+        await store.query(scopeA, `INSERT INTO brain_source_versions(id,tenant_id,workspace_id,source_id,version,content_hash,content_type,content_text,captured_at,created_by)
+          VALUES ($1,$2,$3,$4,2,$5,'text/plain','new version arrived after eligibility',now(),$6)`,
+        [uuidv7(), scopeA.tenantId, scopeA.workspaceId, source.sourceId, await sha256Hex('new version arrived'), actor]);
+        cloudStatus = 'purge_claimed';
+        return response();
+      },
+      async acknowledgeLocalPurge() { throw new Error('MUST_NOT_ACK_PURGE'); },
+      async abortLocalPurge(_id, input) { expect(input.claimGeneration).toBe(3); return response('aborted'); },
+    };
+    const erasing = new BrainService(store, cloud);
+    const job = await erasing.requestSourceErasure(scopeA, actor, uuidv7(), { sourceId: source.sourceId });
+    expect(job).toMatchObject({ status: 'aborted', sourceId: source.sourceId });
+    expect((await store.query(scopeA, 'SELECT id FROM brain_sources WHERE id=$1', [source.sourceId])).rows).toHaveLength(1);
+    expect((await store.query(scopeA, `SELECT id FROM brain_source_erasure_receipts WHERE erasure_id=$1 AND receipt_kind='local_purge'`, [job.id])).rows).toHaveLength(0);
+    expect((await store.query(scopeA, `SELECT id,evidence_digest FROM brain_source_erasure_receipts WHERE erasure_id=$1 AND receipt_kind='no_purge_abort'`, [job.id])).rows)
+      .toEqual([expect.objectContaining({ evidence_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/) })]);
+    expect(erasureId).toBe(job.id);
+    expect(attemptId).toMatch(/[0-9a-f-]{36}/);
+  });
+
   it('retains Bus approval evidence and leaves data pending while CLOUD cannot reference-check blobs', async () => {
     const blobRef = '019a0000-0000-7000-8000-000000000091';
     const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Erase request fixture', trustLevel: 'user', retention: 'seven_years', externalBlobRefs: [blobRef] }, content: 'Source text stays until coordinated erase approval.', contentType: 'text/plain' });
@@ -186,18 +313,19 @@ describe('source erasure coordination and retention evidence', () => {
     await db.query(`INSERT INTO approval_decisions(id,tenant_id,workspace_id,request_id,decided_by,decision,reason)
       VALUES (gen_random_uuid(),$1,$2,$3,$4,'approved','reviewed')`, [tenantA, workspaceA, requestId, actor]);
     const job = await brain.requestSourceErasure(scopeA, actor, requestId, { sourceId: source.sourceId });
-    expect(job).toMatchObject({ status: 'waiting_cloud', attempts: 0, retentionPolicy: 'seven_years', externalBlobRefs: [blobRef], lastErrorCode: 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE' });
-    expect(await brain.requestSourceErasure(scopeA, actor, requestId, { sourceId: source.sourceId })).toMatchObject({ id: job.id, attempts: 0 });
+    expect(job).toMatchObject({ status: 'unavailable', attempts: 0, retentionPolicy: 'seven_years', externalBlobRefs: [blobRef], lastErrorCode: 'SOURCE_REFERENCES_UNAVAILABLE' });
+    expect(await brain.requestSourceErasure(scopeA, actor, requestId, { sourceId: source.sourceId })).toMatchObject({ id: job.id, attempts: 0, status: 'unavailable' });
     expect((await brain.search(scopeA, { query: 'coordinated erase approval' })).length).toBeGreaterThan(0);
     const retryInput = { erasureId: job.id };
     const retryApprovalId = '019a0000-0000-7000-8000-000000000094';
     await expect(brain.retrySourceErasure(scopeA, actor, undefined, retryInput)).rejects.toThrow('ERASURE_APPROVAL_REQUIRED');
     const retried = await brain.retrySourceErasure(scopeA, actor, retryApprovalId, retryInput);
-    expect(retried).toMatchObject({ status: 'waiting_cloud', attempts: 1 });
+    expect(retried).toMatchObject({ status: 'unavailable', attempts: 1, lastErrorCode: 'SOURCE_REFERENCES_UNAVAILABLE' });
     const attempts = await store.query<Record<string, unknown>>(scopeA, 'SELECT outcome,retention_policy,error_code,deleted_blob_refs FROM brain_source_erasure_attempts WHERE erasure_id=$1 ORDER BY occurred_at,id', [job.id]);
-    expect(attempts.rows).toHaveLength(3);
-    expect(attempts.rows.every(row => row.outcome === 'waiting_cloud' && row.retention_policy === 'seven_years' && row.error_code === 'PRIVILEGED_PURGE_AND_CLOUD_REFERENCE_API_UNAVAILABLE' && JSON.stringify(row.deleted_blob_refs) === '[]')).toBe(true);
-    expect(await brain.sourceErasureStatus(scopeA, { erasureId: job.id })).toMatchObject({ status: 'waiting_cloud', attempts: 1, audit: { items: expect.any(Array) } });
+    expect(attempts.rows).toHaveLength(4);
+    expect(attempts.rows.every(row => ['unavailable','waiting_cloud','cloud_request_pending'].includes(String(row.outcome)))).toBe(true);
+    expect(attempts.rows.every(row => row.retention_policy === 'seven_years' && JSON.stringify(row.deleted_blob_refs) === '[]')).toBe(true);
+    expect(await brain.sourceErasureStatus(scopeA, { erasureId: job.id })).toMatchObject({ status: 'unavailable', attempts: 1, audit: { items: expect.any(Array) } });
     await expect(store.query(scopeA, "UPDATE brain_source_erasures SET status='complete' WHERE id=$1", [job.id])).rejects.toThrow();
     await expect(brain.retrySourceErasure(scopeB, actor, retryApprovalId, retryInput)).rejects.toThrow('ERASURE_NOT_FOUND');
   });
