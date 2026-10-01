@@ -23,6 +23,7 @@ import { runScheduledMaintenance } from './cron';
 import { drainSyncOutbox } from './sync-outbox';
 import {
   blobReferenceSnapshotDigest,
+  CloudIngestionBeginResult,
   CloudIngestionFinalizeRequest,
   CloudIngestionFinalizationReceipt,
   CloudIngestionStatus,
@@ -612,9 +613,9 @@ app.post('/v2/brain/ingestions', async (c) => {
       });
     if (!result) return c.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
     if ('error' in result) return c.json({ code: result.error }, result.error === 'INGESTION_STORAGE_UNAVAILABLE' ? 503 : 409);
-    return c.json({ protocolVersion: 'cloud-ingest-v2', ingestionId: result.ingestionId,
+    return c.json(CloudIngestionBeginResult.parse({ protocolVersion: 'cloud-ingest-v2', ingestionId: result.ingestionId,
       tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId,
-      sourceId: parsed.data.sourceId, mode: result.mode, startedAt: result.startedAt });
+      sourceId: parsed.data.sourceId, mode: result.mode, startedAt: result.startedAt }));
   } catch {
     return c.json({ code: 'INGESTION_STORAGE_UNAVAILABLE' }, 503);
   }
@@ -981,7 +982,9 @@ app.post('/v1/blobs/ref', async (c) => {
     { key, principalId: current.claims.principalId, mode, expiresAtMs, ...(ingestionId ? { ingestionId } : {}) },
     c.env.BLOB_ACCESS_SECRET,
   );
-  return c.json({ key, mode, expiresAtMs, url: `/v1/blobs/access/${token}`,
+  // The storage key is an internal locator. Callers need only the opaque reference ID
+  // (when durably registered) and the signed relative access path.
+  return c.json({ mode, expiresAtMs, url: `/v1/blobs/access/${token}`,
     ...(mode === 'PUT' ? { objectRefId, referenceStatus: objectRefId ? (ingestionId ? 'tracked' : 'registration_required') : 'references_unknown' } : {}) });
 });
 

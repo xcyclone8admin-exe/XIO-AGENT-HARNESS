@@ -1,5 +1,10 @@
 import { z } from 'zod';
 import {
+  CloudBrainIngestionBeginRequest as SharedIngestionBeginRequest,
+  CloudBrainIngestionBeginResult as SharedIngestionBeginResult,
+  CloudBrainIngestionFinalizeRequest as SharedIngestionFinalizeRequest,
+  CloudBrainIngestionFinalizationReceipt as SharedIngestionFinalizationReceipt,
+  CloudBrainIngestionStatus as SharedIngestionStatus,
   hashApprovalInput,
   hashApprovalScope,
   VerifiedCapabilityApproval,
@@ -48,54 +53,15 @@ export const AbortErasureRequest = z.object({
   abortReceiptDigest: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
 
-export const CloudIngestionStartRequest = z.object({
-  protocolVersion: z.literal('cloud-ingest-v2'),
-  sourceId: z.uuid().transform((id) => id.toLowerCase()),
-  mode: z.enum(['with_objects', 'text_only']),
-}).strict();
-
-export const CloudIngestionFinalizeRequest = z.object({
-  protocolVersion: z.literal('cloud-ingest-v2'),
-  sourceVersionId: z.uuid().transform((id) => id.toLowerCase()),
-  contentDigest: z.string().regex(/^[0-9a-f]{64}$/),
-}).strict();
-
-export const CloudIngestionFinalizationReceipt = z.object({
-  protocolVersion: z.literal('cloud-ingest-v2'),
-  ingestionId: z.uuid(),
-  tenantId: z.uuid(),
-  workspaceId: z.uuid(),
-  sourceId: z.uuid(),
-  sourceVersionId: z.uuid(),
-  contentDigest: z.string().regex(/^[0-9a-f]{64}$/),
-  sourceVersion: z.string().regex(/^cloud-ingest-v2:sha256:[0-9a-f]{64}$/),
-  referenceState: z.enum(['verified_empty', 'verified_nonempty']),
-  objectRefIds: z.array(z.uuid()),
-  referenceSetDigest: z.string().regex(/^[0-9a-f]{64}$/),
-  referenceStateVersion: z.number().int().positive(),
-  finalizedAt: z.string().datetime(),
-  status: z.literal('finalized'),
-}).strict().superRefine((receipt, ctx) => {
-  const normalized = receipt.objectRefIds.map((id) => id.toLowerCase());
-  if (normalized.some((id, index) => id !== receipt.objectRefIds[index]) ||
-      new Set(normalized).size !== normalized.length ||
-      normalized.some((id, index) => index > 0 && normalized[index - 1]! > id)) {
-    ctx.addIssue({ code: 'custom', message: 'objectRefIds must be sorted, unique, lowercase UUIDs', path: ['objectRefIds'] });
-  }
-  if ((receipt.referenceState === 'verified_empty') !== (receipt.objectRefIds.length === 0)) {
-    ctx.addIssue({ code: 'custom', message: 'referenceState must match objectRefIds', path: ['referenceState'] });
-  }
-});
-
-export const CloudIngestionStatus = z.discriminatedUnion('status', [
-  z.object({ protocolVersion: z.literal('cloud-ingest-v2'), status: z.literal('pending'), ingestionId: z.uuid(),
-    sourceId: z.uuid(), tenantId: z.uuid(), workspaceId: z.uuid(), mode: z.enum(['with_objects','text_only']),
-    startedAt: z.string().datetime() }).strict(),
-  z.object({ protocolVersion: z.literal('cloud-ingest-v2'), status: z.literal('finalized'),
-    receipt: CloudIngestionFinalizationReceipt }).strict(),
-  z.object({ protocolVersion: z.literal('cloud-ingest-v2'), status: z.literal('invalidated'), ingestionId: z.uuid(),
-    sourceId: z.uuid(), sourceVersionId: z.uuid(), invalidatedAt: z.string().datetime() }).strict(),
-]);
+export const CloudIngestionStartRequest = SharedIngestionBeginRequest.transform((request) => ({
+  ...request, sourceId: request.sourceId.toLowerCase(),
+}));
+export const CloudIngestionBeginResult = SharedIngestionBeginResult;
+export const CloudIngestionFinalizeRequest = SharedIngestionFinalizeRequest.transform((request) => ({
+  ...request, sourceVersionId: request.sourceVersionId.toLowerCase(),
+}));
+export const CloudIngestionFinalizationReceipt = SharedIngestionFinalizationReceipt;
+export const CloudIngestionStatus = SharedIngestionStatus;
 
 export type ErasureStatus =
   | 'eligible'

@@ -736,6 +736,9 @@ describe('blob references on workerd', () => {
     expect((await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 301 })).status).toBe(403);
     const put = await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 120 });
     expect(put.status).toBe(200);
+    expect(put.json).not.toHaveProperty('key');
+    expect(put.json).toMatchObject({ mode: 'PUT', referenceStatus: 'references_unknown' });
+    expect(put.json?.['url']).toMatch(/^\/v1\/blobs\/access\/[A-Za-z0-9_.-]+$/);
     const url = `${URL_BASE}${put.json?.['url']}`;
     const stream = new ReadableStream({
       start(controller) {
@@ -762,6 +765,8 @@ describe('blob references on workerd', () => {
       ).status,
     ).toBe(204);
     const get = await ref(token, { mode: 'GET', name: 'a.txt', expiresInSec: 120 });
+    expect(get.json).not.toHaveProperty('key');
+    expect(get.json?.['url']).toMatch(/^\/v1\/blobs\/access\/[A-Za-z0-9_.-]+$/);
     const read = await mf.dispatchFetch(`${URL_BASE}${get.json?.['url']}`);
     expect(await read.text()).toBe('hello blob');
     await setKill(true);
