@@ -2,8 +2,9 @@ import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, SourceIngestRequest, SourceRecordCreate, SpecDocument, TicketState } from '../contracts';
+import { ApprovalRecord, ContextCandidate, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
+import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
 
 export interface ForgeActor { readonly id: string; readonly tenantId: string; readonly workspaceId: string }
@@ -75,6 +76,42 @@ export class ForgeRepository {
     const row = rows[0]; if (!row) throw new Error('FORGE_SOURCE_INGEST_FAILED');
     return { id: row.id, label: row.label, locator: row.locator, authority: row.authority, status: row.status, sha256: row.sha256, createdAt: timestamp(row.created_at) };
   }
+  async compileTicketContext(actor: ForgeActor, raw: unknown) {
+    const input = z.object({ ticketId: z.string().uuid(), budgetTokens: z.number().int().min(9).max(100_000).default(8000), sourceIds: z.array(z.string().uuid()).max(20).default([]) }).parse(raw);
+    const { rows: tickets } = await this.store.query<Record<string, unknown> & { id: string; project_id: string; title: string; description: string; dependencies: unknown; requirement_refs: unknown; acceptance_criteria: unknown }>(this.scope(actor), "SELECT id,project_id,title,description,dependencies,requirement_refs,acceptance_criteria FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND kind IN ('ticket','subtask')", [actor.tenantId, actor.workspaceId, input.ticketId]);
+    const ticket = tickets[0]; if (!ticket) throw new Error('FORGE_CONTEXT_TICKET_NOT_FOUND');
+    const { rows: projects } = await this.store.query<Record<string, unknown> & { name: string; description: string; requirements: unknown }>(this.scope(actor), 'SELECT name,description,requirements FROM forge_projects WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, ticket.project_id]);
+    const project = projects[0]; if (!project) throw new Error('FORGE_CONTEXT_PROJECT_NOT_FOUND');
+    const dependencies = Array.isArray(ticket.dependencies) ? ticket.dependencies as string[] : [];
+    const allNodes = await this.nodes(actor, ticket.project_id);
+    const dependencyNodes = allNodes.filter((node) => dependencies.includes(node.id));
+    const requirements = [...(Array.isArray(project.requirements) ? project.requirements as { id: string; statement: string }[] : []), ...(Array.isArray(ticket.requirement_refs) ? ticket.requirement_refs as { id: string; statement: string }[] : [])];
+    const accepted = Array.isArray(ticket.acceptance_criteria) ? ticket.acceptance_criteria as string[] : [];
+    const { rows: selectedSources } = await this.store.query<Record<string, unknown> & { id: string; label: string; locator: string; authority: string; status: string; sha256: string; content: string | null }>(this.scope(actor), 'SELECT id,label,locator,authority,status,sha256,content FROM forge_sources WHERE tenant_id=$1 AND workspace_id=$2 ORDER BY created_at DESC', [actor.tenantId, actor.workspaceId]);
+    const sources = selectedSources.filter((source) => input.sourceIds.includes(source.id));
+    if (sources.length !== input.sourceIds.length) throw new Error('FORGE_CONTEXT_SOURCE_NOT_FOUND_IN_WORKSPACE');
+    const projectSpecs = await this.specs(actor, ticket.project_id);
+    const architecture = projectSpecs.find((spec) => spec.template === 'architecture' && spec.status === 'approved');
+    const approvedDecisions = await this.store.query<Record<string, unknown> & { spec_id: string; version: number; detail: string }>(this.scope(actor), "SELECT spec_id,version,detail FROM forge_spec_events WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 AND action='approve' ORDER BY created_at DESC", [actor.tenantId, actor.workspaceId, ticket.project_id]);
+    const { rows: evidenceRows } = await this.store.query<Record<string, unknown> & { id: string; requirement_id: string; kind: string; result: string; source: string }>(this.scope(actor), 'SELECT e.id,e.requirement_id,e.kind,e.result,e.source FROM forge_node_evidence ne JOIN forge_evidence e ON e.tenant_id=ne.tenant_id AND e.workspace_id=ne.workspace_id AND e.id=ne.evidence_id WHERE ne.tenant_id=$1 AND ne.workspace_id=$2 AND ne.ticket_id=$3 ORDER BY e.created_at DESC', [actor.tenantId, actor.workspaceId, input.ticketId]);
+    const candidate = (id: string, type: 'objective'|'requirement'|'architecture'|'decision'|'dependency'|'source'|'constraint'|'acceptance'|'prior-evidence', text: string, source: string, authority: 'user'|'contract'|'architecture'|'system'|'reference', status: string, relevance = 1) => ContextCandidate.parse({ id, type, text: text.slice(0, 100_000), source, authority, status, dependencyIds: [], relevance, estimatedTokens: Math.max(1, Math.ceil(text.length / 4)) });
+    const candidates = [
+      candidate(`objective:${ticket.id}`, 'objective', `${project.name}\n${project.description || ''}\n${ticket.title}\n${ticket.description}`, 'forge project and ticket', 'user', 'current'),
+      ...(requirements.length ? requirements.map((item, index) => candidate(`requirement:${index}:${item.id}`, 'requirement', `${item.id}: ${item.statement}`, 'forge project/ticket requirements', 'contract', 'current')) : [candidate(`requirement:none:${ticket.id}`, 'requirement', 'No requirement references recorded for this project or ticket.', 'forge hierarchy', 'reference', 'missing')]),
+      candidate(`architecture:${ticket.project_id}`, 'architecture', architecture?.body ?? 'No approved architecture specification is recorded for this project.', 'forge approved specification corpus', architecture?.authority ?? 'reference', architecture ? 'approved' : 'missing'),
+      candidate(`decision:${ticket.project_id}`, 'decision', approvedDecisions.rows.map((item) => `${item.spec_id} v${item.version}: ${item.detail}`).join('\n') || 'No approved specification decision events are recorded.', 'forge specification lifecycle events', 'user', approvedDecisions.rows.length ? 'approved' : 'missing'),
+      candidate(`dependency:${ticket.id}`, 'dependency', dependencyNodes.map((node) => `${node.id}: ${node.title} (${node.state})`).join('\n') || 'No ticket dependencies are recorded.', 'forge hierarchy dependencies', 'user', dependencies.length ? 'current' : 'none'),
+      ...(sources.length ? sources.map((source) => candidate(`source:${source.id}`, 'source', `${source.label} (${source.locator}) SHA-256 ${source.sha256}\n${source.content ?? 'No local text was ingested for this provenance record.'}`, `forge source ${source.id}`, 'user', source.status, 0.8)) : [candidate(`source:none:${ticket.id}`, 'source', 'No local source records selected for this context.', 'forge source corpus', 'reference', 'none', 0.1)]),
+      candidate('constraint:c1', 'constraint', 'C1: Forge may plan, review and record evidence. Host process execution, network egress, deploy and staging/main promotion are disabled.', 'XYRA execution boundary', 'system', 'enforced'),
+      candidate(`acceptance:${ticket.id}`, 'acceptance', accepted.join('\n') || 'No acceptance criteria recorded for this ticket.', 'forge ticket acceptance criteria', 'user', accepted.length ? 'current' : 'missing'),
+      candidate(`prior-evidence:${ticket.id}`, 'prior-evidence', evidenceRows.map((item) => `${item.requirement_id} ${item.kind} ${item.result}: ${item.source} [${item.id}]`).join('\n') || 'No linked prior evidence is recorded for this ticket.', 'forge ticket evidence links', 'reference', evidenceRows.length ? 'recorded' : 'none'),
+    ];
+    const manifest = compileContext(input.ticketId, candidates, input.budgetTokens);
+    const id = uuidv7();
+    const digest = createHash('sha256').update(JSON.stringify(manifest)).digest('hex');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_context_manifests(id,tenant_id,workspace_id,ticket_id,budget_tokens,used_tokens,items,omitted_ids,manifest_sha256,created_by) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10) RETURNING id', [id, actor.tenantId, actor.workspaceId, input.ticketId, manifest.budgetTokens, manifest.usedTokens, json(manifest.items), json(manifest.omittedIds), digest, actor.id]);
+    return PersistedContextManifest.parse({ ...manifest, id: rows[0]?.id, manifestSha256: digest });
+  }
   async saveSpecs(actor: ForgeActor, projectId: string, rawDocuments: unknown) {
     const documents = z.array(SpecDocument).min(1).max(12).parse(rawDocuments);
     const project = await this.store.query(this.scope(actor), 'SELECT id FROM forge_projects WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, projectId]);
@@ -93,7 +130,27 @@ export class ForgeRepository {
   }
   async specs(actor: ForgeActor, projectId: string) {
     const { rows } = await this.store.query<Record<string, unknown> & { id: string; template: string; version: number; title: string; status: string; authority: string; dependencies: unknown; supersedes: unknown; requirement_ids: unknown; frontmatter: unknown; body: string; content_sha256: string }>(this.scope(actor), 'SELECT spec_id AS id,template,version,title,status,authority,dependencies,supersedes,requirement_ids,frontmatter,body,content_sha256 FROM forge_spec_versions WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 ORDER BY spec_id,version DESC', [actor.tenantId, actor.workspaceId, projectId]);
-    return rows.map((row) => SpecDocument.parse({ id: row.id, template: row.template, version: row.version, title: row.title, status: row.status, authority: row.authority, dependencies: row.dependencies, supersedes: row.supersedes, requirementIds: row.requirement_ids, frontmatter: row.frontmatter, body: row.body, contentHash: row.content_sha256 }));
+    const { rows: events } = await this.store.query<Record<string, unknown> & { spec_id: string; version: number; action: 'approve' | 'supersede' }>(this.scope(actor), 'SELECT DISTINCT ON(spec_id,version) spec_id,version,action FROM forge_spec_events WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 ORDER BY spec_id,version,created_at DESC,id DESC', [actor.tenantId, actor.workspaceId, projectId]);
+    const latest = new Map(events.map((event) => [`${event.spec_id}:${event.version}`, event.action === 'approve' ? 'approved' : 'superseded']));
+    return rows.map((row) => SpecDocument.parse({ id: row.id, template: row.template, version: row.version, title: row.title, status: latest.get(`${row.id}:${row.version}`) ?? row.status, authority: row.authority, dependencies: row.dependencies, supersedes: row.supersedes, requirementIds: row.requirement_ids, frontmatter: row.frontmatter, body: row.body, contentHash: row.content_sha256 }));
+  }
+  async transitionSpec(actor: ForgeActor, raw: unknown) {
+    const input = SpecLifecycleCommand.parse(raw);
+    const { rows: approvals } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), `SELECT a.id FROM forge_approvals a JOIN forge_approval_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.approval_id=a.id JOIN forge_nodes n ON n.tenant_id=a.tenant_id AND n.workspace_id=a.workspace_id AND n.id=a.epic_id WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.id=$3 AND n.project_id=$4 AND d.decision='approved' AND a.expires_at>now()`, [actor.tenantId, actor.workspaceId, input.approvalId, input.projectId]);
+    if (!approvals.length) throw new Error('FORGE_SPEC_APPROVED_PROJECT_SCOPE_REQUIRED');
+    const target = await this.store.query(this.scope(actor), 'SELECT 1 FROM forge_spec_versions WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 AND spec_id=$4 AND version=$5', [actor.tenantId, actor.workspaceId, input.projectId, input.specId, input.version]);
+    if (!target.rows.length) throw new Error('FORGE_SPEC_VERSION_NOT_FOUND');
+    const latest = await this.store.query<Record<string, unknown> & { action: string }>(this.scope(actor), 'SELECT action FROM forge_spec_events WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 AND spec_id=$4 AND version=$5 ORDER BY created_at DESC,id DESC LIMIT 1', [actor.tenantId, actor.workspaceId, input.projectId, input.specId, input.version]);
+    if (input.action === 'approve' && latest.rows[0]?.action) throw new Error('FORGE_SPEC_VERSION_ALREADY_FINALIZED');
+    if (input.action === 'supersede') {
+      if (input.supersededBySpecId === input.specId && input.supersededByVersion === input.version) throw new Error('FORGE_SPEC_CANNOT_SUPERSEDE_ITSELF');
+      const replacement = await this.store.query(this.scope(actor), `SELECT 1 FROM forge_spec_versions v WHERE v.tenant_id=$1 AND v.workspace_id=$2 AND v.project_id=$3 AND v.spec_id=$4 AND v.version=$5 AND EXISTS (SELECT 1 FROM forge_spec_events e WHERE e.tenant_id=v.tenant_id AND e.workspace_id=v.workspace_id AND e.project_id=v.project_id AND e.spec_id=v.spec_id AND e.version=v.version AND e.action='approve')`, [actor.tenantId, actor.workspaceId, input.projectId, input.supersededBySpecId, input.supersededByVersion]);
+      if (!replacement.rows.length) throw new Error('FORGE_SPEC_REPLACEMENT_MUST_BE_APPROVED');
+      if (latest.rows[0]?.action !== 'approve') throw new Error('FORGE_SPEC_MUST_BE_APPROVED_BEFORE_SUPERSESSION');
+    }
+    const { rows } = await this.store.query<Record<string, unknown> & { project_id: string; spec_id: string; version: number; action: 'approve'|'supersede'; approval_id: string; created_by: string; detail: string; superseded_by_spec_id: string | null; superseded_by_version: number | null; created_at: string }>(this.scope(actor), 'INSERT INTO forge_spec_events(id,tenant_id,workspace_id,project_id,spec_id,version,action,approval_id,detail,superseded_by_spec_id,superseded_by_version,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING project_id,spec_id,version,action,approval_id,created_by,detail,superseded_by_spec_id,superseded_by_version,created_at', [uuidv7(), actor.tenantId, actor.workspaceId, input.projectId, input.specId, input.version, input.action, input.approvalId, input.detail, input.supersededBySpecId ?? null, input.supersededByVersion ?? null, actor.id]);
+    const row = rows[0]; if (!row) throw new Error('FORGE_SPEC_EVENT_CREATE_FAILED');
+    return SpecLifecycleEvent.parse({ projectId: row.project_id, specId: row.spec_id, version: row.version, action: row.action, approvalId: row.approval_id, actorId: row.created_by, detail: row.detail, supersededBySpecId: row.superseded_by_spec_id, supersededByVersion: row.superseded_by_version, createdAt: timestamp(row.created_at) });
   }
   async startCouncil(actor: ForgeActor, raw: unknown) {
     const request = z.object({ projectId: z.string().uuid(), targetId: z.string().uuid(), targetKind: z.enum(['project','epic','spec','plan','wave','ticket','subtask']) }).parse(raw);

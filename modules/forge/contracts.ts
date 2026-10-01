@@ -34,6 +34,11 @@ export const SpecDocument = z.object({
   body: z.string().min(1).max(100_000), contentHash: z.string().length(64),
 });
 export type SpecDocument = z.infer<typeof SpecDocument>;
+export const SpecLifecycleCommand = z.object({ projectId: UUID, specId: z.string().regex(/^spec_[a-z0-9][a-z0-9-]{2,120}$/), version: z.number().int().positive(), approvalId: UUID, action: z.enum(['approve', 'supersede']), supersededBySpecId: z.string().regex(/^spec_[a-z0-9][a-z0-9-]{2,120}$/).optional(), supersededByVersion: z.number().int().positive().optional(), detail: z.string().min(1).max(4000) }).superRefine((value, ctx) => {
+  if (value.action === 'supersede' && (!value.supersededBySpecId || !value.supersededByVersion)) ctx.addIssue({ code: 'custom', message: 'Supersession must identify its replacement version' });
+  if (value.action === 'approve' && (value.supersededBySpecId || value.supersededByVersion)) ctx.addIssue({ code: 'custom', message: 'Approval cannot include a replacement version' });
+});
+export const SpecLifecycleEvent = z.object({ projectId: UUID, specId: z.string(), version: z.number().int().positive(), action: z.enum(['approve', 'supersede']), approvalId: UUID, actorId: UUID, detail: z.string(), supersededBySpecId: z.string().nullable(), supersededByVersion: z.number().int().positive().nullable(), createdAt: z.iso.datetime({ offset: true }) });
 
 export const SPEC_TEMPLATES = [
   'product-brief', 'requirements', 'architecture', 'data-model', 'api-contract', 'security-threat-model',
@@ -53,6 +58,8 @@ export const SourceRecord = z.object({ id: UUID, label: z.string().min(1).max(30
 export const SourceRecordCreate = SourceRecord.pick({ label: true, locator: true, sha256: true });
 export const SourceIngestRequest = z.object({ label: z.string().min(1).max(300), locator: z.string().min(1).max(1000), content: z.string().min(1).max(1_000_000) });
 export const ContextManifest = z.object({ ticketId: UUID, budgetTokens: z.number().int().min(9).max(100_000), usedTokens: z.number().int().nonnegative(), items: z.array(ContextCandidate), omittedIds: z.array(z.string()), compiledAt: z.iso.datetime({ offset: true }) });
+export const CompileTicketContextRequest = z.object({ ticketId: UUID, budgetTokens: z.number().int().min(9).max(100_000).default(8000), sourceIds: z.array(UUID).max(20).default([]) });
+export const PersistedContextManifest = ContextManifest.extend({ id: UUID, manifestSha256: z.string().regex(/^[0-9a-f]{64}$/) });
 
 export const SchedulerConfig = z.object({ maxConcurrency: z.number().int().min(1).max(2), maxBudgetUsd: z.number().nonnegative(), resourceLocks: z.array(z.string().min(1)).max(100), substrateVerified: z.boolean(), externalAdaptersEnabled: z.boolean() }).superRefine((config, ctx) => {
   if (config.substrateVerified || config.externalAdaptersEnabled) ctx.addIssue({ code: 'custom', message: 'C1 keeps execution substrate and external adapters disabled' });
@@ -117,6 +124,7 @@ export const forgeCapabilities = {
   sources: defineCapability({ id: 'forge.sources.list', title: 'List source provenance', description: 'List source provenance in the authenticated workspace', kind: 'read', permission: 'forge:project:read', input: z.object({}), output: z.array(SourceRecord) }),
   createSource: defineCapability({ id: 'forge.sources.create', title: 'Register source provenance', description: 'Append source provenance metadata', kind: 'write', permission: 'forge:project:write', input: SourceRecordCreate, output: SourceRecord }),
   ingestSource: defineCapability({ id: 'forge.sources.ingest', title: 'Ingest local source text', description: 'Hash and store user-supplied local text without network fetching', kind: 'write', permission: 'forge:project:write', input: SourceIngestRequest, output: SourceRecord }),
+  compileTicketContext: defineCapability({ id: 'forge.context.compile', title: 'Compile ticket evidence and local sources', description: 'Compile workspace-scoped context candidates into a durable hard-token-bounded manifest', kind: 'write', permission: 'forge:evidence:append', input: CompileTicketContextRequest, output: PersistedContextManifest }),
   schedules: defineCapability({ id: 'forge.schedules.list', title: 'List schedule simulations', description: 'List durable bounded scheduler plans', kind: 'read', permission: 'forge:run:read', input: z.object({}), output: z.array(ForgeSchedule) }),
   runs: defineCapability({ id: 'forge.runs.list', title: 'List simulated ticket runs', description: 'List immutable simulation events; no process executes', kind: 'read', permission: 'forge:run:read', input: z.object({}), output: z.array(ForgeRunEvent) }),
   cancelSchedule: defineCapability({ id: 'forge.schedules.cancel', title: 'Cancel queued schedule plan', description: 'Cancel a queued plan and append canceled ticket events without running processes', kind: 'write', permission: 'forge:run:cancel', input: CancelScheduleRequest, output: ForgeSchedule }),
@@ -126,6 +134,7 @@ export const forgeCapabilities = {
   gateMatrix: defineCapability({ id: 'forge.gates.matrix', title: 'Build evidence gate matrix', description: 'Derive deterministic gates from requirement risk and stored evidence', kind: 'read', permission: 'forge:gate:read', input: GateMatrixRequest, output: GateMatrixResult }),
   promotionList: defineCapability({ id: 'forge.promotions.list', title: 'List promotion proposals', description: 'List immutable local promotion proposal records', kind: 'read', permission: 'forge:gate:read', input: z.object({}), output: z.array(Promotion) }),
   specs: defineCapability({ id: 'forge.specs.list', title: 'List specification versions', description: 'List immutable scoped specification versions', kind: 'read', permission: 'forge:project:read', input: z.object({ projectId: UUID }), output: z.array(SpecDocument) }),
+  specLifecycle: defineCapability({ id: 'forge.specs.lifecycle', title: 'Approve or supersede a specification version', description: 'Append an immutable lifecycle event backed by an approved project-scope approval', kind: 'write', permission: 'forge:plan:approve', input: SpecLifecycleCommand, output: SpecLifecycleEvent }),
   saveSpecs: defineCapability({ id: 'forge.specs.save', title: 'Save compiled specification versions', description: 'Persist append-only draft specification versions and supersession references', kind: 'write', permission: 'forge:project:write', input: z.object({ projectId: UUID, documents: z.array(SpecDocument).min(1).max(12) }), output: z.array(SpecDocument) }),
   compileSpecs: defineCapability({ id: 'forge.specs.compile', title: 'Compile and save specification corpus', description: 'Compile twelve deterministic draft templates and persist immutable versions', kind: 'write', permission: 'forge:project:write', input: z.object({ projectId: UUID, title: z.string().min(1).max(300), requirements: z.array(RequirementRef).max(500), dependencies: z.array(z.string()).max(100).default([]), supersedes: z.array(z.string()).max(100).default([]) }), output: z.array(SpecDocument) }),
   startCouncil: defineCapability({ id: 'forge.councils.start', title: 'Start nine-role review council', description: 'Persist nine scoped role assignments without launching agents', kind: 'write', permission: 'forge:review:append', input: CouncilStartRequest, output: ReviewCouncil }),
