@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  NativeCloudTransport,
-  type NativeCloudBlobUploadInvoker,
-  type NativeCloudInvoker,
-} from './native-cloud-transport';
+import { NativeCloudTransport, type NativeCloudInvoker } from './native-cloud-transport';
 
 const ingestionId = '00000000-0000-4000-8000-000000000001';
 
@@ -41,8 +37,8 @@ describe('NativeCloudTransport', () => {
     await expect(
       transport.request(`/v2/brain/ingestions/${ingestionId}/finalize`, { method: 'POST', body: '{}' }),
     ).resolves.toBeInstanceOf(Response);
-    await expect(transport.request('/v1/blobs/ref', { method: 'POST', body: '{}' })).resolves.toBeInstanceOf(
-      Response,
+    await expect(transport.request('/v1/blobs/ref', { method: 'POST', body: '{}' })).rejects.toThrow(
+      'CLOUD_ROUTE_NOT_ALLOWED',
     );
     await expect(transport.request('/v2/other/resource', { method: 'GET' })).rejects.toThrow(
       'CLOUD_ROUTE_NOT_ALLOWED',
@@ -74,36 +70,20 @@ describe('NativeCloudTransport', () => {
     expect(invoked).toBe(false);
   });
 
-  it('uploads bounded bytes only to a Cloud-issued relative signed path', async () => {
-    let call: Parameters<NativeCloudBlobUploadInvoker> | undefined;
-    const transport = new NativeCloudTransport(
-      async () => ({ status: 200, body: {} }),
-      async (...args) => {
-        call = args;
-        return { status: 204, body: null };
-      },
-    );
-    const reference = {
-      objectRefId: '00000000-0000-4000-8000-000000000009',
-      mode: 'PUT',
-      expiresAtMs: Date.now() + 60_000,
-      url: '/v1/blobs/access.eyJrZXkiOiJ0ZXN0In0.signature',
-      referenceStatus: 'tracked',
-    };
-    // Cloud path is a fixed route followed by the signed token.
-    reference.url = '/v1/blobs/access/eyJrZXkiOiJ0ZXN0In0.signature';
-    await expect(transport.uploadBlob(reference, new Uint8Array([0, 1, 255]))).resolves.toMatchObject({
-      status: 204,
+  it('uploads bounded bytes through the native signed-reference flow without exposing a URL', async () => {
+    let call: Parameters<NativeCloudInvoker> | undefined;
+    const transport = new NativeCloudTransport(async (...args) => {
+      call = args;
+      return { objectRefId: '00000000-0000-4000-8000-000000000009', expiresAtMs: Date.now() + 60_000 };
     });
-    expect(call).toEqual([
-      'cloud_blob_upload',
-      { request: { path: reference.url, bytesBase64: 'AAH/', contentLength: 3 } },
-    ]);
+    const request = { name: 'report.pdf', expiresInSec: 60, ingestionId, bytes: new Uint8Array([0, 1, 255]) };
+    await expect(transport.uploadBlob(request)).resolves.toMatchObject({
+      objectRefId: '00000000-0000-4000-8000-000000000009',
+    });
+    expect(call).toEqual(['cloud_blob_upload', { request: { ...request, bytes: [0, 1, 255] } }]);
+    await expect(transport.uploadBlob({ ...request, name: '../escape' })).rejects.toThrow();
     await expect(
-      transport.uploadBlob({ ...reference, url: 'https://attacker.invalid/upload' }, new Uint8Array()),
-    ).rejects.toThrow();
-    await expect(transport.uploadBlob(reference, new Uint8Array(10 * 1024 * 1024 + 1))).rejects.toThrow(
-      'CLOUD_BLOB_TOO_LARGE',
-    );
+      transport.uploadBlob({ ...request, bytes: new Uint8Array(10 * 1024 * 1024 + 1) }),
+    ).rejects.toThrow('CLOUD_BLOB_TOO_LARGE');
   });
 });

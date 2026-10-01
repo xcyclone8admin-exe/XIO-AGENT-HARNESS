@@ -60,13 +60,25 @@ function transportReturning(payload: unknown, onRequest?: (path: string, init: u
   return transport;
 }
 
-function transportSequence(payloads: unknown[], onRequest?: (path: string, init: unknown) => void) {
-  const transport: AuthenticatedCloudTransport = {
+function transportSequence(
+  payloads: unknown[],
+  onRequest?: (path: string, init: unknown) => void,
+  uploadBlob?: (request: {
+    name: string;
+    expiresInSec: number;
+    ingestionId: string;
+    bytes: Uint8Array;
+  }) => Promise<unknown>,
+) {
+  const transport: AuthenticatedCloudTransport & {
+    uploadBlob?: typeof uploadBlob;
+  } = {
     async request(path, init) {
       onRequest?.(path, init);
       const payload = payloads.shift();
       return Response.json(payload ?? null);
     },
+    ...(uploadBlob ? { uploadBlob } : {}),
   };
   return transport;
 }
@@ -176,29 +188,30 @@ describe('CloudIngestionClient', () => {
     ).resolves.toMatchObject({ referenceState: 'verified_empty', objectRefIds: [] });
   });
 
-  it('issues a tracked blob reference only for a known object-enabled ingestion', async () => {
+  it('uploads tracked blob bytes only for a known object-enabled ingestion', async () => {
     const expiresAtMs = Date.now() + 60_000;
+    let uploaded: unknown;
     const client = new CloudIngestionClient(
-      transportSequence([
-        beginResult(),
-        {
-          objectRefId: ids.refA,
-          mode: 'PUT',
-          expiresAtMs,
-          url: '/v1/blobs/access/eyJrZXkiOiJ0ZXN0In0.signature',
-          referenceStatus: 'tracked',
-        },
-      ]),
+      transportSequence([beginResult()], undefined, async (request) => {
+        uploaded = request;
+        return { objectRefId: ids.refA, expiresAtMs };
+      }),
     );
     await client.begin({ protocolVersion: 'cloud-ingest-v2', sourceId: ids.source, mode: 'with_objects' });
     await expect(
-      client.issueBlobReference(ids.ingestion, { name: 'contract.pdf', expiresInSec: 60 }),
-    ).resolves.toMatchObject({
-      objectRefId: ids.refA,
-      referenceStatus: 'tracked',
-    });
+      client.uploadObject(ids.ingestion, {
+        name: 'contract.pdf',
+        expiresInSec: 60,
+        bytes: new Uint8Array([1, 2, 3]),
+      }),
+    ).resolves.toMatchObject({ objectRefId: ids.refA });
+    expect(uploaded).toMatchObject({ name: 'contract.pdf', expiresInSec: 60, ingestionId: ids.ingestion });
     await expect(
-      client.issueBlobReference(ids.ingestion, { name: '../escape', expiresInSec: 60 }),
+      client.uploadObject(ids.ingestion, {
+        name: '../escape',
+        expiresInSec: 60,
+        bytes: new Uint8Array(),
+      }),
     ).rejects.toThrow();
   });
 
