@@ -132,10 +132,15 @@ describe('BRAIN schema and provenance', () => {
     const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Sync ack', trustLevel: 'user' }, cloudIngestionId: ingestionId, content: 'Sync acknowledgement source.', contentType: 'text/plain' });
     const objectRefId = '019a0000-0000-7000-8000-000000000078';
     await brain.stageCloudReference(scopeA, { mode: 'with_objects', sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId, objectRefId });
+    const secondIngestionId = uuidv7();
+    const secondSource = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Second sync ack', trustLevel: 'user' }, cloudIngestionId: secondIngestionId, content: 'Second sync acknowledgement source.', contentType: 'text/plain' });
+    await brain.stageCloudReference(scopeA, { mode: 'text_only', sourceId: secondSource.sourceId, sourceVersionId: secondSource.versionId, ingestionId: secondIngestionId });
     const fields = (entries: Record<string, unknown>) => Object.fromEntries(Object.entries(entries).map(([key, value]) => [key, { value, hlc: '1790726400000-0000-test', baseHlc: null }]));
     const changes: PushRequest['changes'] = [
       { table: 'brain_sources', id: source.sourceId, tenantId: tenantA, workspaceId: workspaceA, op: 'upsert', fields: fields({ cloud_object_ref_ids: [objectRefId] }), hlc: '1790726400000-0000-test' },
       { table: 'brain_source_versions', id: source.versionId, tenantId: tenantA, workspaceId: workspaceA, op: 'append', fields: fields({ source_id: source.sourceId, content_hash: source.contentDigest }), hlc: '1790726400000-0000-test' },
+      { table: 'brain_sources', id: secondSource.sourceId, tenantId: tenantA, workspaceId: workspaceA, op: 'upsert', fields: fields({ cloud_object_ref_ids: [] }), hlc: '1790726400000-0000-test' },
+      { table: 'brain_source_versions', id: secondSource.versionId, tenantId: tenantA, workspaceId: workspaceA, op: 'append', fields: fields({ source_id: secondSource.sourceId, content_hash: secondSource.contentDigest }), hlc: '1790726400000-0000-test' },
     ];
     const request: PushRequest = { protocolVersion: SYNC_PROTOCOL_VERSION, schemaVersion: SYNC_SCHEMA_VERSION, nodeId: 'brain-test', idempotencyKey: 'brain-ack-idempotency-01', changes };
     const response: PushResponse = { accepted: 0, conflicts: 0, serverSeq: '31', rejected: [], conflictHistory: [], replayed: false,
@@ -150,10 +155,13 @@ describe('BRAIN schema and provenance', () => {
       ? { ...change, fields: { ...change.fields, cloud_object_ref_ids: { ...change.fields.cloud_object_ref_ids!, value: [] } } }
       : change) };
     await expect(brain.acceptCloudReferenceSync(scopeA, changedRequest, response)).rejects.toThrow('SYNC_REFERENCE_REQUEST_CONTENT_MISMATCH');
-    const ack = await brain.acceptCloudReferenceSync(scopeA, request, response);
-    expect(ack).toMatchObject({ status: 'sync_accepted', idempotencyKey: request.idempotencyKey, serverSeq: response.serverSeq,
-      sourceId: source.sourceId, sourceVersionId: source.versionId, contentDigest: source.contentDigest, objectRefIds: [objectRefId] });
-    expect(await brain.acceptCloudReferenceSync(scopeA, request, { ...response, replayed: true })).toMatchObject({ status: 'sync_accepted', serverSeq: response.serverSeq });
+    const acks = await brain.acceptCloudReferenceSync(scopeA, request, response);
+    expect(acks).toHaveLength(2);
+    expect(acks).toContainEqual(expect.objectContaining({ status: 'sync_accepted', idempotencyKey: request.idempotencyKey, serverSeq: response.serverSeq,
+      sourceId: source.sourceId, sourceVersionId: source.versionId, contentDigest: source.contentDigest, objectRefIds: [objectRefId] }));
+    expect(acks).toContainEqual(expect.objectContaining({ status: 'sync_accepted', idempotencyKey: request.idempotencyKey, serverSeq: response.serverSeq,
+      sourceId: secondSource.sourceId, sourceVersionId: secondSource.versionId, contentDigest: secondSource.contentDigest, objectRefIds: [] }));
+    expect(await brain.acceptCloudReferenceSync(scopeA, request, { ...response, replayed: true })).toHaveLength(2);
     const row = await store.query<Record<string, unknown> & { status: string; sync_idempotency_key: string; sync_server_seq: string; sync_request_digest: string; sync_outcome_evidence: unknown }>(scopeA,
       `SELECT status,sync_idempotency_key,sync_server_seq,sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets WHERE source_version_id=$1`, [source.versionId]);
     expect(row.rows[0]).toMatchObject({ status: 'sync_accepted', sync_idempotency_key: request.idempotencyKey, sync_server_seq: response.serverSeq });
