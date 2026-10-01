@@ -1,47 +1,56 @@
 'use client';
 
 import { Command } from 'cmdk';
-import { Command as CommandIcon, Menu, Moon, Search, Sun, X } from 'lucide-react';
+import { Command as CommandIcon, Menu, Search, X } from 'lucide-react';
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { ModuleManifest } from '@xyra/contracts';
 import { PRODUCT_NAME } from '@xyra/brand';
-import { Button, cn, Kbd } from './primitives';
+import { cn, Kbd } from './primitives';
 
-type Theme = 'system' | 'light' | 'dark';
+export type Theme = 'red' | 'graphite' | 'violet' | 'light';
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setTheme] = useState<Theme>('system');
+  const [theme, setTheme] = useState<Theme>('red');
   useEffect(() => {
     const saved = window.localStorage.getItem('xyra.theme');
-    if (saved === 'light' || saved === 'dark') {
+    if (saved === 'red' || saved === 'graphite' || saved === 'violet' || saved === 'light') {
       const frame = window.requestAnimationFrame(() => setTheme(saved));
       return () => window.cancelAnimationFrame(frame);
     }
   }, []);
   useEffect(() => {
-    if (theme === 'system') document.documentElement.removeAttribute('data-theme');
-    else document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.setAttribute('data-theme', theme === 'light' ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-accent', theme === 'red' ? 'red' : theme === 'violet' ? 'violet' : 'signal');
     window.localStorage.setItem('xyra.theme', theme);
   }, [theme]);
+  useEffect(() => {
+    const onThemeSelect = (event: Event) => {
+      const selected = (event as CustomEvent<unknown>).detail;
+      if (selected === 'red' || selected === 'graphite' || selected === 'violet' || selected === 'light') setTheme(selected);
+    };
+    window.addEventListener('xio:theme-select', onThemeSelect);
+    return () => window.removeEventListener('xio:theme-select', onThemeSelect);
+  }, []);
   return <ThemeContext.Provider value={{ theme, setTheme }}>{children}</ThemeContext.Provider>;
 }
 
 const ThemeContext = createContext<{ theme: Theme; setTheme: (value: Theme) => void }>({
-  theme: 'system',
+  theme: 'red',
   setTheme: () => {},
 });
 export function ThemeToggle() {
   const { theme, setTheme } = useContext(ThemeContext);
   return (
-    <Button
-      size="sm"
-      variant="ghost"
-      aria-label={`Theme: ${theme}`}
-      onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
-    >
-      {theme === 'dark' ? <Moon aria-hidden className="size-4" /> : <Sun aria-hidden className="size-4" />}
-      <span className="sr-only">Toggle theme</span>
-    </Button>
+    <label className="flex items-center gap-2 text-xs text-fg-muted">
+      <span>Theme</span>
+      <select aria-label="Theme" value={theme} onChange={(event) => setTheme(event.target.value as Theme)}
+        className="h-8 rounded-md border border-line bg-surface-2 px-2 text-xs text-fg">
+        <option value="red">Obsidian · red</option>
+        <option value="graphite">Graphite</option>
+        <option value="violet">Violet</option>
+        <option value="light">Light</option>
+      </select>
+    </label>
   );
 }
 
