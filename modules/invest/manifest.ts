@@ -27,17 +27,18 @@ export default defineModule({
     'invest:breach:manage',
     'invest:backtest:run',
     'invest:performance:report',
+    'invest:signal:consume',
   ],
   roleGrants: {
     owner: [
       'invest:portfolio:read', 'invest:portfolio:write', 'invest:portfolio:fund', 'invest:mandate:read', 'invest:mandate:manage', 'invest:mandate:vote', 'invest:mandate:approve',
       'invest:market:read', 'invest:market:ingest', 'invest:order:read', 'invest:order:propose',
-      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage', 'invest:backtest:run', 'invest:performance:report',
+      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage', 'invest:backtest:run', 'invest:performance:report', 'invest:signal:consume',
     ],
     admin: [
       'invest:portfolio:read', 'invest:portfolio:write', 'invest:portfolio:fund', 'invest:mandate:read', 'invest:mandate:manage', 'invest:mandate:vote', 'invest:mandate:approve',
       'invest:market:read', 'invest:market:ingest', 'invest:order:read', 'invest:order:propose',
-      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage', 'invest:backtest:run', 'invest:performance:report',
+      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage', 'invest:backtest:run', 'invest:performance:report', 'invest:signal:consume',
     ],
     manager: [
       'invest:portfolio:read', 'invest:portfolio:write', 'invest:portfolio:fund', 'invest:mandate:read', 'invest:market:read',
@@ -55,7 +56,7 @@ export default defineModule({
     { path: 'backtests', title: 'PAPER backtests', keywords: ['simulation', 'OHLC', 'research'] },
     { path: 'performance', title: 'PAPER performance', keywords: ['TWR', 'benchmark', 'statements'] },
   ],
-  dependsOn: ['money'],
+  dependsOn: ['money', 'swarm'],
   tables: [
     { name: 'invest_instruments', class: 'local', authority: 'server', readPermission: 'invest:market:read', serverReadCapabilities: ['invest_paper_execution'], serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_portfolios', class: 'local', authority: 'server', readPermission: 'invest:portfolio:read', serverReadCapabilities: ['invest_paper_execution'], serverWriteCapabilities: ['invest_paper'] },

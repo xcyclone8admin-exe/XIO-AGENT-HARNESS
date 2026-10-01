@@ -14,6 +14,9 @@ import manifest from '../manifest';
 type Call = { readonly principal: Principal; readonly workspaceId: string };
 type Registrar = { register(manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: Call) => Promise<unknown>): void };
 type QueryTx = Pick<ScopedTransaction, 'query'>;
+type KillSwitchSnapshot = { readonly engaged: boolean; readonly reason: string | null; readonly changedBy: string | null; readonly changedAt: string | null };
+/** Structural mirror of @xyra/mod-swarm/server's KillSwitchReader contract. */
+export interface KillSwitchReader { getKillSwitch(scope: Scope): Promise<KillSwitchSnapshot> }
 type OrderRow = {
   id: string; portfolio_id: string; instrument_id: string; symbol: string; side: 'buy'|'sell'; order_type: 'market'|'limit';
   quantity_units: string; limit_price_units: string|null; status: 'proposed'|'approved'|'submitted'|'partially_filled'|'filled'|'cancelled'|'expired';
@@ -31,7 +34,16 @@ export class InvestService {
     private readonly scoped: LocalScopedStore,
     private readonly ledger: LedgerApi,
     private readonly paperLedger: PaperTradeLedgerApi,
+    private readonly killSwitchReader: KillSwitchReader | null = null,
   ) {}
+
+  private async assertGlobalTradingEnabled(scope: InvestScope): Promise<void> {
+    if (!this.killSwitchReader) throw new Error('INVEST_GLOBAL_KILL_SWITCH_UNAVAILABLE');
+    let state: KillSwitchSnapshot;
+    try { state = await this.killSwitchReader.getKillSwitch(scope); }
+    catch { throw new Error('INVEST_GLOBAL_KILL_SWITCH_UNAVAILABLE'); }
+    if (state.engaged) throw new Error('INVEST_GLOBAL_KILL_SWITCH_ENGAGED');
+  }
 
   register(bus: Registrar, moduleManifest: ModuleManifest = manifest): void {
     const reg = (descriptor: AnyCapability, handler: (input: unknown, call: Call) => Promise<unknown>) => bus.register(moduleManifest, descriptor, handler);
@@ -633,6 +645,7 @@ export class InvestService {
   }
 
   async propose(scope: InvestScope, actorId: string, input: { portfolioId: string; instrumentId: string; side: 'buy'|'sell'; orderType: 'market'|'limit'; limitPriceUnits?: string; stopPriceUnits: string; riskBps: number; idempotencyKey: string }): Promise<OrderRow> {
+    await this.assertGlobalTradingEnabled(scope);
     const duplicate = await this.scoped.query<OrderRow>(scope,
       `SELECT o.id,o.portfolio_id,o.instrument_id,i.symbol,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text
        FROM invest_orders o JOIN invest_instruments i ON i.tenant_id=o.tenant_id AND i.workspace_id=o.workspace_id AND i.id=o.instrument_id
@@ -759,6 +772,7 @@ export class InvestService {
   }
 
   async execute(scope: InvestScope, actorId: string, input: { orderId: string; quantityUnits?: string }): Promise<{ order: OrderRow; fillId: string; transactionId: string; environment: 'paper' }> {
+    await this.assertGlobalTradingEnabled(scope);
     return this.paperLedger.withPaperTradeTransaction(scope, async (tx) => {
       const result = await tx.query<Record<string, unknown>>(
         `SELECT o.id,o.portfolio_id,o.instrument_id,o.mandate_id,o.risk_decision_id,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text,
