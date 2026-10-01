@@ -5,7 +5,7 @@ import {
   CloudBrainIngestionFinalizationReceipt,
   CloudBrainIngestionStatus,
   CloudBlobReferenceIssueRequest,
-  CloudBlobReferenceIssueResult,
+  CloudBlobUploadResult,
   cloudBrainSourceVersion,
   cloudReferenceSetDigest,
   type CloudBrainIngestionFinalizationReceipt as FinalizationReceipt,
@@ -23,6 +23,15 @@ export interface AuthenticatedCloudTransport {
     path: string,
     init: { method: 'GET' | 'POST'; headers?: { 'content-type': 'application/json' }; body?: string },
   ): Promise<Response>;
+}
+
+export interface AuthenticatedCloudBlobTransport {
+  uploadBlob(request: {
+    name: string;
+    expiresInSec: number;
+    ingestionId: string;
+    bytes: Uint8Array;
+  }): Promise<unknown>;
 }
 
 export class CloudIngestionRequestError extends Error {
@@ -142,25 +151,35 @@ export class CloudIngestionClient {
     return receipt;
   }
 
-  async issueBlobReference(
+  async uploadObject(
     ingestionId: string,
-    input: { name: string; expiresInSec: number },
-  ): Promise<ReturnType<typeof CloudBlobReferenceIssueResult.parse>> {
+    input: { name: string; expiresInSec: number; bytes: Uint8Array },
+  ): Promise<ReturnType<typeof CloudBlobUploadResult.parse>> {
     const id = CloudBrainIngestionBeginResult.shape.ingestionId.parse(ingestionId);
     const known = this.knownIngestions.get(id);
     if (!known) throw new CloudIngestionBindingError('INGESTION_BEGIN_CONTEXT_REQUIRED');
     if (known.mode !== 'with_objects')
       throw new CloudIngestionBindingError('INGESTION_MODE_DOES_NOT_ALLOW_OBJECTS');
-    const body = CloudBlobReferenceIssueRequest.parse({ ...input, mode: 'PUT', ingestionId: id });
-    const result = CloudBlobReferenceIssueResult.parse(
-      await this.request('/v1/blobs/ref', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+    const request = CloudBlobReferenceIssueRequest.parse({
+      mode: 'PUT',
+      name: input.name,
+      expiresInSec: input.expiresInSec,
+      ingestionId: id,
+    });
+    if (input.bytes.byteLength > 10 * 1024 * 1024) throw new RangeError('CLOUD_BLOB_TOO_LARGE');
+    const blobTransport = this.transport as AuthenticatedCloudTransport &
+      Partial<AuthenticatedCloudBlobTransport>;
+    if (typeof blobTransport.uploadBlob !== 'function') throw new Error('CLOUD_BLOB_UPLOAD_UNAVAILABLE');
+    const result = CloudBlobUploadResult.parse(
+      await blobTransport.uploadBlob({
+        name: request.name,
+        expiresInSec: request.expiresInSec,
+        ingestionId: request.ingestionId,
+        bytes: input.bytes,
       }),
     );
     const now = Date.now();
-    if (result.expiresAtMs <= now || result.expiresAtMs > now + body.expiresInSec * 1000 + 5_000) {
+    if (result.expiresAtMs <= now || result.expiresAtMs > now + request.expiresInSec * 1000 + 5_000) {
       throw new CloudIngestionBindingError('BLOB_REFERENCE_EXPIRY_INVALID');
     }
     return result;

@@ -1,5 +1,5 @@
 import type { AuthenticatedCloudTransport } from './cloud-ingestion';
-import { CloudBlobReferenceIssueResult } from '@xyra/contracts';
+import { CloudBlobReferenceIssueRequest, CloudBlobUploadResult } from '@xyra/contracts';
 
 export interface NativeCloudRequestResult {
   status: number;
@@ -8,35 +8,16 @@ export interface NativeCloudRequestResult {
 
 /** Minimal Tauri invoke surface; the native command owns origin, tokens, and DPoP. */
 export type NativeCloudInvoker = (
-  command: 'cloud_authenticated_request',
-  args: { request: { path: string; method: 'GET' | 'POST'; body?: unknown } },
-) => Promise<NativeCloudRequestResult>;
-
-export type NativeCloudBlobUploadInvoker = (
-  command: 'cloud_blob_upload',
-  args: { request: { path: string; bytesBase64: string; contentLength: number } },
-) => Promise<NativeCloudRequestResult>;
+  command: 'cloud_authenticated_request' | 'cloud_blob_upload',
+  args:
+    | { request: { path: string; method: 'GET' | 'POST'; body?: unknown } }
+    | { request: { name: string; expiresInSec: number; ingestionId: string; bytes: number[] } },
+) => Promise<unknown>;
 
 export const MAX_CLOUD_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
 
-function encodeBase64(bytes: Uint8Array): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let encoded = '';
-  for (let index = 0; index < bytes.length; index += 3) {
-    const first = bytes[index] ?? 0;
-    const second = bytes[index + 1];
-    const third = bytes[index + 2];
-    const block = (first << 16) | ((second ?? 0) << 8) | (third ?? 0);
-    encoded += alphabet[(block >>> 18) & 63];
-    encoded += alphabet[(block >>> 12) & 63];
-    encoded += second === undefined ? '=' : alphabet[(block >>> 6) & 63];
-    encoded += third === undefined ? '=' : alphabet[block & 63];
-  }
-  return encoded;
-}
-
 function isAllowedCloudPath(path: string, method: 'GET' | 'POST'): boolean {
-  if (path === '/v2/brain/ingestions' || path === '/v1/blobs/ref') return method === 'POST';
+  if (path === '/v2/brain/ingestions') return method === 'POST';
   const match =
     /^\/v2\/brain\/ingestions\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?:\/finalize)?$/.exec(
       path,
@@ -50,10 +31,7 @@ function isAllowedCloudPath(path: string, method: 'GET' | 'POST'): boolean {
  * authorization header, token, or DPoP proof from WebView code.
  */
 export class NativeCloudTransport implements AuthenticatedCloudTransport {
-  constructor(
-    private readonly invoke: NativeCloudInvoker,
-    private readonly invokeBlobUpload?: NativeCloudBlobUploadInvoker,
-  ) {}
+  constructor(private readonly invoke: NativeCloudInvoker) {}
 
   async request(
     path: string,
@@ -79,9 +57,9 @@ export class NativeCloudTransport implements AuthenticatedCloudTransport {
         throw new TypeError('CLOUD_BODY_INVALID_SHAPE');
       }
     }
-    const result = await this.invoke('cloud_authenticated_request', {
+    const result = (await this.invoke('cloud_authenticated_request', {
       request: { path, method: init.method, ...(body === undefined ? {} : { body }) },
-    });
+    })) as NativeCloudRequestResult;
     if (
       !Number.isInteger(result.status) ||
       result.status < 200 ||
@@ -93,21 +71,33 @@ export class NativeCloudTransport implements AuthenticatedCloudTransport {
     return Response.json(result.body, { status: result.status });
   }
 
-  /** Upload bytes to a Cloud-issued relative signed path; the native host pins its origin. */
-  async uploadBlob(reference: unknown, bytes: Uint8Array): Promise<NativeCloudRequestResult> {
-    if (!this.invokeBlobUpload) throw new Error('CLOUD_BLOB_UPLOAD_UNAVAILABLE');
-    const parsed = CloudBlobReferenceIssueResult.parse(reference);
-    if (parsed.expiresAtMs <= Date.now()) throw new Error('CLOUD_BLOB_REFERENCE_EXPIRED');
-    if (bytes.byteLength > MAX_CLOUD_BLOB_UPLOAD_BYTES) throw new RangeError('CLOUD_BLOB_TOO_LARGE');
-    const result = await this.invokeBlobUpload('cloud_blob_upload', {
-      request: {
-        path: parsed.url,
-        bytesBase64: encodeBase64(bytes),
-        contentLength: bytes.byteLength,
-      },
+  /** Native issues the signed ref, streams bytes to its relative path, and returns no key/URL. */
+  async uploadBlob(request: {
+    name: string;
+    expiresInSec: number;
+    ingestionId: string;
+    bytes: Uint8Array;
+  }): Promise<ReturnType<typeof CloudBlobUploadResult.parse>> {
+    const issue = CloudBlobReferenceIssueRequest.parse({
+      mode: 'PUT',
+      name: request.name,
+      expiresInSec: request.expiresInSec,
+      ingestionId: request.ingestionId,
     });
-    if (!Number.isInteger(result.status) || result.status < 200 || result.status > 599) {
-      throw new TypeError('CLOUD_NATIVE_RESPONSE_INVALID_STATUS');
+    if (request.bytes.byteLength > MAX_CLOUD_BLOB_UPLOAD_BYTES) throw new RangeError('CLOUD_BLOB_TOO_LARGE');
+    const result = CloudBlobUploadResult.parse(
+      await this.invoke('cloud_blob_upload', {
+        request: {
+          name: issue.name,
+          expiresInSec: issue.expiresInSec,
+          ingestionId: issue.ingestionId,
+          bytes: Array.from(request.bytes),
+        },
+      }),
+    );
+    const now = Date.now();
+    if (result.expiresAtMs <= now || result.expiresAtMs > now + issue.expiresInSec * 1000 + 5_000) {
+      throw new TypeError('CLOUD_BLOB_EXPIRY_INVALID');
     }
     return result;
   }

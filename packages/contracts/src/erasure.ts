@@ -121,6 +121,13 @@ export const CloudBlobReferenceIssueResult = z.strictObject({
 });
 export type CloudBlobReferenceIssueResult = z.infer<typeof CloudBlobReferenceIssueResult>;
 
+/** Native host returns durable Cloud identity/expiry only; storage key and signed URL stay internal. */
+export const CloudBlobUploadResult = z.strictObject({
+  objectRefId: CanonicalUuid,
+  expiresAtMs: z.number().int().positive(),
+});
+export type CloudBlobUploadResult = z.infer<typeof CloudBlobUploadResult>;
+
 const CloudBrainReferenceSetDigestInput = z.strictObject({
   sourceId: CanonicalUuid,
   sourceVersionId: CanonicalUuid,
