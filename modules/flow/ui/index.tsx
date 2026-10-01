@@ -1,3 +1,5 @@
+'use client';
+
 import { useCallback, useEffect, useState } from 'react';
 import { Workflow, Play, RefreshCw, Ban } from 'lucide-react';
 import type { ModulePageProps, ModuleUi } from '@xyra/sdk/module-ui';
