@@ -1,7 +1,13 @@
 'use client';
 
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
-import { LocalApiClient, type LocalSession } from '@xyra/sdk';
+import {
+  CloudIngestionClient,
+  LocalApiClient,
+  NativeCloudTransport,
+  type LocalSession,
+  type NativeCloudInvoker,
+} from '@xyra/sdk';
 
 interface WorkspaceChoice {
   id: string;
@@ -10,6 +16,7 @@ interface WorkspaceChoice {
 }
 interface LocalState {
   api: LocalApiClient | null;
+  cloudIngestion: CloudIngestionClient | null;
   session: LocalSession | null;
   workspaces: WorkspaceChoice[];
   workspaceId: string | null;
@@ -20,12 +27,17 @@ interface LocalState {
 declare global {
   interface Window {
     /** Native host injects this bridge before or during WebView initialization. */
-    xyraNative?: { getSession(): Promise<{ port: number; token: string }> };
+    xyraNative?: {
+      getSession(): Promise<{ port: number; token: string }>;
+      /** Native host exposes only fixed Cloud commands, never generic invoke or credentials. */
+      invoke?: NativeCloudInvoker;
+    };
   }
 }
 
 const LocalContext = createContext<LocalState>({
   api: null,
+  cloudIngestion: null,
   session: null,
   workspaces: [],
   workspaceId: null,
@@ -39,6 +51,7 @@ export function useLocal(): LocalState {
 
 export function LocalProvider({ children }: { children: ReactNode }) {
   const [api, setApi] = useState<LocalApiClient | null>(null);
+  const [cloudIngestion, setCloudIngestion] = useState<CloudIngestionClient | null>(null);
   const [session, setSession] = useState<LocalSession | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceChoice[]>([]);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
@@ -48,7 +61,10 @@ export function LocalProvider({ children }: { children: ReactNode }) {
     let active = true;
     const connect = async () => {
       if (!window.xyraNative) {
-        if (active) setStatus('unavailable');
+        if (active) {
+          setStatus('unavailable');
+          setCloudIngestion(null);
+        }
         return;
       }
       try {
@@ -65,12 +81,20 @@ export function LocalProvider({ children }: { children: ReactNode }) {
         const saved = window.localStorage.getItem('xyra.workspace');
         const chosen = choices.find((w) => w.id === saved) ?? choices[0];
         setApi(client);
+        setCloudIngestion(
+          window.xyraNative.invoke
+            ? new CloudIngestionClient(new NativeCloudTransport(window.xyraNative.invoke))
+            : null,
+        );
         setSession(identity);
         setWorkspaces(choices);
         setWorkspaceId(chosen?.id ?? null);
         setStatus('connected');
       } catch {
-        if (active) setStatus('unavailable');
+        if (active) {
+          setStatus('unavailable');
+          setCloudIngestion(null);
+        }
       }
     };
     void connect();
@@ -87,7 +111,9 @@ export function LocalProvider({ children }: { children: ReactNode }) {
     window.localStorage.setItem('xyra.workspace', id);
   };
   return (
-    <LocalContext.Provider value={{ api, session, workspaces, workspaceId, status, selectWorkspace }}>
+    <LocalContext.Provider
+      value={{ api, cloudIngestion, session, workspaces, workspaceId, status, selectWorkspace }}
+    >
       {children}
     </LocalContext.Provider>
   );
