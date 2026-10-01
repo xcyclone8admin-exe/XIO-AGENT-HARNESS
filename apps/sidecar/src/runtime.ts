@@ -7,6 +7,8 @@ import { bootstrapLocalIdentity, CoreService } from '@xyra/mod-core/server';
 import { MoneyService } from '@xyra/mod-money/server';
 import { OpsService } from '@xyra/mod-ops/server';
 import { BrainService } from '@xyra/mod-brain/server';
+import { createForgeServer, ForgeRepository, type ForgeBus } from '@xyra/mod-forge/server';
+import forgeManifest from '@xyra/mod-forge/manifest';
 import { MIGRATIONS } from './generated/migrations';
 import { MANIFESTS } from './generated/modules';
 import { CapabilityBus } from './bus';
@@ -65,6 +67,12 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
     new MoneyService(new PGliteLedgerWriter(db)).register(bus);
     const brain = new BrainService(scoped);
     registerBrainCapabilities(bus, brain);
+    const forgeRepository = new ForgeRepository(scoped);
+    const forgeBus: ForgeBus = {
+      register: (manifest, descriptor, handler) =>
+        bus.register(manifest, descriptor, (input, call) => handler(input, call)),
+    };
+    createForgeServer(forgeRepository).register(forgeBus, forgeManifest);
     const launchToken = options.launchToken ?? randomBytes(32).toString('base64url');
     const app = createSidecarApp({
       port: options.port,

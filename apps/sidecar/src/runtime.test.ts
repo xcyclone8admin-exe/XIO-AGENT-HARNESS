@@ -31,8 +31,23 @@ test('local runtime serves an authenticated, scoped workspace session', async ()
       },
     });
     expect(authenticated.status).toBe(200);
-    const body = (await authenticated.json()) as { workspaces: Array<{ kind: string }> };
+    const body = (await authenticated.json()) as { workspaces: Array<{ id: string; kind: string }> };
     expect(body.workspaces.map((w) => w.kind).sort()).toEqual(['sample', 'standard']);
+    const workspaceId = body.workspaces.find((w) => w.kind === 'standard')?.id;
+    expect(workspaceId).toBeTruthy();
+    const created = await fetch(`http://127.0.0.1:${port}/api/v1/call/forge.projects.create`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${session.launchToken}`,
+        origin: 'http://tauri.localhost',
+        'content-type': 'application/json',
+        'idempotency-key': 'runtime-forge-create-0001',
+      },
+      body: JSON.stringify({ workspaceId, input: { name: 'Runtime Forge', description: 'Integrated workflow', requirements: [] } }),
+    });
+    expect(created.status, JSON.stringify(await created.clone().json())).toBe(200);
+    const createdBody = await created.json() as { data: { id: string; name: string } };
+    expect(createdBody.data.name).toBe('Runtime Forge');
   } finally {
     await session.close();
   }
