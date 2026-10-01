@@ -36,6 +36,8 @@ export async function withNeonTransaction<T>(
     authTransactionId?: string;
     authCredentialId?: string;
     refreshTokenHash?: string;
+    investSignalSourceId?: string;
+    investSignalKeyId?: string;
   },
   operation: (client: SqlClient) => Promise<T>,
 ): Promise<T> {
@@ -52,6 +54,12 @@ export async function withNeonTransaction<T>(
     ]);
     await client.query("SELECT set_config('app.refresh_token_hash', $1, true)", [
       scope.refreshTokenHash ?? '',
+    ]);
+    await client.query("SELECT set_config('app.invest_signal_source_id', $1, true)", [
+      scope.investSignalSourceId ?? '',
+    ]);
+    await client.query("SELECT set_config('app.invest_signal_key_id', $1, true)", [
+      scope.investSignalKeyId ?? '',
     ]);
     const value = await operation(client);
     await client.query('COMMIT');
