@@ -263,6 +263,7 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
   app.get('/api/v1/session', async (c) => {
     const principal = await options.resolvePrincipal();
     return c.json({
+      tenantId: principal.tenantId,
       user: { id: principal.id, displayName: principal.displayName ?? 'Local user' },
       workspaces: principal.workspaces,
     });

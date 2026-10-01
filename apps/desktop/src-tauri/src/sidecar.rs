@@ -445,6 +445,29 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::cloud_service::SidecarTransport;
+    use ring::digest::{digest, SHA256};
+    use serde_json::{json, Value};
+
+    fn signal_envelope_digest(envelope: &Value) -> String {
+        let bytes = serde_json::to_vec(&json!({
+            "digestAlgorithm": "SHA-256",
+            "digestVersion": "xyra.invest.envelope.digest.v1",
+            "envelope": envelope,
+        }))
+        .expect("canonical digest envelope JSON");
+        digest(&SHA256, &bytes)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn utc_timestamp(offset_seconds: i64) -> String {
+        use time::format_description::well_known::Rfc3339;
+        (time::OffsetDateTime::now_utc() + time::Duration::seconds(offset_seconds))
+            .format(&Rfc3339)
+            .expect("format UTC timestamp")
+    }
 
     fn cmd_exe() -> PathBuf {
         let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
@@ -612,6 +635,8 @@ mod tests {
         let port = free_port().unwrap();
         let launch_token = random_token();
         let native_sync_token = random_token();
+        let data_dir = std::env::temp_dir().join(format!("xyra-invest-e2e-{}", random_token()));
+        std::fs::create_dir_all(&data_dir).unwrap();
         let endpoint = Endpoint {
             port,
             token: launch_token.clone(),
@@ -625,8 +650,8 @@ mod tests {
                 args: vec![staged.into_os_string()],
                 env: vec![
                     ("XYRA_SIDECAR_PORT", port.to_string()),
-                    ("XYRA_DATA_DIR", "memory://".into()),
-                    ("XYRA_OS_SUBJECT", "smoke:rust-launcher".into()),
+                    ("XYRA_DATA_DIR", data_dir.to_string_lossy().into_owned()),
+                    ("XYRA_OS_SUBJECT", "smoke:rust-launcher-invest-e2e".into()),
                     ("XYRA_DISPLAY_NAME", "Rust launcher smoke".into()),
                     ("XYRA_ALLOWED_ORIGINS", "http://tauri.localhost".into()),
                 ],
@@ -661,6 +686,16 @@ mod tests {
             .expect("staged sidecar health request");
         let body: serde_json::Value = response.json().expect("session response JSON");
         assert_eq!(body["workspaces"].as_array().map(Vec::len), Some(2));
+        let tenant_id = body["tenantId"].as_str().expect("session tenant scope");
+        let workspace_id = body["workspaces"]
+            .as_array()
+            .and_then(|workspaces| {
+                workspaces
+                    .iter()
+                    .find(|workspace| workspace["kind"] == "standard")
+            })
+            .and_then(|workspace| workspace["id"].as_str())
+            .expect("standard workspace scope");
 
         let callback = format!("http://127.0.0.1:{port}/internal/native/cloud-sync/push");
         let malformed_envelope = r#"{"request":{},"response":{}}"#;
@@ -737,13 +772,140 @@ mod tests {
             .expect("renderer-origin native Invest callback request");
         assert_eq!(renderer_signal.status(), reqwest::StatusCode::FORBIDDEN);
 
-        let native_signal = native_sender.process_advisory_signal(
-            port,
-            &ready.native_sync_token,
-            &serde_json::json!({ "status": "claimed" }),
+        let vector_envelope = json!({
+            "protocol": "xyra.invest.signal.v1",
+            "eventId": "feed:event-1",
+            "occurredAt": "2026-09-30T12:00:00.000Z",
+            "expiresAt": "2026-09-30T12:05:00.000Z",
+            "algorithmId": "momentum-v1",
+            "signalId": "00000000-0000-4000-8000-000000000001",
+            "symbol": "XYRA",
+            "side": "buy",
+            "quantity": "2.5",
+            "sourceId": "00000000-0000-4000-8000-000000000002",
+            "tenantId": "00000000-0000-4000-8000-000000000003",
+            "workspaceId": "00000000-0000-4000-8000-000000000004",
+            "receivedAt": "2026-09-30T12:00:01.000Z",
+            "payloadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verification": {
+                "signature": "verified",
+                "keyId": "00000000-0000-4000-8000-000000000005",
+                "signingAlg": "ES256",
+            },
+        });
+        assert_eq!(
+            signal_envelope_digest(&vector_envelope),
+            "07588322e8162ffcda4cb67bc807d5552f60a3d44e4a1631dd4a63b0a6558940",
+            "Rust canonical JSON + SHA-256 must match the shared cross-runtime vector"
         );
-        assert_eq!(native_signal, Err("INVEST_SIGNAL_PROCESS_FAILED".into()));
+
+        // The native sender receives a test-only Cloud claim fixture. The scoped database and
+        // Invest decision path are real; no Cloud endpoint, credentials or trust bypass is used.
+        let signal = json!({
+            "protocol": "xyra.invest.signal.v1",
+            "eventId": "rust-launcher:signal-1",
+            "sourceId": "019a0000-0000-7000-8000-000000000302",
+            "tenantId": tenant_id,
+            "workspaceId": workspace_id,
+            "receivedAt": utc_timestamp(0),
+            "occurredAt": utc_timestamp(-1),
+            "expiresAt": utc_timestamp(60),
+            "algorithmId": "momentum-v1",
+            "signalId": "019a0000-0000-7000-8000-000000000303",
+            "symbol": "UNLISTED",
+            "side": "buy",
+            "quantity": "1.25",
+            "payloadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verification": {
+                "signature": "verified",
+                "keyId": "019a0000-0000-7000-8000-000000000304",
+                "signingAlg": "ES256",
+            },
+        });
+        let claim = json!({
+            "status": "claimed",
+            "lease": {
+                "leaseId": "019a0000-0000-7000-8000-000000000301",
+                "fence": 1,
+                "expiresAt": utc_timestamp(20),
+            },
+            "signal": {
+                "protocol": signal["protocol"],
+                "eventId": signal["eventId"],
+                "sourceId": signal["sourceId"],
+                "tenantId": signal["tenantId"],
+                "workspaceId": signal["workspaceId"],
+                "receivedAt": signal["receivedAt"],
+                "occurredAt": signal["occurredAt"],
+                "expiresAt": signal["expiresAt"],
+                "algorithmId": signal["algorithmId"],
+                "signalId": signal["signalId"],
+                "symbol": signal["symbol"],
+                "side": signal["side"],
+                "quantity": signal["quantity"],
+                "payloadDigest": signal["payloadDigest"],
+                "verification": signal["verification"],
+                "envelopeDigestVersion": "xyra.invest.envelope.digest.v1",
+                "envelopeDigestAlgorithm": "SHA-256",
+                "envelopeDigest": signal_envelope_digest(&signal),
+            },
+        });
+        let first_decision = native_sender
+            .process_advisory_signal(port, &ready.native_sync_token, &claim)
+            .expect("valid scoped claim persists a PGlite-backed PAPER decision");
+        assert_eq!(first_decision.len(), 36);
+        assert_eq!(first_decision.as_bytes()[8], b'-');
+        assert_eq!(first_decision.as_bytes()[13], b'-');
+        assert_eq!(first_decision.as_bytes()[18], b'-');
+        assert_eq!(first_decision.as_bytes()[23], b'-');
+        assert!(first_decision
+            .bytes()
+            .all(|byte| byte == b'-' || byte.is_ascii_hexdigit()));
+        assert_eq!(first_decision, first_decision.to_ascii_lowercase());
+
+        let mut tampered_claim = claim.clone();
+        tampered_claim["signal"]["quantity"] = json!("1.5");
+        assert_eq!(
+            native_sender.process_advisory_signal(port, &ready.native_sync_token, &tampered_claim),
+            Err("INVEST_SIGNAL_PROCESS_FAILED".into()),
+            "mutated envelope fields with the old digest must be rejected"
+        );
+        let replay = native_sender
+            .process_advisory_signal(port, &ready.native_sync_token, &claim)
+            .expect("exact claim replay returns its durable decision");
+        assert_eq!(replay, first_decision);
+
+        sup.restart();
+        let restarted = match sup.wait_ready(Duration::from_secs(30)) {
+            Ok(ready) => ready,
+            Err(status) => {
+                sup.shutdown();
+                panic!("staged sidecar restart failed: {status:?}");
+            }
+        };
+        assert_eq!(restarted.port, port);
+        let after_restart = native_sender
+            .process_advisory_signal(port, &restarted.native_sync_token, &claim)
+            .expect("PGlite decision survives sidecar process restart");
+        assert_eq!(after_restart, first_decision);
+        assert_eq!(
+            native_sender.process_advisory_signal(
+                port,
+                &restarted.native_sync_token,
+                &tampered_claim
+            ),
+            Err("INVEST_SIGNAL_PROCESS_FAILED".into()),
+            "tampering remains rejected after restart"
+        );
+        assert_eq!(
+            native_sender
+                .process_advisory_signal(port, &restarted.native_sync_token, &claim)
+                .expect("valid replay after tampering"),
+            first_decision,
+            "tampered claim did not alter or duplicate the durable decision"
+        );
         sup.shutdown();
         let _ = std::fs::remove_dir_all(log_dir);
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
