@@ -6,7 +6,7 @@ import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/l
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
 import { allocateFifoTaxLots } from './tax-lots';
-import { runMomentumStopTargetBacktest, type OhlcBar, type MomentumStopTargetStrategy } from './backtest';
+import { backtestStrategyIdentity, runMomentumStopTargetBacktest, type OhlcBar, type MomentumStopTargetStrategy } from './backtest';
 import { calculateTimeWeightedStatement, type PerformanceMark, type PerformanceStatement } from './performance';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
@@ -361,7 +361,7 @@ export class InvestService {
         if (!dataset || dataset.data_hash !== result.dataHash || dataset.source_name !== input.sourceName || dataset.source_ref !== input.sourceRef) throw new Error('Backtest data version already exists with different content or provenance');
         datasetId=dataset.id;
       }
-      const strategyConfig = {...input.strategy,quantityScale:row.quantity_scale};
+      const strategyConfig = backtestStrategyIdentity(input.strategy,row.quantity_scale);
       const strategyInsert = await tx.query<{id:string}>(`INSERT INTO invest_backtest_strategies(id,tenant_id,workspace_id,strategy_key,strategy_version,config,strategy_hash,created_by)
         VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8) ON CONFLICT(tenant_id,workspace_id,strategy_key,strategy_version) DO NOTHING RETURNING id`,
         [uuidv7(),scope.tenantId,scope.workspaceId,input.strategy.id,input.strategy.version,JSON.stringify(strategyConfig),result.strategyHash,actorId]);
@@ -741,14 +741,17 @@ export class InvestService {
   }
   private async transition(scope: InvestScope, actorId: string, orderId: string, target: 'approved'|'cancelled', detail: object): Promise<OrderRow> {
     return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
-      const prior = await tx.query<OrderRow>(`SELECT o.id,o.portfolio_id,o.instrument_id,i.symbol,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text
+      const prior = await tx.query<OrderRow>(`SELECT o.id,o.portfolio_id,o.instrument_id,i.symbol,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text,
+          COALESCE((SELECT sum(f.quantity_units) FROM invest_fills f WHERE f.tenant_id=o.tenant_id AND f.workspace_id=o.workspace_id AND f.order_id=o.id),0)::text AS filled_units
         FROM invest_orders o JOIN invest_instruments i ON i.tenant_id=o.tenant_id AND i.workspace_id=o.workspace_id AND i.id=o.instrument_id
         WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, orderId]);
       const old = prior.rows[0]; if (!old) throw new Error('Order not found');
+      if (target === 'cancelled' && old.status === 'cancelled') return old;
       if (target === 'approved' && old.status !== 'proposed') throw new Error('Only proposed orders may be approved');
-      if (target === 'cancelled' && !['proposed','approved','submitted'].includes(old.status)) throw new Error('Order cannot be cancelled in its current state');
+      if (target === 'cancelled' && !['proposed','approved','submitted','partially_filled'].includes(old.status)) throw new Error('Order cannot be cancelled in its current state');
       const updated = await tx.query<OrderRow>(`UPDATE invest_orders SET status=$1 WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4
-        RETURNING id,portfolio_id,instrument_id,(SELECT symbol FROM invest_instruments WHERE id=invest_orders.instrument_id)::text AS symbol,side,order_type,quantity_units::text,limit_price_units::text,status,environment,created_at::text`,
+        RETURNING id,portfolio_id,instrument_id,(SELECT symbol FROM invest_instruments WHERE id=invest_orders.instrument_id)::text AS symbol,side,order_type,quantity_units::text,limit_price_units::text,status,environment,created_at::text,
+          COALESCE((SELECT sum(f.quantity_units) FROM invest_fills f WHERE f.tenant_id=invest_orders.tenant_id AND f.workspace_id=invest_orders.workspace_id AND f.order_id=invest_orders.id),0)::text AS filled_units`,
         [target, scope.tenantId, scope.workspaceId, orderId]);
       await this.orderEvent(tx, scope, actorId, orderId, target, old.status, target, detail);
       if (!updated.rows[0]) throw new Error('Order update failed'); return updated.rows[0];

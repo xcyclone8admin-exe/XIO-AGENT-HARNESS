@@ -108,7 +108,7 @@ export const investCapabilities = {
   execute: defineCapability({ id: 'invest.orders.execute-paper', title: 'Execute PAPER fill', description: 'Fill an approved order at a stored PAPER market quote and post ledger entries atomically',
     kind: 'write', permission: 'invest:order:execute', agentCallable: false,
     input: z.object({ orderId: Uuid, quantityUnits: Units.refine((value) => BigInt(value) > 0n).optional() }).strict(), output: z.object({ order: OrderView, fillId: Uuid, transactionId: Uuid, environment: z.literal('paper') }) }),
-  cancel: defineCapability({ id: 'invest.orders.cancel', title: 'Cancel PAPER order', description: 'Cancel an unfilled PAPER order',
+  cancel: defineCapability({ id: 'invest.orders.cancel', title: 'Cancel PAPER order remainder', description: 'Cancel an open PAPER order or the unfilled remainder of a partially filled order',
     kind: 'write', permission: 'invest:order:cancel', agentCallable: false, input: z.object({ orderId: Uuid }), output: OrderView }),
   killSwitch: defineCapability({ id: 'invest.orders.set-kill-switch', title: 'Halt PAPER trading', description: 'Halt new orders and cancel open PAPER orders for a portfolio; resuming requires this explicit action',
     kind: 'write', permission: 'invest:order:kill_switch', agentCallable: false,

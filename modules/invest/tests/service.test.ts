@@ -125,13 +125,21 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
     firstFill = await service.execute(scope, userId, { orderId, quantityUnits: '200000' });
     expect(firstFill.order.status).toBe('partially_filled');
     await expect(service.execute(scope,userId,{orderId,quantityUnits:'300001'})).rejects.toThrow(/exceeds remaining/);
-    fill = await service.execute(scope, userId, { orderId });
+    const cancelled = await service.cancel(scope,userId,{orderId});
+    expect(cancelled.status).toBe('cancelled');
+    const repeatedCancel = await service.cancel(scope,userId,{orderId});
+    expect(repeatedCancel).toMatchObject({status:'cancelled',filled_units:'200000'});
+    const events = await db.query<{count:number}>(`SELECT count(*)::int AS count FROM invest_order_events WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3 AND event_type='cancelled'`,[tenantId,workspaceId,orderId]);
+    expect(events.rows[0]?.count).toBe(1);
+    const latestFill = await db.query<{id:string;execution_ref:string}>(`SELECT id,execution_ref FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3 ORDER BY created_at DESC LIMIT 1`,[tenantId,workspaceId,orderId]);
+    fill = {order:cancelled,fillId:latestFill.rows[0]!.id,transactionId:latestFill.rows[0]!.execution_ref.slice('paper:'.length),environment:'paper'};
   }
   finally { vi.unstubAllGlobals(); }
   expect(network).not.toHaveBeenCalled();
-  expect(fill).toMatchObject({ order: { id: orderId, status: 'filled' }, environment: 'paper' });
-  expect(fill.order.filled_units).toBe('500000');
-  await expect(service.orders(scope,{portfolioId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:orderId,quantity_units:'500000',filled_units:'500000'})]));
+  expect(fill.order).toMatchObject({ id: orderId, status: 'cancelled' });
+  const expectedFilledUnits = '200000';
+  expect(fill.order.filled_units).toBe(expectedFilledUnits);
+  await expect(service.orders(scope,{portfolioId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:orderId,quantity_units:'500000',filled_units:expectedFilledUnits})]));
 
   const persisted = await db.query<{ fills: number; ledger_transactions: number; entries: number; cash: string; position: string }>(
     `SELECT (SELECT count(*)::int FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3) AS fills,
@@ -141,10 +149,12 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
       (SELECT units::text FROM ledger_balances WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$5 AND account_id=(SELECT id FROM ledger_accounts WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$5 AND code=$6) AND asset=$7) AS position`,
     [tenantId, workspaceId, orderId, fill.transactionId, portfolio.book_id, `position:${instrumentId}`, `EQ:PAPERX`],
   );
-  expect(persisted.rows[0]).toMatchObject({ fills: 2, ledger_transactions: 1, entries: 4, cash: '95000', position: '500000' });
+  expect(persisted.rows[0]).toMatchObject({ fills: expectedFilledUnits === '200000' ? 1 : 2, ledger_transactions: expectedFilledUnits === '200000' ? 1 : 1, entries: 4, cash: expectedFilledUnits === '200000' ? '98000' : '95000', position: expectedFilledUnits });
   const openedLots = await service.taxLots(scope, { portfolioId: portfolio.id });
-  expect(openedLots).toHaveLength(2);
-  expect(openedLots.map((lot)=>[lot.instrumentId,lot.acquiredUnits,lot.remainingUnits,lot.costBasisUnits,lot.remainingBasisUnits])).toEqual([
+  expect(openedLots).toHaveLength(expectedFilledUnits === '200000' ? 1 : 2);
+  expect(openedLots.map((lot)=>[lot.instrumentId,lot.acquiredUnits,lot.remainingUnits,lot.costBasisUnits,lot.remainingBasisUnits])).toEqual(expectedFilledUnits === '200000' ? [
+    [instrumentId,'200000','200000','2000','2000'],
+  ] : [
     [instrumentId,'200000','200000','2000','2000'],[instrumentId,'300000','300000','3000','3000'],
   ]);
   await new Promise((resolve) => setTimeout(resolve, 1_100));
@@ -157,8 +167,10 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
        sum(e.realized_gain_units)::text AS gain FROM invest_tax_lots l JOIN invest_tax_lot_events e
        ON e.tenant_id=l.tenant_id AND e.workspace_id=l.workspace_id AND e.lot_id=l.id
        WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 GROUP BY l.id`, [tenantId, workspaceId, portfolio.id]);
-  expect(lots.rows).toHaveLength(2);
-  expect(lots.rows).toEqual([
+  expect(lots.rows).toHaveLength(expectedFilledUnits === '200000' ? 1 : 2);
+  expect(lots.rows).toEqual(expectedFilledUnits === '200000' ? [
+    { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
+  ] : [
     { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
     { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
   ]);
@@ -222,7 +234,32 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   await expect(service.runBacktest(scope,userId,backtestInput)).resolves.toMatchObject({runId:backtest.runId});
   await expect(service.backtestRuns(scope,{instrumentId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:backtest.runId,data_version:1,strategy_key:strategy.id,strategy_version:1,net_pnl_units:'948'})]));
   await expect(service.runBacktest(scope,userId,{...backtestInput,bars:[...historicalBars.slice(0,2),{...historicalBars[2]!,closeUnits:'12999'}]})).rejects.toThrow(/data version already exists/);
+  const differentScale = await service.createInstrument(scope,userId,{symbol:'SCALETEST',assetClass:'equity',quantityScale:4,exchangeCode:null});
+  await expect(service.runBacktest(scope,userId,{...backtestInput,instrumentId:differentScale.id,dataVersion:1})).rejects.toThrow(/strategy version already exists with different configuration/);
   await expect(db.query(`UPDATE invest_backtest_runs SET net_pnl_units=0 WHERE id=$1`,[backtest.runId])).rejects.toThrow(/append-only/);
+});
+
+test('cancel and fill serialize on the locked order row', async () => {
+  const scope = {tenantId,workspaceId};
+  await new Promise((resolve)=>setTimeout(resolve,1_100));
+  const order=await service.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'paper-cancel-fill-race'});
+  await service.approve(scope,userId,{orderId:order.id});
+  await service.execute(scope,userId,{orderId:order.id,quantityUnits:'100000'});
+  const [cancelled,filled]=await Promise.allSettled([service.cancel(scope,userId,{orderId:order.id}),service.execute(scope,userId,{orderId:order.id})]);
+  const final= (await service.orders(scope,{portfolioId})).find((candidate)=>candidate.id===order.id);
+  expect(final).toBeDefined();
+  expect(['cancelled','filled']).toContain(final?.status);
+  const count=await db.query<{fills:number;cancellations:number;filledUnits:string}>(`SELECT
+      (SELECT count(*)::int FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3) AS fills,
+      (SELECT count(*)::int FROM invest_order_events WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3 AND event_type='cancelled') AS cancellations,
+      COALESCE((SELECT sum(quantity_units) FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3),0)::text AS "filledUnits"`,[tenantId,workspaceId,order.id]);
+  if(final?.status==='cancelled') {
+    expect(cancelled.status).toBe('fulfilled'); expect(filled.status).toBe('rejected');
+    expect(count.rows[0]).toMatchObject({fills:1,cancellations:1,filledUnits:'100000'});
+  } else {
+    expect(cancelled.status).toBe('rejected'); expect(filled.status).toBe('fulfilled');
+    expect(count.rows[0]).toMatchObject({fills:2,cancellations:0});
+  }
 });
 
 test('a failing fill-event insert rolls back fill and ledger posting together', async () => {
