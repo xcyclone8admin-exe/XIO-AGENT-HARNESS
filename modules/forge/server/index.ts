@@ -92,6 +92,9 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.findings, (_input, call) => requireRepository(repository).findings(actor(call)));
     bus.register(manifest, forgeCapabilities.updateFinding, (input, call) => requireRepository(repository).transitionFindingRecord(actor(call), forgeCapabilities.updateFinding.input.parse(input)));
     bus.register(manifest, forgeCapabilities.gateMatrix, (input, call) => requireRepository(repository).gateMatrix(actor(call), forgeCapabilities.gateMatrix.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.riskAcceptances, (_input, call) => requireRepository(repository).riskAcceptances(actor(call)));
+    bus.register(manifest, forgeCapabilities.requestRiskAcceptance, (input, call) => requireRepository(repository).requestRiskAcceptance(actor(call), forgeCapabilities.requestRiskAcceptance.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.decideRiskAcceptance, (input, call) => requireRepository(repository).decideRiskAcceptance(actor(call), forgeCapabilities.decideRiskAcceptance.input.parse(input)));
     bus.register(manifest, forgeCapabilities.promotionList, (_input, call) => requireRepository(repository).promotions(actor(call)));
     bus.register(manifest, forgeCapabilities.specs, (input, call) => { const request = forgeCapabilities.specs.input.parse(input); return requireRepository(repository).specs(actor(call), request.projectId); });
     bus.register(manifest, forgeCapabilities.specLifecycle, (input, call) => requireRepository(repository).transitionSpec(actor(call), forgeCapabilities.specLifecycle.input.parse(input)));

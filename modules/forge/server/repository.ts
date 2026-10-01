@@ -2,7 +2,7 @@ import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
+import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
 import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
@@ -359,6 +359,28 @@ export class ForgeRepository {
   async recordGateEvaluation(actor: ForgeActor, evaluation: { gates: Array<{ id: string; requirementId: string; kind: 'deterministic' | 'human' | 'ai-judgment'; status: 'pass' | 'fail' | 'pending' | 'blocked'; hard: boolean; evidenceIds: string[] }> }) {
     for (const gate of evaluation.gates) await this.store.query(this.scope(actor), 'INSERT INTO forge_gates(id,tenant_id,workspace_id,requirement_id,kind,status,hard,evidence_ids,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)', [`${uuidv7()}:${gate.id}`, actor.tenantId, actor.workspaceId, gate.requirementId, gate.kind, gate.status, gate.hard, json(gate.evidenceIds), actor.id]);
     return evaluation;
+  }
+  async riskAcceptances(actor: ForgeActor) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; gate_id: string; requirement_id: string; reason: string; impact: string; mitigation: string; review_at: string; requested_by: string; created_at: string; decision: 'approved'|'rejected'|null; decision_reason: string|null; decided_by: string|null; decided_at: string|null }>(this.scope(actor), 'SELECT r.id,r.gate_id,r.requirement_id,r.reason,r.impact,r.mitigation,r.review_at,r.requested_by,r.created_at,d.decision,d.reason AS decision_reason,d.decided_by,d.created_at AS decided_at FROM forge_risk_acceptances r LEFT JOIN forge_risk_acceptance_decisions d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.acceptance_id=r.id ORDER BY r.created_at DESC');
+    return rows.map((row) => RiskAcceptanceRecord.parse({ id: row.id, gateId: row.gate_id, requirementId: row.requirement_id, reason: row.reason, impact: row.impact, mitigation: row.mitigation, reviewAt: timestamp(row.review_at), requestedBy: row.requested_by, createdAt: timestamp(row.created_at), status: row.decision ?? 'pending', decisionReason: row.decision_reason, decidedBy: row.decided_by, decidedAt: row.decided_at ? timestamp(row.decided_at) : null }));
+  }
+  async requestRiskAcceptance(actor: ForgeActor, raw: unknown) {
+    const request = RiskAcceptanceRequest.parse(raw);
+    if (Date.parse(request.reviewAt) <= Date.now()) throw new Error('FORGE_RISK_ACCEPTANCE_REVIEW_DATE_MUST_BE_FUTURE');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_risk_acceptances(id,tenant_id,workspace_id,gate_id,requirement_id,reason,impact,mitigation,review_at,requested_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.gateId, request.requirementId, request.reason, request.impact, request.mitigation, request.reviewAt, actor.id]);
+    const record = (await this.riskAcceptances(actor)).find((item) => item.id === rows[0]?.id);
+    if (!record) throw new Error('FORGE_RISK_ACCEPTANCE_CREATE_FAILED');
+    return record;
+  }
+  async decideRiskAcceptance(actor: ForgeActor, raw: unknown) {
+    const request = RiskAcceptanceDecisionRequest.parse(raw);
+    const current = (await this.riskAcceptances(actor)).find((item) => item.id === request.acceptanceId);
+    if (!current) throw new Error('FORGE_RISK_ACCEPTANCE_NOT_FOUND');
+    if (current.status !== 'pending') throw new Error('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
+    if (request.decision === 'approved' && current.requestedBy === actor.id) throw new Error('FORGE_RISK_ACCEPTANCE_REQUIRES_INDEPENDENT_APPROVER');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_risk_acceptance_decisions(id,tenant_id,workspace_id,acceptance_id,decision,reason,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,workspace_id,acceptance_id) DO NOTHING RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.acceptanceId, request.decision, request.reason, actor.id]);
+    if (!rows.length) throw new Error('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
+    return (await this.riskAcceptances(actor)).find((item) => item.id === request.acceptanceId);
   }
   async recordPromotion(actor: ForgeActor, promotion: { id: string; commitSha: string; from: string; to: string; state: string; evidenceIds: string[]; missingGateIds: string[]; approvalId: string | null; rollbackOf: string | null; workspaceId: string; createdAt: string }) {
     if (promotion.workspaceId !== actor.workspaceId) throw new Error('FORGE_PROMOTION_WORKSPACE_MISMATCH');
