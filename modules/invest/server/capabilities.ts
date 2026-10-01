@@ -6,7 +6,7 @@ const Uuid = z.uuid();
 const Units = z.string().regex(/^(0|-?[1-9]\d{0,37})$/);
 const OrderView = z.object({
   id: Uuid, portfolio_id: Uuid, instrument_id: Uuid, symbol: z.string(), side: z.enum(['buy', 'sell']), order_type: z.enum(['market', 'limit']),
-  quantity_units: Units, limit_price_units: Units.nullable(), status: z.enum(['proposed', 'approved', 'rejected', 'submitted', 'partially_filled', 'filled', 'cancelled', 'expired']),
+  quantity_units: Units, filled_units: Units.optional(), limit_price_units: Units.nullable(), status: z.enum(['proposed', 'approved', 'rejected', 'submitted', 'partially_filled', 'filled', 'cancelled', 'expired']),
   environment: z.literal('paper'), created_at: z.string(),
 });
 const PortfolioView = z.object({ id: Uuid, name: z.string(), base_asset: z.string(), book_id: Uuid, environment: z.literal('paper'), status: z.enum(['active','paused','closed']) });
@@ -85,7 +85,7 @@ export const investCapabilities = {
     input: z.object({ orderId: Uuid }), output: OrderView }),
   execute: defineCapability({ id: 'invest.orders.execute-paper', title: 'Execute PAPER fill', description: 'Fill an approved order at a stored PAPER market quote and post ledger entries atomically',
     kind: 'write', permission: 'invest:order:execute', agentCallable: false,
-    input: z.object({ orderId: Uuid }), output: z.object({ order: OrderView, fillId: Uuid, transactionId: Uuid, environment: z.literal('paper') }) }),
+    input: z.object({ orderId: Uuid, quantityUnits: Units.refine((value) => BigInt(value) > 0n).optional() }).strict(), output: z.object({ order: OrderView, fillId: Uuid, transactionId: Uuid, environment: z.literal('paper') }) }),
   cancel: defineCapability({ id: 'invest.orders.cancel', title: 'Cancel PAPER order', description: 'Cancel an unfilled PAPER order',
     kind: 'write', permission: 'invest:order:cancel', agentCallable: false, input: z.object({ orderId: Uuid }), output: OrderView }),
   killSwitch: defineCapability({ id: 'invest.orders.set-kill-switch', title: 'Halt PAPER trading', description: 'Halt new orders and cancel open PAPER orders for a portfolio; resuming requires this explicit action',

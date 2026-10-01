@@ -15,7 +15,7 @@ type QueryTx = Pick<ScopedTransaction, 'query'>;
 type OrderRow = {
   id: string; portfolio_id: string; instrument_id: string; symbol: string; side: 'buy'|'sell'; order_type: 'market'|'limit';
   quantity_units: string; limit_price_units: string|null; status: 'proposed'|'approved'|'submitted'|'partially_filled'|'filled'|'cancelled'|'expired';
-  environment: 'paper'; created_at: string;
+  environment: 'paper'; created_at: string; filled_units?: string;
 };
 type PortfolioRow = { id: string; name: string; base_asset: string; book_id: string; environment: 'paper'; status: 'active'|'paused'|'closed' };
 type InvestScope = Scope & LedgerScope;
@@ -102,7 +102,8 @@ export class InvestService {
   }
   async orders(scope: InvestScope, filter: { portfolioId?: string }): Promise<OrderRow[]> {
     return (await this.scoped.query<OrderRow>(scope,
-      `SELECT o.id,o.portfolio_id,o.instrument_id,i.symbol,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text
+      `SELECT o.id,o.portfolio_id,o.instrument_id,i.symbol,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text,
+         COALESCE((SELECT sum(f.quantity_units) FROM invest_fills f WHERE f.tenant_id=o.tenant_id AND f.workspace_id=o.workspace_id AND f.order_id=o.id),0)::text AS filled_units
        FROM invest_orders o JOIN invest_instruments i ON i.tenant_id=o.tenant_id AND i.workspace_id=o.workspace_id AND i.id=o.instrument_id
        WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.deleted_hlc IS NULL AND ($3::uuid IS NULL OR o.portfolio_id=$3)
        ORDER BY o.created_at DESC LIMIT 200`, [scope.tenantId, scope.workspaceId, filter.portfolioId ?? null])).rows;
@@ -304,7 +305,7 @@ export class InvestService {
           { ...breach.detail, source: 'market_mark', instrumentId: changedInstrumentId });
       }
       if (autoHalt) {
-        const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
+        const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted','partially_filled') RETURNING id,status`,
           [scope.tenantId, scope.workspaceId, portfolio.id]);
         for (const order of cancelled.rows) await this.orderEvent(tx, scope, actorId, order.id, 'cancelled', order.status, 'cancelled', { reason: 'Automatic PAPER risk halt after market mark' });
       }
@@ -435,7 +436,7 @@ export class InvestService {
         VALUES($1,$2,$3,invest_utc_risk_date(),$4,$4,0,$5,$6) ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET kill_switch=EXCLUDED.kill_switch,kill_reason=EXCLUDED.kill_reason,updated_at=now()`,
         [scope.tenantId, scope.workspaceId, input.portfolioId, openingNav, input.engaged, input.engaged ? input.reason : null]);
       if (!input.engaged) return { portfolioId: input.portfolioId, engaged: false, cancelledOrders: 0 };
-      const open = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
+      const open = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted','partially_filled') RETURNING id,status`,
         [scope.tenantId, scope.workspaceId, input.portfolioId]);
       for (const order of open.rows) await this.orderEvent(tx, scope, actorId, order.id, 'cancelled', order.status, 'cancelled', { reason: input.reason, killSwitch: true });
       return { portfolioId: input.portfolioId, engaged: true, cancelledOrders: open.rows.length };
@@ -603,10 +604,11 @@ export class InvestService {
     });
   }
 
-  async execute(scope: InvestScope, actorId: string, input: { orderId: string }): Promise<{ order: OrderRow; fillId: string; transactionId: string; environment: 'paper' }> {
+  async execute(scope: InvestScope, actorId: string, input: { orderId: string; quantityUnits?: string }): Promise<{ order: OrderRow; fillId: string; transactionId: string; environment: 'paper' }> {
     return this.paperLedger.withPaperTradeTransaction(scope, async (tx) => {
       const result = await tx.query<Record<string, unknown>>(
         `SELECT o.id,o.portfolio_id,o.instrument_id,o.mandate_id,o.risk_decision_id,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text,
+           COALESCE((SELECT sum(f.quantity_units) FROM invest_fills f WHERE f.tenant_id=o.tenant_id AND f.workspace_id=o.workspace_id AND f.order_id=o.id),0)::text AS filled_units,
            p.book_id,p.base_asset,i.symbol,i.asset_code,i.quantity_scale,i.exchange_code,q.price_units::text,q.id AS quote_id,q.received_at,
            accepted_quote.price_units::text AS accepted_price_units,m.limits AS mandate_limits
          FROM invest_orders o JOIN invest_portfolios p ON p.tenant_id=o.tenant_id AND p.workspace_id=o.workspace_id AND p.id=o.portfolio_id
@@ -616,10 +618,18 @@ export class InvestService {
          JOIN invest_market_prices accepted_quote ON accepted_quote.tenant_id=rd.tenant_id AND accepted_quote.workspace_id=rd.workspace_id AND accepted_quote.id=rd.quote_id
          JOIN LATERAL (SELECT id,price_units,received_at FROM invest_market_prices WHERE tenant_id=o.tenant_id AND workspace_id=o.workspace_id AND instrument_id=o.instrument_id ORDER BY received_at DESC LIMIT 1) q ON true
          WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3 FOR UPDATE OF o`, [scope.tenantId, scope.workspaceId, input.orderId]);
-      const row = result.rows[0]; if (!row || row['status'] !== 'approved' || row['environment'] !== 'paper') throw new Error('Only approved PAPER orders can execute');
+      const row = result.rows[0]; if (!row || !['approved','partially_filled'].includes(String(row['status'])) || row['environment'] !== 'paper') throw new Error('Only approved or partially filled PAPER orders can execute');
       const halt = await tx.query<{kill_switch:boolean}>(`SELECT kill_switch FROM invest_latest_risk_halt($1,$2,$3)`, [scope.tenantId,scope.workspaceId,row['portfolio_id']]);
       if (halt.rows[0]?.kill_switch) throw new Error('PAPER trading kill switch is engaged');
-      const quote = BigInt(String(row['price_units'])); const quantity = String(row['quantity_units']);
+      const quote = BigInt(String(row['price_units']));
+      const originalQuantity = BigInt(String(row['quantity_units']));
+      const filledQuantity = BigInt(String(row['filled_units']));
+      const remainingQuantity = originalQuantity - filledQuantity;
+      if (remainingQuantity <= 0n) throw new Error('PAPER order has no remaining quantity');
+      const quantity = input.quantityUnits ?? remainingQuantity.toString();
+      const fillQuantity = BigInt(quantity);
+      if (fillQuantity <= 0n || fillQuantity > remainingQuantity) throw new Error('PAPER fill quantity exceeds remaining order quantity');
+      const finalFill = fillQuantity === remainingQuantity;
       const mandateLimits = GuardrailLimits.parse(row['mandate_limits']);
       if (Date.now() - new Date(row['received_at'] as string | Date).getTime() > mandateLimits.quoteFreshnessSeconds * 1000) throw new Error('Latest PAPER market quote is stale');
       const acceptedPrice = BigInt(String(row['accepted_price_units']));
@@ -675,10 +685,15 @@ export class InvestService {
             VALUES($1,$2,$3,$4,$5,'disposed',$6,$7,$8,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, allocation.lotId, fillId, allocation.consumedUnits, allocation.basisUnits, allocation.proceedsUnits, allocation.realizedGainUnits]);
         }
       }
-      await tx.query(`UPDATE invest_orders SET status='submitted' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);
-      await this.orderEvent(tx, scope, actorId, input.orderId, 'submitted', 'approved', 'submitted', { environment: 'paper' });
-      await tx.query(`UPDATE invest_orders SET status='filled' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);
-      await this.orderEvent(tx, scope, actorId, input.orderId, 'filled', 'submitted', 'filled', { fillId, transactionId, environment: 'paper' });
+      const previousStatus = String(row['status']);
+      if (previousStatus === 'approved') {
+        await tx.query(`UPDATE invest_orders SET status='submitted' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);
+        await this.orderEvent(tx, scope, actorId, input.orderId, 'submitted', 'approved', 'submitted', { environment: 'paper' });
+      }
+      const nextStatus = finalFill ? 'filled' : 'partially_filled';
+      await tx.query(`UPDATE invest_orders SET status=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId, nextStatus]);
+      await this.orderEvent(tx, scope, actorId, input.orderId, finalFill ? 'filled' : 'partial_fill', previousStatus === 'approved' ? 'submitted' : previousStatus, nextStatus,
+        { fillId, transactionId, quantityUnits: quantity, remainingUnits: (remainingQuantity-fillQuantity).toString(), environment: 'paper' });
 
       const held = await tx.query<{instrument_id:string;quantity_units:string;quantity_scale:number;price_units:string|null}>(
         `SELECT i.id AS instrument_id,COALESCE(b.units,0)::text AS quantity_units,i.quantity_scale,q.price_units::text
@@ -721,13 +736,14 @@ export class InvestService {
       for (const breach of breaches) await this.createBreach(tx, scope, actorId, String(row['portfolio_id']), String(row['instrument_id']),
         autoHalt ? 'critical' : 'high', breach.kind, { ...breach.detail, sourceOrderId: input.orderId });
       if (autoHalt) {
-        const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND id<>$4 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
+        const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND id<>$4 AND status IN ('proposed','approved','submitted','partially_filled') RETURNING id,status`,
           [scope.tenantId, scope.workspaceId, row['portfolio_id'], input.orderId]);
         for (const order of cancelled.rows) await this.orderEvent(tx, scope, actorId, order.id, 'cancelled', order.status, 'cancelled', { reason: 'Automatic PAPER daily-loss halt' });
       }
       const order: OrderRow = { id: String(row['id']), portfolio_id: String(row['portfolio_id']), instrument_id: String(row['instrument_id']),
-        symbol: String(row['symbol']), side: row['side'] as 'buy'|'sell', order_type: row['order_type'] as 'market'|'limit', quantity_units: quantity,
-        limit_price_units: row['limit_price_units'] == null ? null : String(row['limit_price_units']), status: 'filled', environment: 'paper', created_at: String(row['created_at']) };
+        symbol: String(row['symbol']), side: row['side'] as 'buy'|'sell', order_type: row['order_type'] as 'market'|'limit', quantity_units: String(row['quantity_units']),
+        filled_units: (filledQuantity+fillQuantity).toString(),
+        limit_price_units: row['limit_price_units'] == null ? null : String(row['limit_price_units']), status: nextStatus, environment: 'paper', created_at: String(row['created_at']) };
       return { order, fillId, transactionId: post.transactionId, environment: 'paper' };
     });
   }

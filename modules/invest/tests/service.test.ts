@@ -117,11 +117,19 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   await service.approve(scope, userId, { orderId });
   const network = vi.fn();
   vi.stubGlobal('fetch', network);
+  let firstFill: Awaited<ReturnType<typeof service.execute>>;
   let fill: Awaited<ReturnType<typeof service.execute>>;
-  try { fill = await service.execute(scope, userId, { orderId }); }
+  try {
+    firstFill = await service.execute(scope, userId, { orderId, quantityUnits: '200000' });
+    expect(firstFill.order.status).toBe('partially_filled');
+    await expect(service.execute(scope,userId,{orderId,quantityUnits:'300001'})).rejects.toThrow(/exceeds remaining/);
+    fill = await service.execute(scope, userId, { orderId });
+  }
   finally { vi.unstubAllGlobals(); }
   expect(network).not.toHaveBeenCalled();
   expect(fill).toMatchObject({ order: { id: orderId, status: 'filled' }, environment: 'paper' });
+  expect(fill.order.filled_units).toBe('500000');
+  await expect(service.orders(scope,{portfolioId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:orderId,quantity_units:'500000',filled_units:'500000'})]));
 
   const persisted = await db.query<{ fills: number; ledger_transactions: number; entries: number; cash: string; position: string }>(
     `SELECT (SELECT count(*)::int FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3) AS fills,
@@ -131,10 +139,12 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
       (SELECT units::text FROM ledger_balances WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$5 AND account_id=(SELECT id FROM ledger_accounts WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$5 AND code=$6) AND asset=$7) AS position`,
     [tenantId, workspaceId, orderId, fill.transactionId, portfolio.book_id, `position:${instrumentId}`, `EQ:PAPERX`],
   );
-  expect(persisted.rows[0]).toMatchObject({ fills: 1, ledger_transactions: 1, entries: 4, cash: '95000', position: '500000' });
+  expect(persisted.rows[0]).toMatchObject({ fills: 2, ledger_transactions: 1, entries: 4, cash: '95000', position: '500000' });
   const openedLots = await service.taxLots(scope, { portfolioId: portfolio.id });
-  expect(openedLots).toHaveLength(1);
-  expect(openedLots[0]).toMatchObject({ instrumentId, acquiredUnits: '500000', remainingUnits: '500000', costBasisUnits: '5000', remainingBasisUnits: '5000' });
+  expect(openedLots).toHaveLength(2);
+  expect(openedLots.map((lot)=>[lot.instrumentId,lot.acquiredUnits,lot.remainingUnits,lot.costBasisUnits,lot.remainingBasisUnits])).toEqual([
+    [instrumentId,'200000','200000','2000','2000'],[instrumentId,'300000','300000','3000','3000'],
+  ]);
   await new Promise((resolve) => setTimeout(resolve, 1_100));
   const sell = await service.propose(scope, userId, { portfolioId, instrumentId, side: 'sell', orderType: 'market', stopPriceUnits: '11000', riskBps: 50, idempotencyKey: 'paper-fifo-disposal-test' });
   await service.approve(scope, userId, { orderId: sell.id });
@@ -145,7 +155,11 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
        sum(e.realized_gain_units)::text AS gain FROM invest_tax_lots l JOIN invest_tax_lot_events e
        ON e.tenant_id=l.tenant_id AND e.workspace_id=l.workspace_id AND e.lot_id=l.id
        WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 GROUP BY l.id`, [tenantId, workspaceId, portfolio.id]);
-  expect(lots.rows[0]).toEqual({ remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' });
+  expect(lots.rows).toHaveLength(2);
+  expect(lots.rows).toEqual([
+    { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
+    { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
+  ]);
   const matchedInput = { portfolioId:portfolio.id,sourceName:'Fixture custodian',sourceRef:'fixture://statement/matched',statementDate:'2026-09-30',cashUnits:'100000',positions:[] as Array<{symbol:string;units:string}> };
   await expect(service.reconcileStatement(scope, userCall(userId), { ...matchedInput, statementHash:'0'.repeat(64) })).rejects.toThrow(/content hash/);
   const matched = await service.reconcileStatement(scope, userCall(userId), { ...matchedInput, statementHash:hashStatement(matchedInput) });

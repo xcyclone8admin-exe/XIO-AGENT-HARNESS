@@ -9,7 +9,7 @@ import { investCapabilities as caps } from '../contracts';
 
 type Portfolio = { id: string; name: string; base_asset: string; book_id: string; environment: 'paper'; status: string };
 type Instrument = { id: string; symbol: string; asset_class: string; quantity_scale: number; exchange_code: string|null };
-type Order = { id:string; portfolio_id:string; instrument_id:string; symbol:string; side:'buy'|'sell'; order_type:'market'|'limit'; quantity_units:string; limit_price_units:string|null; status:string; environment:'paper'; created_at:string };
+type Order = { id:string; portfolio_id:string; instrument_id:string; symbol:string; side:'buy'|'sell'; order_type:'market'|'limit'; quantity_units:string; filled_units:string; limit_price_units:string|null; status:string; environment:'paper'; created_at:string };
 type ICMemo = { id:string; portfolio_id:string; version:number; title:string; status:'draft'|'in_review'|'approved'|'rejected'|'expired'; approvals:number; rejections:number; recusals:number; created_at:string };
 type Breach = { id:string; portfolio_id:string; instrument_id:string|null; kind:string; severity:'warning'|'high'|'critical'; status:'open'|'acknowledged'|'resolved'; owner_id:string|null; detail:Record<string,unknown>; opened_at:string };
 type Summary = { portfolioId:string; environment:'paper'; cashUnits:string; navUnits:string; positions:Array<{instrumentId:string;symbol:string;quantityUnits:string;priceUnits:string;marketValueUnits:string}> };
@@ -89,6 +89,7 @@ function OrdersPage({ workspaceId, api }: ModulePageProps) {
   const [stop, setStop] = useState('');
   const [limit, setLimit] = useState('');
   const [riskBps, setRiskBps] = useState('50');
+  const [fillQuantities, setFillQuantities] = useState<Record<string,string>>({});
   const [busy, setBusy] = useState<string|null>(null);
   const [error, setError] = useState<string|null>(null);
   const refresh = () => { portfolios.refresh(); instruments.refresh(); orders.refresh(); };
@@ -127,8 +128,8 @@ function OrdersPage({ workspaceId, api }: ModulePageProps) {
       {loading ? <LoadingState label="Loading paper orders" rows={4} /> : null}
       {!loading && !orders.data?.length ? <EmptyState icon={Activity} title="No PAPER orders yet">Risk-cleared proposals and simulator fills will be recorded here.</EmptyState> : null}
       {orders.data?.length ? <div className="divide-y divide-line">{orders.data.map((order) => <div key={order.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
-        <div><p className="font-medium">{order.side.toUpperCase()} {order.symbol} <Badge tone={order.status === 'filled' ? 'positive' : order.status === 'cancelled' ? 'neutral' : 'caution'}>{order.status}</Badge></p><p className="mt-1 font-mono text-xs text-fg-muted">{order.quantity_units} units · {order.order_type} · PAPER</p></div>
-        <div className="flex gap-2">{order.status === 'proposed' ? <Button size="sm" loading={busy === caps.approve.id} onClick={() => void call(caps.approve.id, { orderId: order.id })}>Approve</Button> : null}{order.status === 'approved' ? <Button size="sm" loading={busy === caps.execute.id} onClick={() => void call(caps.execute.id, { orderId: order.id })}>Simulate fill</Button> : null}{['proposed','approved','submitted'].includes(order.status) ? <Button size="sm" variant="secondary" loading={busy === caps.cancel.id} onClick={() => void call(caps.cancel.id, { orderId: order.id })}>Cancel</Button> : null}</div>
+        <div><p className="font-medium">{order.side.toUpperCase()} {order.symbol} <Badge tone={order.status === 'filled' ? 'positive' : order.status === 'cancelled' ? 'neutral' : 'caution'}>{order.status}</Badge></p><p className="mt-1 font-mono text-xs text-fg-muted">{order.filled_units}/{order.quantity_units} units filled · {order.order_type} · PAPER</p></div>
+        <div className="flex flex-wrap items-end gap-2">{order.status === 'proposed' ? <Button size="sm" loading={busy === caps.approve.id} onClick={() => void call(caps.approve.id, { orderId: order.id })}>Approve</Button> : null}{['approved','partially_filled'].includes(order.status) ? <><label className="space-y-1 text-xs text-fg-muted">Fill units (blank = all remaining)<Input aria-label={`PAPER fill units for ${order.symbol}`} inputMode="numeric" value={fillQuantities[order.id] ?? ''} onChange={(event) => setFillQuantities((current) => ({ ...current,[order.id]:event.target.value }))} /></label><Button size="sm" loading={busy === caps.execute.id} disabled={Boolean(fillQuantities[order.id] && !/^[1-9]\d{0,37}$/.test(fillQuantities[order.id] ?? ''))} onClick={() => void call(caps.execute.id, { orderId: order.id, ...(fillQuantities[order.id] ? { quantityUnits:fillQuantities[order.id] } : {}) })}>Simulate fill</Button></> : null}{['proposed','approved','submitted','partially_filled'].includes(order.status) ? <Button size="sm" variant="secondary" loading={busy === caps.cancel.id} onClick={() => void call(caps.cancel.id, { orderId: order.id })}>Cancel</Button> : null}</div>
       </div>)}</div> : null}
     </Panel>
   </div>;
