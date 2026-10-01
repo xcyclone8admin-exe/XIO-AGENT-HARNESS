@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- untyped JSON responses from the Worker under test */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
@@ -246,6 +247,25 @@ const project = () => {
 async function rawPut(url: string, body: string): Promise<Response> {
   const base = await mf.ready;
   return fetch(new URL(new URL(url).pathname, base), { method: 'PUT', body });
+}
+/** Actual chunked HTTP ingress with no Content-Length, bypassing Miniflare's dispatchFetch bridge. */
+async function rawChunkedPut(url: string, body: string): Promise<Response> {
+  const base = new URL(await mf.ready);
+  const target = new URL(new URL(url).pathname, base);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(
+      target,
+      { method: 'PUT', headers: { 'transfer-encoding': 'chunked' } },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })));
+        response.on('error', reject);
+      },
+    );
+    request.on('error', reject);
+    request.end(body);
+  });
 }
 const uuid = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
 
@@ -772,18 +792,9 @@ describe('blob references on workerd', () => {
     expect(put.json).toMatchObject({ mode: 'PUT', referenceStatus: 'references_unknown' });
     expect(put.json?.['url']).toMatch(/^\/v1\/blobs\/access\/[A-Za-z0-9_.-]+$/);
     const url = `${URL_BASE}${put.json?.['url']}`;
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode('hi'));
-        controller.close();
-      },
-    });
-    const noLength = await mf.dispatchFetch(url, {
-      method: 'PUT',
-      body: stream,
-      duplex: 'half',
-    } as never);
+    const noLength = await rawChunkedPut(url, 'hi');
     expect(noLength.status).toBe(411);
+    expect(await noLength.json()).toMatchObject({ code: 'LENGTH_REQUIRED' });
     const oversize = 17;
     const tooBig = await rawPut(url, 'a'.repeat(oversize));
     expect(tooBig.status).toBe(413);
