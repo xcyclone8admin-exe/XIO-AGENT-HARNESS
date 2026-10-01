@@ -14,6 +14,7 @@ import { DurableBusApproval, DurableBusAudit, DurableBusIdempotency } from './du
 import { registerBrainCapabilities } from './brain';
 import { registerFoundationCapabilities } from './foundation';
 import { createSidecarApp } from './http';
+import type { PushRequest as PushRequestValue, PushResponse as PushResponseValue } from '@xyra/contracts';
 
 export interface LocalSidecarOptions {
   readonly dataDir: string;
@@ -26,6 +27,8 @@ export interface LocalSidecarOptions {
   readonly launchToken?: string;
   /** Private native→sidecar callback token; must never be returned through LocalSidecarSession. */
   readonly nativeSyncToken?: string;
+  /** Trusted host adapter; leave unset until BRAIN's durable acknowledgement handler is available. */
+  readonly acceptCloudSyncPush?: (request: PushRequestValue, response: PushResponseValue) => Promise<void>;
 }
 
 export interface LocalSidecarSession {
@@ -65,6 +68,9 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       resolvePrincipal: async () => principal,
       bus,
       ...(options.nativeSyncToken === undefined ? {} : { nativeSyncToken: options.nativeSyncToken }),
+      ...(options.acceptCloudSyncPush === undefined
+        ? {}
+        : { acceptCloudSyncPush: options.acceptCloudSyncPush }),
     });
     const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: options.port });
     return {

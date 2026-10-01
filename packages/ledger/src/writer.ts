@@ -27,7 +27,14 @@ import {
   PostTransactionInput,
   ReverseTransactionInput,
 } from './contracts';
-import type { LedgerApi, LedgerEnvironment, LedgerScope, TrialBalance as TrialBalanceType } from './contracts';
+import type {
+  LedgerApi,
+  LedgerEnvironment,
+  LedgerScope,
+  PaperTradeLedgerApi,
+  PaperTradeTransaction,
+  TrialBalance as TrialBalanceType,
+} from './contracts';
 import { toUnits } from './units';
 
 export type LedgerStoreErrorCode =
@@ -37,6 +44,7 @@ export type LedgerStoreErrorCode =
   | 'CROSS_ENVIRONMENT'
   | 'CROSS_BOOK'
   | 'LIVE_TRADING_DISABLED'
+  | 'PAPER_ONLY'
   | 'UNKNOWN_ASSET'
   | 'SCALE_CONFLICT'
   | 'ALREADY_REVERSED'
@@ -89,9 +97,11 @@ function pgMessage(error: unknown): string {
  * PGlite ledger write/read primitive. Posting, entries and the SQL balance projection share one
  * scoped transaction. Higher-level aggregation/reconciliation and capability wiring build on this.
  */
-export class PGliteLedgerWriter implements LedgerApi {
+export class PGliteLedgerWriter implements LedgerApi, PaperTradeLedgerApi {
   private readonly scoped: LocalScopedStore;
-  constructor(private readonly db: PGlite) { this.scoped = new LocalScopedStore(db); }
+  constructor(private readonly db: PGlite) {
+    this.scoped = new LocalScopedStore(db);
+  }
 
   private async inScope<T>(scope: LedgerScope, work: (tx: TxContext) => Promise<T>): Promise<T> {
     if (!/^[0-9a-f-]{36}$/i.test(scope.tenantId) || !/^[0-9a-f-]{36}$/i.test(scope.workspaceId)) {
@@ -104,10 +114,64 @@ export class PGliteLedgerWriter implements LedgerApi {
       throw new LedgerStoreError('NOT_FOUND', 'Workspace HLC is too far in the future');
     }
     try {
-      return await this.scoped.withServerScope(scope, 'money_ledger', scope.hlc, (tx) => work({ query: tx.query }));
+      return await this.scoped.withServerScope(scope, 'money_ledger', scope.hlc, (tx) =>
+        work({ query: tx.query }),
+      );
     } catch (error) {
       const message = pgMessage(error);
       if (/LIVE_TRADING_DISABLED/.test(message)) throw new LedgerStoreError('LIVE_TRADING_DISABLED');
+      if (/UNBALANCED/.test(message)) throw new LedgerStoreError('UNBALANCED');
+      if (/TOO_FEW_ENTRIES/.test(message)) throw new LedgerStoreError('TOO_FEW_ENTRIES');
+      if (/CROSS_ENVIRONMENT/.test(message)) throw new LedgerStoreError('CROSS_ENVIRONMENT');
+      if (/ledger_transactions_tenant_id_workspace_id_reverses_id_key|duplicate key/.test(message)) {
+        if (/reverses_id/.test(message)) throw new LedgerStoreError('ALREADY_REVERSED');
+        throw new LedgerStoreError('IDEMPOTENCY_CONFLICT');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Execute Invest's domain writes and ledger posting in one capability-scoped transaction.
+   * The `invest_paper_execution` role receives only declared Invest rows, ledger read tables,
+   * ledger append tables and the local balance projection.
+   */
+  async withPaperTradeTransaction<T>(
+    scope: LedgerScope,
+    work: (transaction: PaperTradeTransaction) => Promise<T>,
+  ): Promise<T> {
+    if (!/^[0-9a-f-]{36}$/i.test(scope.tenantId) || !/^[0-9a-f-]{36}$/i.test(scope.workspaceId)) {
+      throw new LedgerStoreError('NOT_FOUND', 'Invalid ledger scope');
+    }
+    try {
+      return await this.scoped.withServerScope(
+        scope,
+        'invest_paper_execution',
+        scope.hlc,
+        async (scopedTx) => {
+          const tx: TxContext = { query: (sql, params) => scopedTx.query(sql, params) };
+          const transaction: PaperTradeTransaction = {
+            query: <T extends Record<string, unknown>>(sql: string, params?: unknown[]) =>
+              scopedTx.query<T>(sql, params),
+            post: async (actorId, value) => {
+              const input = PostTransactionInput.parse(value);
+              if (input.environment !== 'paper') throw new LedgerStoreError('PAPER_ONLY');
+              if (input.entries.some((entry) => entry.externalRef !== undefined)) {
+                throw new LedgerStoreError(
+                  'IDEMPOTENCY_CONFLICT',
+                  'Paper trade posting uses correlationId, not import externalRef',
+                );
+              }
+              return this.postInTransaction(tx, scope, actorId, input, null);
+            },
+          };
+          return work(transaction);
+        },
+      );
+    } catch (error) {
+      const message = pgMessage(error);
+      if (/LIVE_TRADING_DISABLED/.test(message)) throw new LedgerStoreError('LIVE_TRADING_DISABLED');
+      if (/PAPER_ONLY/.test(message)) throw new LedgerStoreError('PAPER_ONLY');
       if (/UNBALANCED/.test(message)) throw new LedgerStoreError('UNBALANCED');
       if (/TOO_FEW_ENTRIES/.test(message)) throw new LedgerStoreError('TOO_FEW_ENTRIES');
       if (/CROSS_ENVIRONMENT/.test(message)) throw new LedgerStoreError('CROSS_ENVIRONMENT');
@@ -259,6 +323,16 @@ export class PGliteLedgerWriter implements LedgerApi {
     value: PostTransactionInput,
     reversesId: string | null,
   ): Promise<PostResult> {
+    return this.inScope(scope, (tx) => this.postInTransaction(tx, scope, actorId, value, reversesId));
+  }
+
+  private async postInTransaction(
+    tx: TxContext,
+    scope: LedgerScope,
+    actorId: string,
+    value: PostTransactionInput,
+    reversesId: string | null,
+  ): Promise<PostResult> {
     const input = PostTransactionInput.parse(value);
     if (input.environment === 'live') throw new LedgerStoreError('LIVE_TRADING_DISABLED');
     const totals = new Map<string, bigint>();
@@ -268,7 +342,7 @@ export class PGliteLedgerWriter implements LedgerApi {
     }
     if ([...totals.values()].some((units) => units !== 0n)) throw new LedgerStoreError('UNBALANCED');
 
-    return this.inScope(scope, async (tx) => {
+    {
       const prior = await tx.query<Record<string, unknown>>(
         `SELECT id,book_id,environment,effective_date::text,description,source,correlation_id,reverses_id
          FROM ledger_transactions WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,
@@ -400,7 +474,7 @@ export class PGliteLedgerWriter implements LedgerApi {
         );
       }
       return PostResult.parse({ status: 'posted', transactionId: input.id, discrepancyId: null });
-    });
+    }
   }
 
   async reverse(scope: LedgerScope, actorId: string, value: ReverseTransactionInput): Promise<PostResult> {
@@ -491,7 +565,8 @@ export class PGliteLedgerWriter implements LedgerApi {
 
   async transactions(scope: LedgerScope, value: TransactionQuery): Promise<TransactionPage> {
     const query = TransactionQuery.parse(value);
-    if (query.from && query.to && query.from > query.to) throw new LedgerStoreError('NOT_FOUND', 'Invalid date range');
+    if (query.from && query.to && query.from > query.to)
+      throw new LedgerStoreError('NOT_FOUND', 'Invalid date range');
     const cursor = query.cursor ? this.decodeCursor(query.cursor) : null;
     return this.inScope(scope, async (tx) => {
       const { rows } = await tx.query<Record<string, unknown>>(
@@ -506,9 +581,19 @@ export class PGliteLedgerWriter implements LedgerApi {
              AND e.workspace_id=t.workspace_id AND e.transaction_id=t.id AND e.account_id=$8))
            AND ($9::date IS NULL OR (t.effective_date,t.id) < ($9::date,$10::uuid))
          ORDER BY t.effective_date DESC,t.id DESC LIMIT $11`,
-        [scope.tenantId, scope.workspaceId, query.environment, query.bookId ?? null, query.correlationId ?? null,
-          query.from ?? null, query.to ?? null, query.accountId ?? null, cursor?.date ?? null, cursor?.id ?? null,
-          query.limit + 1],
+        [
+          scope.tenantId,
+          scope.workspaceId,
+          query.environment,
+          query.bookId ?? null,
+          query.correlationId ?? null,
+          query.from ?? null,
+          query.to ?? null,
+          query.accountId ?? null,
+          cursor?.date ?? null,
+          cursor?.id ?? null,
+          query.limit + 1,
+        ],
       );
       const hasMore = rows.length > query.limit;
       const pageRows = rows.slice(0, query.limit);
@@ -519,20 +604,35 @@ export class PGliteLedgerWriter implements LedgerApi {
            WHERE tenant_id=$1 AND workspace_id=$2 AND transaction_id=$3 ORDER BY line_no`,
           [scope.tenantId, scope.workspaceId, row['id']],
         );
-        items.push(Transaction.parse({
-          id: row['id'], bookId: row['book_id'], environment: row['environment'],
-          effectiveDate: row['effective_date'], description: row['description'], source: row['source'],
-          correlationId: row['correlation_id'], reversesId: row['reverses_id'], reversedById: row['reversed_by_id'],
-          postedBy: row['posted_by'], postedAt: this.iso(row['posted_at']),
-          entries: entryResult.rows.map((entry) => ({
-            id: entry['id'], transactionId: entry['transaction_id'], lineNo: entry['line_no'],
-            accountId: entry['account_id'], asset: entry['asset'], units: String(entry['units']),
-            memo: entry['memo'], externalRef: entry['external_ref'],
-          })),
-        }));
+        items.push(
+          Transaction.parse({
+            id: row['id'],
+            bookId: row['book_id'],
+            environment: row['environment'],
+            effectiveDate: row['effective_date'],
+            description: row['description'],
+            source: row['source'],
+            correlationId: row['correlation_id'],
+            reversesId: row['reverses_id'],
+            reversedById: row['reversed_by_id'],
+            postedBy: row['posted_by'],
+            postedAt: this.iso(row['posted_at']),
+            entries: entryResult.rows.map((entry) => ({
+              id: entry['id'],
+              transactionId: entry['transaction_id'],
+              lineNo: entry['line_no'],
+              accountId: entry['account_id'],
+              asset: entry['asset'],
+              units: String(entry['units']),
+              memo: entry['memo'],
+              externalRef: entry['external_ref'],
+            })),
+          }),
+        );
       }
       const last = pageRows.at(-1);
-      const nextCursor = hasMore && last ? this.encodeCursor(String(last['effective_date']), String(last['id'])) : null;
+      const nextCursor =
+        hasMore && last ? this.encodeCursor(String(last['effective_date']), String(last['id'])) : null;
       return TransactionPage.parse({ items, nextCursor });
     });
   }
@@ -540,8 +640,10 @@ export class PGliteLedgerWriter implements LedgerApi {
   async trialBalance(scope: LedgerScope, value: TrialBalanceQuery): Promise<TrialBalanceType> {
     const query = TrialBalanceQuery.parse(value);
     return this.inScope(scope, async (tx) => {
-      const book = await tx.query(`SELECT 1 FROM ledger_books WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND environment=$4`,
-        [scope.tenantId, scope.workspaceId, query.bookId, query.environment]);
+      const book = await tx.query(
+        `SELECT 1 FROM ledger_books WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND environment=$4`,
+        [scope.tenantId, scope.workspaceId, query.bookId, query.environment],
+      );
       if (!book.rows.length) throw new LedgerStoreError('NOT_FOUND', 'Ledger book not found');
       const { rows } = await tx.query<Record<string, unknown>>(
         `SELECT a.id AS account_id,a.code AS account_code,a.name AS account_name,a.type AS account_type,
@@ -557,15 +659,32 @@ export class PGliteLedgerWriter implements LedgerApi {
       const mapped = rows.map((r) => {
         const units = BigInt(String(r['units']));
         const agg = byAsset.get(String(r['asset'])) ?? { scale: Number(r['scale']), debit: 0n, credit: 0n };
-        if (units > 0n) agg.debit += units; else agg.credit += -units;
+        if (units > 0n) agg.debit += units;
+        else agg.credit += -units;
         byAsset.set(String(r['asset']), agg);
-        return { accountId: r['account_id'], accountCode: r['account_code'], accountName: r['account_name'],
-          accountType: r['account_type'], asset: r['asset'], scale: r['scale'], debit: (units > 0n ? units : 0n).toString(),
-          credit: (units < 0n ? -units : 0n).toString() };
+        return {
+          accountId: r['account_id'],
+          accountCode: r['account_code'],
+          accountName: r['account_name'],
+          accountType: r['account_type'],
+          asset: r['asset'],
+          scale: r['scale'],
+          debit: (units > 0n ? units : 0n).toString(),
+          credit: (units < 0n ? -units : 0n).toString(),
+        };
       });
-      return TrialBalance.parse({ environment: query.environment, bookId: query.bookId, rows: mapped,
-        totals: [...byAsset].map(([asset, x]) => ({ asset, scale: x.scale, debit: x.debit.toString(),
-          credit: x.credit.toString(), balanced: x.debit === x.credit })) });
+      return TrialBalance.parse({
+        environment: query.environment,
+        bookId: query.bookId,
+        rows: mapped,
+        totals: [...byAsset].map(([asset, x]) => ({
+          asset,
+          scale: x.scale,
+          debit: x.debit.toString(),
+          credit: x.credit.toString(),
+          balanced: x.debit === x.credit,
+        })),
+      });
     });
   }
 
@@ -581,21 +700,38 @@ export class PGliteLedgerWriter implements LedgerApi {
          WHERE b.tenant_id=$1 AND b.workspace_id=$2 AND b.environment=$3 AND b.deleted_hlc IS NULL
            AND ($4::uuid[] IS NULL OR b.id=ANY($4)) AND ($6::text IS NULL OR b.owner_module=$6)
          GROUP BY a.type,asst.scale ORDER BY a.type`,
-        [scope.tenantId, scope.workspaceId, query.environment, query.bookIds?.length ? query.bookIds : null,
-          query.asset, query.ownerModule ?? null],
+        [
+          scope.tenantId,
+          scope.workspaceId,
+          query.environment,
+          query.bookIds?.length ? query.bookIds : null,
+          query.asset,
+          query.ownerModule ?? null,
+        ],
       );
       const bookCount = await tx.query<{ count: number }>(
         `SELECT count(*)::int AS count FROM ledger_books b
          WHERE b.tenant_id=$1 AND b.workspace_id=$2 AND b.environment=$3 AND b.deleted_hlc IS NULL
            AND ($4::uuid[] IS NULL OR b.id=ANY($4)) AND ($5::text IS NULL OR b.owner_module=$5)
            AND EXISTS (SELECT 1 FROM ledger_assets a WHERE a.tenant_id=b.tenant_id AND a.workspace_id=b.workspace_id AND a.code=$6)`,
-        [scope.tenantId, scope.workspaceId, query.environment, query.bookIds?.length ? query.bookIds : null,
-          query.ownerModule ?? null, query.asset],
+        [
+          scope.tenantId,
+          scope.workspaceId,
+          query.environment,
+          query.bookIds?.length ? query.bookIds : null,
+          query.ownerModule ?? null,
+          query.asset,
+        ],
       );
       const byType = Object.fromEntries(rows.map((r) => [String(r['type']), String(r['units'])]));
       for (const type of ['asset', 'liability', 'equity', 'income', 'expense']) byType[type] ??= '0';
-      return TypeTotals.parse({ environment: query.environment, asset: query.asset, scale: rows[0]?.['scale'] ?? 0,
-        byType, bookCount: bookCount.rows[0]?.count ?? 0 });
+      return TypeTotals.parse({
+        environment: query.environment,
+        asset: query.asset,
+        scale: rows[0]?.['scale'] ?? 0,
+        byType,
+        bookCount: bookCount.rows[0]?.count ?? 0,
+      });
     });
   }
 
@@ -618,17 +754,28 @@ export class PGliteLedgerWriter implements LedgerApi {
           LEFT JOIN ledger_balances b ON b.tenant_id=$1 AND b.workspace_id=$2 AND b.book_id=k.book_id
             AND b.environment=k.environment AND b.account_id=k.account_id AND b.asset=k.asset
          WHERE t.account_id IS NULL OR b.account_id IS NULL OR t.units<>b.units::text OR t.entry_count<>b.entry_count
-         ORDER BY k.book_id,k.account_id,k.asset`, filter);
+         ORDER BY k.book_id,k.account_id,k.asset`,
+        filter,
+      );
       const watermark = await tx.query<{ entry_count: number; latest_entry: string | null }>(
         `SELECT count(*)::int AS entry_count,max(created_at)::text AS latest_entry FROM ledger_entries
-         WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::uuid IS NULL OR book_id=$4)`, filter);
-      const payload = JSON.stringify([scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null,
-        watermark.rows[0]?.entry_count ?? 0, watermark.rows[0]?.latest_entry ?? null]);
+         WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::uuid IS NULL OR book_id=$4)`,
+        filter,
+      );
+      const payload = JSON.stringify([
+        scope.tenantId,
+        scope.workspaceId,
+        input.environment,
+        input.bookId ?? null,
+        watermark.rows[0]?.entry_count ?? 0,
+        watermark.rows[0]?.latest_entry ?? null,
+      ]);
       const runKey = createHash('sha256').update(payload).digest('hex');
       const prior = await tx.query<Record<string, unknown>>(
         `SELECT id,environment,book_id,run_key,checked_balances,discrepancy_count,status,started_at FROM ledger_reconciliation_runs
          WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND book_id IS NOT DISTINCT FROM $4 AND run_key=$5`,
-        [scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null, runKey]);
+        [scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null, runKey],
+      );
       if (prior.rows[0]) return this.runOut(prior.rows[0], true);
       const id = randomUUID();
       const status = mismatches.rows.length ? 'discrepancies' : 'clean';
@@ -637,34 +784,76 @@ export class PGliteLedgerWriter implements LedgerApi {
           SELECT e.book_id,e.account_id,e.asset FROM ledger_entries e WHERE e.tenant_id=$1 AND e.workspace_id=$2
             AND e.environment=$3 AND ($4::uuid IS NULL OR e.book_id=$4) GROUP BY e.book_id,e.account_id,e.asset
           UNION SELECT b.book_id,b.account_id,b.asset FROM ledger_balances b WHERE b.tenant_id=$1 AND b.workspace_id=$2
-            AND b.environment=$3 AND ($4::uuid IS NULL OR b.book_id=$4)) keys`, filter);
-      await tx.query(`INSERT INTO ledger_reconciliation_runs(id,tenant_id,workspace_id,environment,book_id,run_key,
+            AND b.environment=$3 AND ($4::uuid IS NULL OR b.book_id=$4)) keys`,
+        filter,
+      );
+      await tx.query(
+        `INSERT INTO ledger_reconciliation_runs(id,tenant_id,workspace_id,environment,book_id,run_key,
         checked_balances,discrepancy_count,status,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [id, scope.tenantId, scope.workspaceId, input.environment, input.bookId ?? null, runKey,
-          checked.rows[0]?.count ?? 0, mismatches.rows.length, status, actorId]);
-      for (const m of mismatches.rows) await tx.query(
-        `INSERT INTO ledger_discrepancies(id,tenant_id,workspace_id,run_id,kind,status,environment,book_id,account_id,asset,
+        [
+          id,
+          scope.tenantId,
+          scope.workspaceId,
+          input.environment,
+          input.bookId ?? null,
+          runKey,
+          checked.rows[0]?.count ?? 0,
+          mismatches.rows.length,
+          status,
+          actorId,
+        ],
+      );
+      for (const m of mismatches.rows)
+        await tx.query(
+          `INSERT INTO ledger_discrepancies(id,tenant_id,workspace_id,run_id,kind,status,environment,book_id,account_id,asset,
           expected_units,recorded_units,detail) VALUES($1,$2,$3,$4,$5,'open',$6,$7,$8,$9,$10,$11,$12)`,
-        [randomUUID(), scope.tenantId, scope.workspaceId, id, m['kind'], input.environment, m['book_id'], m['account_id'],
-          m['asset'], m['expected_units'], m['recorded_units'], 'Balance projection differs from immutable ledger entries']);
-      return ReconciliationRun.parse({ id, environment: input.environment, bookId: input.bookId ?? null, runKey,
-        checkedBalances: checked.rows[0]?.count ?? 0, discrepancyCount: mismatches.rows.length, status,
-        startedAt: new Date().toISOString(), reused: false });
+          [
+            randomUUID(),
+            scope.tenantId,
+            scope.workspaceId,
+            id,
+            m['kind'],
+            input.environment,
+            m['book_id'],
+            m['account_id'],
+            m['asset'],
+            m['expected_units'],
+            m['recorded_units'],
+            'Balance projection differs from immutable ledger entries',
+          ],
+        );
+      return ReconciliationRun.parse({
+        id,
+        environment: input.environment,
+        bookId: input.bookId ?? null,
+        runKey,
+        checkedBalances: checked.rows[0]?.count ?? 0,
+        discrepancyCount: mismatches.rows.length,
+        status,
+        startedAt: new Date().toISOString(),
+        reused: false,
+      });
     });
   }
 
   async discrepancies(scope: LedgerScope, value: DiscrepancyQuery): Promise<Discrepancy[]> {
     const query = DiscrepancyQuery.parse(value);
-    const result = await this.scoped.query<Record<string, unknown>>(scope,
+    const result = await this.scoped.query<Record<string, unknown>>(
+      scope,
       `SELECT id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
          external_ref,detail,resolution,created_at,resolved_at FROM ledger_discrepancies
        WHERE tenant_id=$1 AND workspace_id=$2 AND environment=$3 AND ($4::text IS NULL OR status=$4)
          AND ($5::uuid IS NULL OR book_id=$5) ORDER BY created_at DESC,id`,
-      [scope.tenantId, scope.workspaceId, query.environment, query.status ?? null, query.bookId ?? null]);
+      [scope.tenantId, scope.workspaceId, query.environment, query.status ?? null, query.bookId ?? null],
+    );
     return result.rows.map((r) => this.discrepancyOut(r));
   }
 
-  async assignDiscrepancy(scope: LedgerScope, actorId: string, value: AssignDiscrepancyInput): Promise<Discrepancy> {
+  async assignDiscrepancy(
+    scope: LedgerScope,
+    actorId: string,
+    value: AssignDiscrepancyInput,
+  ): Promise<Discrepancy> {
     const input = AssignDiscrepancyInput.parse(value);
     return this.inScope(scope, async (tx) => {
       const { rows } = await tx.query<Record<string, unknown>>(
@@ -672,35 +861,52 @@ export class PGliteLedgerWriter implements LedgerApi {
          WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status<>'resolved'
          RETURNING id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
            external_ref,detail,resolution,created_at,resolved_at`,
-        [scope.tenantId, scope.workspaceId, input.discrepancyId, input.ownerId]);
+        [scope.tenantId, scope.workspaceId, input.discrepancyId, input.ownerId],
+      );
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Open discrepancy not found');
       return this.discrepancyOut(rows[0]);
     });
   }
 
-  async resolveDiscrepancy(scope: LedgerScope, actorId: string, value: ResolveDiscrepancyInput): Promise<Discrepancy> {
+  async resolveDiscrepancy(
+    scope: LedgerScope,
+    actorId: string,
+    value: ResolveDiscrepancyInput,
+  ): Promise<Discrepancy> {
     const input = ResolveDiscrepancyInput.parse(value);
     return this.inScope(scope, async (tx) => {
       const before = await tx.query<Record<string, unknown>>(
         `SELECT id,book_id,environment,account_id,asset FROM ledger_discrepancies
          WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status<>'resolved'`,
-        [scope.tenantId, scope.workspaceId, input.discrepancyId]);
+        [scope.tenantId, scope.workspaceId, input.discrepancyId],
+      );
       const d = before.rows[0];
       if (!d) throw new LedgerStoreError('NOT_FOUND', 'Open discrepancy not found');
       if (input.rebuildProjection && d['account_id'] && d['asset']) {
-        await tx.query(`INSERT INTO ledger_balances(tenant_id,workspace_id,book_id,environment,account_id,asset,units,entry_count,as_of_hlc)
+        await tx.query(
+          `INSERT INTO ledger_balances(tenant_id,workspace_id,book_id,environment,account_id,asset,units,entry_count,as_of_hlc)
           SELECT $1,$2,$5,$6,$3,$4,COALESCE(sum(units),0),count(*)::int,$7
           FROM ledger_entries WHERE tenant_id=$1 AND workspace_id=$2 AND account_id=$3 AND asset=$4
           ON CONFLICT(tenant_id,workspace_id,account_id,asset) DO UPDATE SET
             units=EXCLUDED.units,entry_count=EXCLUDED.entry_count,as_of_hlc=GREATEST(ledger_balances.as_of_hlc,EXCLUDED.as_of_hlc)`,
-          [scope.tenantId, scope.workspaceId, d['account_id'], d['asset'], d['book_id'], d['environment'], scope.hlc ?? '']);
+          [
+            scope.tenantId,
+            scope.workspaceId,
+            d['account_id'],
+            d['asset'],
+            d['book_id'],
+            d['environment'],
+            scope.hlc ?? '',
+          ],
+        );
       }
       const { rows } = await tx.query<Record<string, unknown>>(
         `UPDATE ledger_discrepancies SET status='resolved',resolution=$4,resolved_at=now(),updated_at=now()
          WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3
          RETURNING id,run_id,kind,status,owner_id,environment,book_id,account_id,asset,expected_units::text,recorded_units::text,
            external_ref,detail,resolution,created_at,resolved_at`,
-        [scope.tenantId, scope.workspaceId, input.discrepancyId, input.resolution]);
+        [scope.tenantId, scope.workspaceId, input.discrepancyId, input.resolution],
+      );
       if (!rows[0]) throw new LedgerStoreError('NOT_FOUND', 'Discrepancy not found');
       return this.discrepancyOut(rows[0]);
     });
@@ -712,9 +918,17 @@ export class PGliteLedgerWriter implements LedgerApi {
 
   private decodeCursor(cursor: string): { date: string; id: string } {
     try {
-      const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as { date?: unknown; id?: unknown };
-      if (typeof decoded.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(decoded.date) ||
-        typeof decoded.id !== 'string' || !/^[0-9a-f-]{36}$/i.test(decoded.id)) throw new Error('bad cursor');
+      const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+        date?: unknown;
+        id?: unknown;
+      };
+      if (
+        typeof decoded.date !== 'string' ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(decoded.date) ||
+        typeof decoded.id !== 'string' ||
+        !/^[0-9a-f-]{36}$/i.test(decoded.id)
+      )
+        throw new Error('bad cursor');
       return { date: decoded.date, id: decoded.id };
     } catch {
       throw new LedgerStoreError('NOT_FOUND', 'Invalid transaction cursor');
@@ -726,18 +940,38 @@ export class PGliteLedgerWriter implements LedgerApi {
   }
 
   private runOut(row: Record<string, unknown>, reused: boolean): ReconciliationRun {
-    return ReconciliationRun.parse({ id: row['id'], environment: row['environment'], bookId: row['book_id'],
-      runKey: row['run_key'], checkedBalances: row['checked_balances'], discrepancyCount: row['discrepancy_count'],
-      status: row['status'], startedAt: this.iso(row['started_at']), reused });
+    return ReconciliationRun.parse({
+      id: row['id'],
+      environment: row['environment'],
+      bookId: row['book_id'],
+      runKey: row['run_key'],
+      checkedBalances: row['checked_balances'],
+      discrepancyCount: row['discrepancy_count'],
+      status: row['status'],
+      startedAt: this.iso(row['started_at']),
+      reused,
+    });
   }
 
   private discrepancyOut(row: Record<string, unknown>): Discrepancy {
-    return Discrepancy.parse({ id: row['id'], runId: row['run_id'], kind: row['kind'], status: row['status'],
-      ownerId: row['owner_id'], environment: row['environment'], bookId: row['book_id'], accountId: row['account_id'],
-      asset: row['asset'], expectedUnits: row['expected_units'] === null ? null : String(row['expected_units']),
-      recordedUnits: row['recorded_units'] === null ? null : String(row['recorded_units']), externalRef: row['external_ref'],
-      detail: row['detail'], resolution: row['resolution'], createdAt: this.iso(row['created_at']),
-      resolvedAt: row['resolved_at'] === null ? null : this.iso(row['resolved_at']) });
+    return Discrepancy.parse({
+      id: row['id'],
+      runId: row['run_id'],
+      kind: row['kind'],
+      status: row['status'],
+      ownerId: row['owner_id'],
+      environment: row['environment'],
+      bookId: row['book_id'],
+      accountId: row['account_id'],
+      asset: row['asset'],
+      expectedUnits: row['expected_units'] === null ? null : String(row['expected_units']),
+      recordedUnits: row['recorded_units'] === null ? null : String(row['recorded_units']),
+      externalRef: row['external_ref'],
+      detail: row['detail'],
+      resolution: row['resolution'],
+      createdAt: this.iso(row['created_at']),
+      resolvedAt: row['resolved_at'] === null ? null : this.iso(row['resolved_at']),
+    });
   }
 
   private bookOut(row: BookRow | undefined): unknown {

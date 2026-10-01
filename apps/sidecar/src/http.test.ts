@@ -88,7 +88,7 @@ test('the HTTP call resolves its own principal and runs the shared bus', async (
 });
 
 test('Cloud sync result callback requires a separate native-only token and validates the pair', async () => {
-  const path = '/api/v1/internal/cloud-sync/push-result';
+  const path = '/internal/native/cloud-sync/push';
   const changeId = '019a0000-0000-7000-8000-000000000061';
   const hlc = '1790000000000-0003-devicea';
   const request = {
@@ -96,10 +96,17 @@ test('Cloud sync result callback requires a separate native-only token and valid
     schemaVersion: 'cloud-sync-v1',
     nodeId: 'devicea',
     idempotencyKey: 'native-sync-00000001',
-    changes: [{
-      table: 'brain_sources', id: changeId, tenantId: principal.tenantId, workspaceId: WORKSPACE,
-      op: 'upsert', fields: { title: { value: 'source', hlc, baseHlc: null } }, hlc,
-    }],
+    changes: [
+      {
+        table: 'brain_sources',
+        id: changeId,
+        tenantId: principal.tenantId,
+        workspaceId: WORKSPACE,
+        op: 'upsert',
+        fields: { title: { value: 'source', hlc, baseHlc: null } },
+        hlc,
+      },
+    ],
   };
   const response = {
     accepted: 1,
@@ -107,10 +114,18 @@ test('Cloud sync result callback requires a separate native-only token and valid
     serverSeq: '1',
     rejected: [],
     conflictHistory: [],
-    changeOutcomes: [{
-      index: 0, changeId, table: 'brain_sources', rowId: changeId, outcome: 'committed',
-      appliedFields: ['title'], unchangedFields: [], conflictedFields: [],
-    }],
+    changeOutcomes: [
+      {
+        index: 0,
+        changeId,
+        table: 'brain_sources',
+        rowId: changeId,
+        outcome: 'committed',
+        appliedFields: ['title'],
+        unchangedFields: [],
+        conflictedFields: [],
+      },
+    ],
     replayed: false,
   };
   let recorded = 0;
@@ -131,13 +146,32 @@ test('Cloud sync result callback requires a separate native-only token and valid
   const body = JSON.stringify({ request, response });
   const userTokenAttempt = await nativeApp.request(endpoint, {
     method: 'POST',
-    headers: { host: '127.0.0.1:43118', authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    headers: {
+      host: '127.0.0.1:43118',
+      authorization: `Bearer ${TOKEN}`,
+      'content-type': 'application/json',
+    },
     body,
   });
   expect(userTokenAttempt.status).toBe(403);
+  const webviewOriginAttempt = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:43118',
+      authorization: `Bearer ${NATIVE_SYNC_TOKEN}`,
+      origin: 'http://tauri.localhost',
+      'content-type': 'application/json',
+    },
+    body,
+  });
+  expect(webviewOriginAttempt.status).toBe(403);
   const accepted = await nativeApp.request(endpoint, {
     method: 'POST',
-    headers: { host: '127.0.0.1:43118', authorization: `Bearer ${NATIVE_SYNC_TOKEN}`, 'content-type': 'application/json' },
+    headers: {
+      host: '127.0.0.1:43118',
+      'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+      'content-type': 'application/json',
+    },
     body,
   });
   expect(accepted.status).toBe(200);
@@ -145,7 +179,11 @@ test('Cloud sync result callback requires a separate native-only token and valid
   expect(recorded).toBe(1);
   const missingOutcomes = await nativeApp.request(endpoint, {
     method: 'POST',
-    headers: { host: '127.0.0.1:43118', authorization: `Bearer ${NATIVE_SYNC_TOKEN}`, 'content-type': 'application/json' },
+    headers: {
+      host: '127.0.0.1:43118',
+      'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+      'content-type': 'application/json',
+    },
     body: JSON.stringify({ request, response: { ...response, changeOutcomes: undefined } }),
   });
   expect(missingOutcomes.status).toBe(409);
@@ -157,7 +195,11 @@ test('Cloud sync result callback requires a separate native-only token and valid
   };
   const wrongScope = await nativeApp.request(endpoint, {
     method: 'POST',
-    headers: { host: '127.0.0.1:43118', authorization: `Bearer ${NATIVE_SYNC_TOKEN}`, 'content-type': 'application/json' },
+    headers: {
+      host: '127.0.0.1:43118',
+      'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+      'content-type': 'application/json',
+    },
     body: JSON.stringify({ request: wrongTenantRequest, response }),
   });
   expect(wrongScope.status).toBe(403);
