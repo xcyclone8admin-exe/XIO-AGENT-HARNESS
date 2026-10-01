@@ -22,6 +22,7 @@ export function planSchedule(input: unknown): zReturn<typeof ScheduleResult> {
   const done = new Set(nodes.filter((ticket) => ticket.state === 'done').map((ticket) => ticket.id));
   const blocked = new Set<string>();
   const runnable = nodes.filter((ticket) => {
+    if (ticket.kind !== 'ticket' && ticket.kind !== 'subtask') return false;
     if (ticket.state !== 'ready' && ticket.state !== 'queued') return false;
     if (ticket.dependencies.some((id) => !done.has(id))) { blocked.add(ticket.id); return false; }
     if (ticket.dependencies.some((id) => !nodes.some((node) => node.id === id) && !done.has(id))) { blocked.add(ticket.id); return false; }
@@ -29,7 +30,7 @@ export function planSchedule(input: unknown): zReturn<typeof ScheduleResult> {
     return true;
   }).slice(0, request.config.maxConcurrency);
   const runId = uuidv7();
-  return { runId, state: runnable.length ? 'queued' : 'blocked', runnableTicketIds: runnable.map((ticket) => ticket.id), blockedTicketIds: [...new Set([...blocked, ...nodes.filter((t) => !runnable.includes(t) && t.state !== 'done').map((t) => t.id)])], reason: runnable.length ? null : 'NO_RUNNABLE_TICKETS', externalExecution: false };
+  return { runId, state: runnable.length ? 'queued' : 'blocked', runnableTicketIds: runnable.map((ticket) => ticket.id), blockedTicketIds: [...new Set([...blocked, ...nodes.filter((t) => (t.kind === 'ticket' || t.kind === 'subtask') && !runnable.includes(t) && t.state !== 'done' && t.state !== 'canceled').map((t) => t.id)])], reason: runnable.length ? null : 'NO_RUNNABLE_TICKETS', externalExecution: false };
 }
 
 export function classifyDiscovery(ticket: NodeType, summary: string, evidenceIds: string[], affectedTicketIds: string[]) {
@@ -69,6 +70,17 @@ export function evaluateGates(rawGates: readonly unknown[], riskAcceptances: rea
   const failedHard = gates.some((gate) => gate.hard && gate.status === 'fail' && !acceptedGateIds.has(gate.id));
   const pendingHard = gates.some((gate) => gate.hard && gate.status !== 'pass' && !(gate.status === 'fail' && acceptedGateIds.has(gate.id)));
   return GateEvaluation.parse({ gates, overall: deterministicFailure || failedHard ? 'fail' : pendingHard ? 'blocked' : 'pass', aiJudgmentAllowed: false, deterministicBeforeJudgment: true });
+}
+
+export function deriveGateMatrix(requirements: readonly { requirementId: string; risk: 'low' | 'medium' | 'high' | 'critical'; evidenceIds: readonly string[] }[], evidenceRows: readonly zReturn<typeof Evidence>[]) {
+  const evidenceById = new Map(evidenceRows.map((item) => [item.id, item]));
+  const gates = requirements.map((requirement) => {
+    const matched = requirement.evidenceIds.map((id) => evidenceById.get(id)).filter((item): item is zReturn<typeof Evidence> => item !== undefined);
+    const complete = matched.length === requirement.evidenceIds.length && matched.length > 0;
+    const status = !complete ? 'pending' : matched.some((item) => item.result === 'fail') ? 'fail' : matched.some((item) => item.result !== 'pass') ? 'blocked' : 'pass';
+    return { id: `req:${requirement.requirementId}`, requirementId: requirement.requirementId, kind: 'deterministic' as const, evidenceIds: matched.map((item) => item.id), status: status as 'pass' | 'fail' | 'pending' | 'blocked', hard: requirement.risk === 'high' || requirement.risk === 'critical' };
+  });
+  return evaluateGates(gates, []);
 }
 
 export function createEvidence(input: Omit<zReturn<typeof Evidence>, 'id' | 'verifiedAt' | 'sha256'> & { sha256?: string | undefined; payload?: unknown }) {

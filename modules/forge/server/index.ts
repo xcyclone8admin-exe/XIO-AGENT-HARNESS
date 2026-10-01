@@ -8,12 +8,18 @@ export * from './repository';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { ForgeRepository } from './repository';
 import { forgeCapabilities } from '../contracts';
-import { classifyDiscovery, createEvidence, createFinding, evaluateGates, planSchedule, requestPromotion, rollbackPromotion } from './engine';
+import { evaluateGates, planSchedule, requestPromotion, rollbackPromotion } from './engine';
 
-interface ForgeBus {
-  register(manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call?: ForgeCall) => Promise<unknown>): void;
+export interface ForgeCall {
+  readonly principal: Pick<Principal, 'id' | 'tenantId'>;
+  readonly workspaceId: string;
+  readonly capabilityId?: string;
+  readonly input?: unknown;
+  readonly idempotencyKey?: string;
+  readonly approvalId?: string;
 }
-export interface ForgeCall { readonly principal: Pick<Principal, 'id' | 'tenantId'>; readonly workspaceId: string }
+export interface ForgeModuleServer { readonly id: string; readonly capabilities: readonly AnyCapability[]; register(bus: ForgeBus, manifest: ModuleManifest): void }
+export interface ForgeBus { register(manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call?: ForgeCall) => Promise<unknown>): void }
 const actor = (call?: ForgeCall) => {
   if (!call) throw new Error('FORGE_TRUSTED_CALL_CONTEXT_REQUIRED');
   return { id: call.principal.id, tenantId: call.principal.tenantId, workspaceId: call.workspaceId };
@@ -23,34 +29,43 @@ const requireRepository = (repository?: ForgeRepository) => {
   return repository;
 };
 
-export function registerForge(bus: ForgeBus, manifest: ModuleManifest, repository?: ForgeRepository) {
-  ForgeServer.register(bus, manifest, repository);
+export function registerForge(bus: ForgeBus, manifest: ModuleManifest, repository: ForgeRepository) {
+  ForgeRegistration.register(bus, manifest, repository);
 }
 
-const ForgeServer = {
+const ForgeRegistration = {
   id: 'forge',
   capabilities: Object.values(forgeCapabilities),
-  register(bus: ForgeBus, manifest: ModuleManifest, repository?: ForgeRepository) {
+  register(bus: ForgeBus, manifest: ModuleManifest, repository: ForgeRepository) {
     bus.register(manifest, forgeCapabilities.schedule, async (input, call) => {
       const request = forgeCapabilities.schedule.input.parse(input);
-      const trusted = await requireRepository(repository).approvedPlanData(actor(call), request.approval.id);
+      const trusted = await requireRepository(repository).approvedPlanData(actor(call), request.approvalId);
       if (trusted.approval.epicId !== request.epicId || trusted.approval.workspaceId !== actor(call).workspaceId) throw new Error('FORGE_APPROVAL_SCOPE_MISMATCH');
-      return planSchedule({ ...request, approval: trusted.approval, tickets: trusted.tickets });
+      const plannerRequest = { ...request, approval: trusted.approval, tickets: trusted.tickets, killSwitchEngaged: false };
+      const result = planSchedule(plannerRequest);
+      await requireRepository(repository).persistSchedule(actor(call), plannerRequest, result);
+      return result;
     });
-    bus.register(manifest, forgeCapabilities.gates, async (input) => {
+    bus.register(manifest, forgeCapabilities.gates, async (input, call) => {
       const request = forgeCapabilities.gates.input.parse(input);
-      return evaluateGates(request.gates, request.riskAcceptances);
+      const result = evaluateGates(request.gates, request.riskAcceptances);
+      return repository.recordGateEvaluation(actor(call), result);
     });
-    bus.register(manifest, forgeCapabilities.promotion, async (input) => requestPromotion(input));
-    bus.register(manifest, forgeCapabilities.evidence, async (input) => createEvidence(forgeCapabilities.evidence.input.parse(input)));
-    bus.register(manifest, forgeCapabilities.finding, async (input) => createFinding(forgeCapabilities.finding.input.parse(input)));
-    bus.register(manifest, forgeCapabilities.discovery, async (input) => {
+    bus.register(manifest, forgeCapabilities.promotion, async (input, call) => {
+      const promotion = requestPromotion(input);
+      return repository.recordPromotion(actor(call), promotion);
+    });
+    bus.register(manifest, forgeCapabilities.evidence, async (input, call) => requireRepository(repository).createEvidence(actor(call), forgeCapabilities.evidence.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.finding, async (input, call) => requireRepository(repository).createFindingRecord(actor(call), forgeCapabilities.finding.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.discovery, async (input, call) => {
       const request = forgeCapabilities.discovery.input.parse(input);
-      return classifyDiscovery(request.ticket, request.summary, request.evidenceIds, request.affectedTicketIds);
+      if (!repository) throw new Error('FORGE_REPOSITORY_NOT_CONFIGURED');
+      return repository.recordDiscovery(actor(call), request);
     });
-    bus.register(manifest, forgeCapabilities.rollback, async (input) => {
+    bus.register(manifest, forgeCapabilities.rollback, async (input, call) => {
       const request = forgeCapabilities.rollback.input.parse(input);
-      return rollbackPromotion(request.promotion, request.rollbackEvidence);
+      const promotion = rollbackPromotion(request.promotion, request.rollbackEvidence);
+      return repository.recordPromotion(actor(call), promotion);
     });
     bus.register(manifest, forgeCapabilities.projects, (_input, call) => requireRepository(repository).projects(actor(call)));
     bus.register(manifest, forgeCapabilities.createProject, (input, call) => requireRepository(repository).createProject(actor(call), forgeCapabilities.createProject.input.parse(input)));
@@ -67,7 +82,26 @@ const ForgeServer = {
     bus.register(manifest, forgeCapabilities.approvalDecision, (input, call) => requireRepository(repository).decideApproval(actor(call), forgeCapabilities.approvalDecision.input.parse(input)));
     bus.register(manifest, forgeCapabilities.sources, (_input, call) => requireRepository(repository).sources(actor(call)));
     bus.register(manifest, forgeCapabilities.createSource, (input, call) => requireRepository(repository).createSource(actor(call), forgeCapabilities.createSource.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.schedules, (_input, call) => requireRepository(repository).schedules(actor(call)));
+    bus.register(manifest, forgeCapabilities.runs, (_input, call) => requireRepository(repository).runs(actor(call)));
+    bus.register(manifest, forgeCapabilities.cancelSchedule, (input, call) => {
+      const request = forgeCapabilities.cancelSchedule.input.parse(input); return requireRepository(repository).cancelSchedule(actor(call), request.scheduleId, request.reason);
+    });
+    bus.register(manifest, forgeCapabilities.evidenceList, (_input, call) => requireRepository(repository).evidence(actor(call)));
+    bus.register(manifest, forgeCapabilities.findings, (_input, call) => requireRepository(repository).findings(actor(call)));
+    bus.register(manifest, forgeCapabilities.updateFinding, (input, call) => requireRepository(repository).transitionFindingRecord(actor(call), forgeCapabilities.updateFinding.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.gateMatrix, (input, call) => requireRepository(repository).gateMatrix(actor(call), forgeCapabilities.gateMatrix.input.parse(input)));
   },
+};
+
+export function createForgeServer(repository: ForgeRepository): ForgeModuleServer {
+  return { id: ForgeRegistration.id, capabilities: ForgeRegistration.capabilities, register: (bus, manifest) => registerForge(bus, manifest, repository) };
+}
+
+const ForgeServer: ForgeModuleServer = {
+  id: ForgeRegistration.id,
+  capabilities: ForgeRegistration.capabilities,
+  register: () => { throw new Error('FORGE_SCOPED_REPOSITORY_FACTORY_REQUIRED'); },
 };
 
 export default ForgeServer;

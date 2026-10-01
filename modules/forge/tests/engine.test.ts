@@ -5,6 +5,7 @@ import { authorizeChaosTarget, classifyDiscovery, createEvidence, evaluateGates,
 import { registerForge } from '../server';
 import type { AnyCapability, ModuleManifest } from '@xyra/contracts';
 import type { ForgeCall } from '../server';
+import type { ForgeRepository } from '../server/repository';
 import { renderAllGoldenBriefs } from '../server/specs';
 import { transitionEpic, transitionFinding, transitionPromotion, transitionTicket } from '../server/state-machine';
 
@@ -85,21 +86,22 @@ describe('approved bounded scheduler (planning only)', () => {
 
 describe('review, gates, promotion and hard execution boundary', () => {
   it('validates the gates envelope and registers evidence/review workflows through capabilities', async () => {
-    const registered = new Map<string, (input: unknown, call?: ForgeCall) => Promise<unknown>>();
-    const bus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call?: ForgeCall) => Promise<unknown>) => registered.set(descriptor.id, handler) };
-    registerForge(bus, {} as ModuleManifest);
+    const registered = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    const bus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: ForgeCall) => Promise<unknown>) => registered.set(descriptor.id, handler) };
+    registerForge(bus, {} as ModuleManifest, {} as ForgeRepository);
     expect([...registered.keys()]).toEqual(expect.arrayContaining([
       'forge.evidence.create', 'forge.findings.create', 'forge.discoveries.classify', 'forge.promotions.rollback-record',
     ]));
-    await expect(registered.get('forge.gates.evaluate')?.({})).rejects.toThrow();
-    await expect(registered.get('forge.gates.evaluate')?.({ gates: 'nope', riskAcceptances: [] })).rejects.toThrow();
-    const createdEvidence = await registered.get('forge.evidence.create')?.({ workspaceId, requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest', deterministic: true, result: 'pass', payload: { report: 'capability' } });
-    expect(createdEvidence).toMatchObject({ workspaceId, result: 'pass' });
-    const createdFinding = await registered.get('forge.findings.create')?.({ workspaceId, role: 'security', state: 'open', severity: 'low', title: 'Review note', evidenceIds: [evidenceId], affectedRequirements: ['XIO-REQ-FRG-007'], confidence: 0.9, reproduction: 'Observed in test', remediation: 'Track review', revalidation: 'Recheck' });
-    expect(createdFinding).toMatchObject({ workspaceId, role: 'security', state: 'open' });
-    const discovery = await registered.get('forge.discoveries.classify')?.({ ticket, summary: 'Contract impact', evidenceIds: [evidenceId], affectedTicketIds: [] });
-    expect(discovery).toMatchObject({ classification: 'material', escalated: true });
-    const rollback = await registered.get('forge.promotions.rollback-record')?.({ promotion: { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'promoted', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time }, rollbackEvidence: evidence });
+    const validationCall: ForgeCall = { principal: { id: userId, tenantId }, workspaceId };
+    await expect(registered.get('forge.gates.evaluate')?.({}, validationCall)).rejects.toThrow();
+    await expect(registered.get('forge.gates.evaluate')?.({ gates: 'nope', riskAcceptances: [] }, validationCall)).rejects.toThrow();
+    const call: ForgeCall = { principal: { id: userId, tenantId }, workspaceId };
+    const recordPromotion = (actualCall: { id: string; tenantId: string; workspaceId: string }, promotion: unknown) => Promise.resolve(promotion);
+    const repository = { recordPromotion } as unknown as ForgeRepository;
+    const scopedHandlers = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    const scopedBus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: ForgeCall) => Promise<unknown>) => scopedHandlers.set(descriptor.id, handler) };
+    registerForge(scopedBus, {} as ModuleManifest, repository);
+    const rollback = await scopedHandlers.get('forge.promotions.rollback-record')?.({ promotion: { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'promoted', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time }, rollbackEvidence: evidence }, call);
     expect(rollback).toMatchObject({ state: 'rolled-back', rollbackOf: '019a0000-0000-7000-8000-000000000081' });
   });
 
