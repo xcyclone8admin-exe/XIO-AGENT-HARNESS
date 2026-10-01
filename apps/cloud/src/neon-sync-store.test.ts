@@ -9,8 +9,25 @@ import type { NeonQueryClient } from './neon';
 import { lockWorkspaceSequence, NeonSyncStore } from './neon-sync-store';
 import { SyncAuthorityEngine, hashRequest, parseSyncPush } from './sync';
 import { drainSyncOutbox } from './sync-outbox';
-import { acknowledgeLocalErasurePurge, claimLocalErasurePurge, currentBrainIngestionSnapshot, eraseCloudBrainSourceRows,
-  hasErasureFence, LocalPurgeAckRequest, sourceVersionDigest } from './erasures';
+import {
+  INVEST_SIGNAL_CONSUME_PROTOCOL,
+  INVEST_SIGNAL_PROTOCOL,
+  acceptInvestSignalInTransaction,
+  acknowledgeInvestSignalInTransaction,
+  claimInvestSignalInTransaction,
+  type InvestSignalBody,
+  type InvestSignalSourceKey,
+  type RawInvestWebhook,
+} from './invest-signals';
+import {
+  acknowledgeLocalErasurePurge,
+  claimLocalErasurePurge,
+  currentBrainIngestionSnapshot,
+  eraseCloudBrainSourceRows,
+  hasErasureFence,
+  LocalPurgeAckRequest,
+  sourceVersionDigest,
+} from './erasures';
 
 const sql = (relative: string) => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
 const migrations = [
@@ -21,13 +38,38 @@ const migrations = [
   migration('core/0001_cloud_auth', sql('../../../modules/core/migrations/0001_cloud_auth.sql')),
   migration('core/0002_cloud_sync', sql('../../../modules/core/migrations/0002_cloud_sync.sql')),
   migration('core/0003_cloud_erasure', sql('../../../modules/core/migrations/0003_cloud_erasure.sql')),
-  migration('core/0004_cloud_blob_reference_sets', sql('../../../modules/core/migrations/0004_cloud_blob_reference_sets.sql')),
-  migration('core/0005_cloud_ingestion_finalization', sql('../../../modules/core/migrations/0005_cloud_ingestion_finalization.sql')),
-  migration('core/0006_cloud_ingestion_v2_hashes', sql('../../../modules/core/migrations/0006_cloud_ingestion_v2_hashes.sql')),
-  migration('core/0007_cloud_erasure_v2_fence', sql('../../../modules/core/migrations/0007_cloud_erasure_v2_fence.sql')),
-  migration('core/0008_cloud_erasure_sync_delete', sql('../../../modules/core/migrations/0008_cloud_erasure_sync_delete.sql')),
-  migration('core/0009_cloud_erasure_provenance_delete', sql('../../../modules/core/migrations/0009_cloud_erasure_provenance_delete.sql')),
-  migration('core/0010_cloud_erasure_deleting_state', sql('../../../modules/core/migrations/0010_cloud_erasure_deleting_state.sql')),
+  migration(
+    'core/0004_cloud_blob_reference_sets',
+    sql('../../../modules/core/migrations/0004_cloud_blob_reference_sets.sql'),
+  ),
+  migration(
+    'core/0005_cloud_ingestion_finalization',
+    sql('../../../modules/core/migrations/0005_cloud_ingestion_finalization.sql'),
+  ),
+  migration(
+    'core/0006_cloud_ingestion_v2_hashes',
+    sql('../../../modules/core/migrations/0006_cloud_ingestion_v2_hashes.sql'),
+  ),
+  migration(
+    'core/0007_cloud_erasure_v2_fence',
+    sql('../../../modules/core/migrations/0007_cloud_erasure_v2_fence.sql'),
+  ),
+  migration(
+    'core/0008_cloud_erasure_sync_delete',
+    sql('../../../modules/core/migrations/0008_cloud_erasure_sync_delete.sql'),
+  ),
+  migration(
+    'core/0009_cloud_erasure_provenance_delete',
+    sql('../../../modules/core/migrations/0009_cloud_erasure_provenance_delete.sql'),
+  ),
+  migration(
+    'core/0010_cloud_erasure_deleting_state',
+    sql('../../../modules/core/migrations/0010_cloud_erasure_deleting_state.sql'),
+  ),
+  migration(
+    'core/0011_cloud_invest_signals',
+    sql('../../../modules/core/migrations/0011_cloud_invest_signals.sql'),
+  ),
 ];
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
@@ -134,52 +176,160 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     const content = 'Cloud copy to erase';
     const contentHash = '9'.repeat(64);
     const contentDigest = await cloudBrainContentDigest(content);
-    const contentVersion = await sourceVersionDigest({ sourceId, versions: [{ id: versionId, version: 1, contentHash }] });
+    const contentVersion = await sourceVersionDigest({
+      sourceId,
+      versions: [{ id: versionId, version: 1, contentHash }],
+    });
     const objectRefIds: string[] = [];
     const referenceStateVersion = 1;
-    const snapshotDigest = await cloudReferenceSetDigest({ sourceId, sourceVersionId: versionId, objectRefIds });
-    const sourceVersion = await cloudBrainSourceVersion({ protocolVersion: 'cloud-ingest-v2', sourceId,
-      sourceVersionId: versionId, tenantId: TENANT_A, workspaceId: WORKSPACE_A, contentDigest,
-      objectRefIds, referenceStateVersion });
+    const snapshotDigest = await cloudReferenceSetDigest({
+      sourceId,
+      sourceVersionId: versionId,
+      objectRefIds,
+    });
+    const sourceVersion = await cloudBrainSourceVersion({
+      protocolVersion: 'cloud-ingest-v2',
+      sourceId,
+      sourceVersionId: versionId,
+      tenantId: TENANT_A,
+      workspaceId: WORKSPACE_A,
+      contentDigest,
+      objectRefIds,
+      referenceStateVersion,
+    });
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
       await lockWorkspaceSequence(client, TENANT_A, WORKSPACE_A);
-      await client.query(`INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
+      await client.query(
+        `INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
         VALUES ($1,$2,'brain_sources',$3,$4::jsonb),($1,$2,'brain_source_versions',$5,$6::jsonb)`,
-      [TENANT_A, WORKSPACE_A, sourceId, JSON.stringify({ cloud_object_ref_ids: { value: [] } }),
-        versionId, JSON.stringify({ source_id: { value: sourceId }, version: { value: 1 },
-          content_hash: { value: contentHash }, content_text: { value: content } })]);
-      await client.query(`INSERT INTO cloud_source_ingestions(tenant_id,workspace_id,id,source_id,actor_id,mode,status,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          sourceId,
+          JSON.stringify({ cloud_object_ref_ids: { value: [] } }),
+          versionId,
+          JSON.stringify({
+            source_id: { value: sourceId },
+            version: { value: 1 },
+            content_hash: { value: contentHash },
+            content_text: { value: content },
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_source_ingestions(tenant_id,workspace_id,id,source_id,actor_id,mode,status,
           content_version,source_version,source_version_id,content_digest,reference_state_version,snapshot_digest,
           reference_state,object_ref_ids,finalized_at)
         VALUES ($1,$2,$3,$4,$5,'text_only','finalized',$6,$7,$8,$9,$10,$11,'verified_empty','{}',now())`,
-      [TENANT_A, WORKSPACE_A, ingestionId, sourceId, USER_A, contentVersion, sourceVersion, versionId,
-        contentDigest, referenceStateVersion, snapshotDigest]);
-      await client.query(`INSERT INTO cloud_erasure_reference_sets(tenant_id,workspace_id,snapshot_id,source_kind,source_id,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          ingestionId,
+          sourceId,
+          USER_A,
+          contentVersion,
+          sourceVersion,
+          versionId,
+          contentDigest,
+          referenceStateVersion,
+          snapshotDigest,
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_reference_sets(tenant_id,workspace_id,snapshot_id,source_kind,source_id,
           source_version,snapshot_digest,reference_state_version,object_ids,current,ingestion_id,content_version,completeness)
         VALUES ($1,$2,$3,'brain_source',$4,$5,$6,$7,'{}',true,$8,$9,'verified_empty')`,
-      [TENANT_A, WORKSPACE_A, crypto.randomUUID(), sourceId, sourceVersion, snapshotDigest,
-        referenceStateVersion, ingestionId, contentVersion]);
-      await client.query(`INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          crypto.randomUUID(),
+          sourceId,
+          sourceVersion,
+          snapshotDigest,
+          referenceStateVersion,
+          ingestionId,
+          contentVersion,
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
           source_version,request_digest,actor_id,capability_id,approval_id,status,claim_id,claim_generation,receipt_id)
         VALUES ($1,$2,$3,$4,'brain_source',$5,$6,$7,$8,'brain.sources.erase',$9,'purge_claimed',$10,1,$11)`,
-      [TENANT_A, WORKSPACE_A, operationId, operationId, sourceId, sourceVersion, '8'.repeat(64), USER_A,
-        approvalId, claimId, auditReceiptId]);
-      await client.query(`INSERT INTO cloud_erasure_attempts(tenant_id,workspace_id,operation_id,attempt_id,attempt_no,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          operationId,
+          operationId,
+          sourceId,
+          sourceVersion,
+          '8'.repeat(64),
+          USER_A,
+          approvalId,
+          claimId,
+          auditReceiptId,
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_attempts(tenant_id,workspace_id,operation_id,attempt_id,attempt_no,
           request_digest,approval_id,approval_input_hash,approval_scope_hash)
         VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8)`,
-      [TENANT_A, WORKSPACE_A, operationId, attemptId, '8'.repeat(64), approvalId, '7'.repeat(64), '6'.repeat(64)]);
-      const ack = LocalPurgeAckRequest.parse({ protocolVersion: 'cloud-erasure-v1', attemptId, claimId,
-        claimGeneration: 1, localPurgeReceiptId: localReceiptId, localPurgeReceiptDigest: '5'.repeat(64), sourceVersion });
-      const first = await acknowledgeLocalErasurePurge(client, TENANT_A, WORKSPACE_A, operationId, ack, false);
-      expect(first).toMatchObject({ ok: true, status: 'completed', receiptId: auditReceiptId, replayed: false });
-      const replay = await acknowledgeLocalErasurePurge(client, TENANT_A, WORKSPACE_A, operationId, ack, false);
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          operationId,
+          attemptId,
+          '8'.repeat(64),
+          approvalId,
+          '7'.repeat(64),
+          '6'.repeat(64),
+        ],
+      );
+      const ack = LocalPurgeAckRequest.parse({
+        protocolVersion: 'cloud-erasure-v1',
+        attemptId,
+        claimId,
+        claimGeneration: 1,
+        localPurgeReceiptId: localReceiptId,
+        localPurgeReceiptDigest: '5'.repeat(64),
+        sourceVersion,
+      });
+      const first = await acknowledgeLocalErasurePurge(
+        client,
+        TENANT_A,
+        WORKSPACE_A,
+        operationId,
+        ack,
+        false,
+      );
+      expect(first).toMatchObject({
+        ok: true,
+        status: 'completed',
+        receiptId: auditReceiptId,
+        replayed: false,
+      });
+      const replay = await acknowledgeLocalErasurePurge(
+        client,
+        TENANT_A,
+        WORKSPACE_A,
+        operationId,
+        ack,
+        false,
+      );
       expect(replay).toEqual({ ...first, replayed: true, deleteTargets: [] });
-      const mismatch = await acknowledgeLocalErasurePurge(client, TENANT_A, WORKSPACE_A, operationId,
-        { ...ack, localPurgeReceiptId: '41414141-4141-4141-8141-414141414141' }, false);
+      const mismatch = await acknowledgeLocalErasurePurge(
+        client,
+        TENANT_A,
+        WORKSPACE_A,
+        operationId,
+        { ...ack, localPurgeReceiptId: '41414141-4141-4141-8141-414141414141' },
+        false,
+      );
       expect(mismatch).toEqual({ ok: false, code: 'RECEIPT_MISMATCH' });
-      const copies = await client.query(`SELECT 1 FROM cloud_sync_rows WHERE tenant_id=$1 AND workspace_id=$2
+      const copies = await client.query(
+        `SELECT 1 FROM cloud_sync_rows WHERE tenant_id=$1 AND workspace_id=$2
         AND table_name IN ('brain_sources','brain_source_versions') AND row_id=ANY($3::uuid[])`,
-      [TENANT_A, WORKSPACE_A, [sourceId, versionId]]);
+        [TENANT_A, WORKSPACE_A, [sourceId, versionId]],
+      );
       expect(copies.rows).toHaveLength(0);
     });
   });
@@ -203,75 +353,218 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     const f = (value: unknown) => ({ value, hlc: tick, baseHlc: null });
     const rows = [
       ['brain_sources', sourceId, { title: f('source secret'), cloud_object_ref_ids: f([]) }],
-      ['brain_source_versions', versionId, { source_id: f(sourceId), version: f(1), content_hash: f('c'.repeat(64)), content_text: f('version secret') }],
-      ['brain_chunks', chunkId, { source_id: f(sourceId), source_version_id: f(versionId), content_text: f('chunk secret') }],
-      ['brain_signals', signalId, { source_id: f(sourceId), source_version_id: f(versionId), signal_type: f('signal') }],
+      [
+        'brain_source_versions',
+        versionId,
+        {
+          source_id: f(sourceId),
+          version: f(1),
+          content_hash: f('c'.repeat(64)),
+          content_text: f('version secret'),
+        },
+      ],
+      [
+        'brain_chunks',
+        chunkId,
+        { source_id: f(sourceId), source_version_id: f(versionId), content_text: f('chunk secret') },
+      ],
+      [
+        'brain_signals',
+        signalId,
+        { source_id: f(sourceId), source_version_id: f(versionId), signal_type: f('signal') },
+      ],
       ['brain_claims', claimId, { signal_id: f(signalId), subject: f('subject secret') }],
       ['brain_promotions', promotionId, { claim_id: f(claimId), reason: f('promotion secret') }],
       ['brain_facts', factId, { claim_id: f(claimId), object: f('fact secret') }],
-      ['brain_contradictions', contradictionId, { claim_id: f(claimId), fact_id: f(factId), resolution: f('resolution secret') }],
-      ['brain_memories', memoryId, { source_id: f(sourceId), source_version_id: f(versionId), content: f('memory secret') }],
+      [
+        'brain_contradictions',
+        contradictionId,
+        { claim_id: f(claimId), fact_id: f(factId), resolution: f('resolution secret') },
+      ],
+      [
+        'brain_memories',
+        memoryId,
+        { source_id: f(sourceId), source_version_id: f(versionId), content: f('memory secret') },
+      ],
       ['brain_memories', survivorMemoryId, { content: f('surviving memory'), supersedes_id: f(memoryId) }],
       ['brain_procedures', procedureId, { source_run_id: f(sourceId), body: f('workflow secret') }],
     ] as const;
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
       await lockWorkspaceSequence(client, TENANT_A, WORKSPACE_A);
       const seqState = await client.query<{ last_seq: number }>(
-        'SELECT last_seq FROM cloud_sync_sequences WHERE tenant_id=$1 AND workspace_id=$2', [TENANT_A, WORKSPACE_A],
+        'SELECT last_seq FROM cloud_sync_sequences WHERE tenant_id=$1 AND workspace_id=$2',
+        [TENANT_A, WORKSPACE_A],
       );
       const baseSeq = seqState.rows[0]?.last_seq ?? 0;
-      await client.query('UPDATE cloud_sync_sequences SET last_seq=$3 WHERE tenant_id=$1 AND workspace_id=$2',
-        [TENANT_A, WORKSPACE_A, baseSeq + 1000]);
+      await client.query(
+        'UPDATE cloud_sync_sequences SET last_seq=$3 WHERE tenant_id=$1 AND workspace_id=$2',
+        [TENANT_A, WORKSPACE_A, baseSeq + 1000],
+      );
       for (const [table, id, fields] of rows) {
         if (table === 'brain_procedures') {
-          await client.query(`INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
-            VALUES ($1,$2,$3,$4,$5::jsonb)`, [TENANT_A, WORKSPACE_A, table, id, JSON.stringify(fields)]);
+          await client.query(
+            `INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
+            VALUES ($1,$2,$3,$4,$5::jsonb)`,
+            [TENANT_A, WORKSPACE_A, table, id, JSON.stringify(fields)],
+          );
           continue;
         }
-        await client.query(`INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
-          VALUES ($1,$2,$3,$4,$5::jsonb)`, [TENANT_A, WORKSPACE_A, table, id, JSON.stringify(fields)]);
-        const change = { table, id, tenantId: TENANT_A, workspaceId: WORKSPACE_A, op: 'append', hlc: tick, fields };
+        await client.query(
+          `INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
+          VALUES ($1,$2,$3,$4,$5::jsonb)`,
+          [TENANT_A, WORKSPACE_A, table, id, JSON.stringify(fields)],
+        );
+        const change = {
+          table,
+          id,
+          tenantId: TENANT_A,
+          workspaceId: WORKSPACE_A,
+          op: 'append',
+          hlc: tick,
+          fields,
+        };
         const seq = baseSeq + 101 + rows.indexOf(rows.find((item) => item[1] === id)!);
-        await client.query(`INSERT INTO cloud_sync_changes(tenant_id,workspace_id,server_seq,table_name,row_id,change,bytes)
-          VALUES ($1,$2,$3,$4,$5,$6::jsonb,octet_length($6::text))`, [TENANT_A, WORKSPACE_A, seq, table, id, JSON.stringify(change)]);
-        await client.query(`INSERT INTO cloud_sync_field_seq(tenant_id,workspace_id,table_name,row_id,field_name,server_seq)
-          VALUES ($1,$2,$3,$4,'content_text',$5) ON CONFLICT DO NOTHING`, [TENANT_A, WORKSPACE_A, table, id, seq]);
+        await client.query(
+          `INSERT INTO cloud_sync_changes(tenant_id,workspace_id,server_seq,table_name,row_id,change,bytes)
+          VALUES ($1,$2,$3,$4,$5,$6::jsonb,octet_length($6::text))`,
+          [TENANT_A, WORKSPACE_A, seq, table, id, JSON.stringify(change)],
+        );
+        await client.query(
+          `INSERT INTO cloud_sync_field_seq(tenant_id,workspace_id,table_name,row_id,field_name,server_seq)
+          VALUES ($1,$2,$3,$4,'content_text',$5) ON CONFLICT DO NOTHING`,
+          [TENANT_A, WORKSPACE_A, table, id, seq],
+        );
       }
-      await client.query(`INSERT INTO cloud_sync_conflicts(tenant_id,workspace_id,table_name,row_id,record,bytes)
+      await client.query(
+        `INSERT INTO cloud_sync_conflicts(tenant_id,workspace_id,table_name,row_id,record,bytes)
         VALUES ($1,$2,'brain_chunks',$3,$4::jsonb,128)`,
-      [TENANT_A, WORKSPACE_A, chunkId, JSON.stringify({ table: 'brain_chunks', rowId: chunkId, field: 'content_text', losingValue: 'conflict secret' })]);
-      await client.query(`INSERT INTO cloud_sync_idempotency(tenant_id,workspace_id,idempotency_key,payload_hash,response)
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          chunkId,
+          JSON.stringify({
+            table: 'brain_chunks',
+            rowId: chunkId,
+            field: 'content_text',
+            losingValue: 'conflict secret',
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_sync_idempotency(tenant_id,workspace_id,idempotency_key,payload_hash,response)
         VALUES ($1,$2,'erasure-replay-secret-key','${'a'.repeat(64)}',$3::jsonb)`,
-      [TENANT_A, WORKSPACE_A, JSON.stringify({ accepted: 1, conflicts: 1, serverSeq: '101', rejected: [], replayed: false,
-        conflictHistory: [{ table: 'brain_chunks', rowId: chunkId, field: 'content_text', losingValue: 'conflict secret' }],
-        changeOutcomes: [{ index: 0, changeId: chunkId, table: 'brain_chunks', rowId: chunkId, outcome: 'committed',
-          appliedFields: ['content_text'], unchangedFields: [], conflictedFields: [] }] })]);
-      await client.query(`INSERT INTO cloud_source_ingestions(tenant_id,workspace_id,id,source_id,actor_id,mode,status)
-        VALUES ($1,$2,$3,$4,$5,'text_only','collecting')`, [TENANT_A, WORKSPACE_A, ingestionId, sourceId, USER_A]);
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          JSON.stringify({
+            accepted: 1,
+            conflicts: 1,
+            serverSeq: '101',
+            rejected: [],
+            replayed: false,
+            conflictHistory: [
+              {
+                table: 'brain_chunks',
+                rowId: chunkId,
+                field: 'content_text',
+                losingValue: 'conflict secret',
+              },
+            ],
+            changeOutcomes: [
+              {
+                index: 0,
+                changeId: chunkId,
+                table: 'brain_chunks',
+                rowId: chunkId,
+                outcome: 'committed',
+                appliedFields: ['content_text'],
+                unchangedFields: [],
+                conflictedFields: [],
+              },
+            ],
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_source_ingestions(tenant_id,workspace_id,id,source_id,actor_id,mode,status)
+        VALUES ($1,$2,$3,$4,$5,'text_only','collecting')`,
+        [TENANT_A, WORKSPACE_A, ingestionId, sourceId, USER_A],
+      );
       const receipt = crypto.randomUUID();
-      await client.query(`INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
+      await client.query(
+        `INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
           source_version,request_digest,actor_id,capability_id,approval_id,status,claim_id,claim_generation,receipt_id)
         VALUES ($1,$2,$3,$4,'brain_source',$5,$6,$7,$8,'brain.sources.erase',$9,'purge_claimed',$10,1,$11)`,
-      [TENANT_A, WORKSPACE_A, operationId, operationId, sourceId, sourceVersion, 'b'.repeat(64), USER_A,
-        TEST_APPROVAL, crypto.randomUUID(), receipt]);
-      const result = await eraseCloudBrainSourceRows(client, TENANT_A, WORKSPACE_A, sourceId, operationId, sourceVersion);
-      expect(result).toMatchObject({ canonicalRows: 2, derivedRows: 7, detachedSupersedesEdges: 1,
-        conflictRecordsDeleted: 1, idempotencyRecordsDeleted: 1, ingestionRecordsDeleted: 1 });
-      expect(result.deletedByTable).toMatchObject({ brain_sources: 1, brain_source_versions: 1,
-        brain_chunks: 1, brain_signals: 1, brain_claims: 1, brain_promotions: 1, brain_facts: 1,
-        brain_contradictions: 1, brain_memories: 1 });
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          operationId,
+          operationId,
+          sourceId,
+          sourceVersion,
+          'b'.repeat(64),
+          USER_A,
+          TEST_APPROVAL,
+          crypto.randomUUID(),
+          receipt,
+        ],
+      );
+      const result = await eraseCloudBrainSourceRows(
+        client,
+        TENANT_A,
+        WORKSPACE_A,
+        sourceId,
+        operationId,
+        sourceVersion,
+      );
+      expect(result).toMatchObject({
+        canonicalRows: 2,
+        derivedRows: 7,
+        detachedSupersedesEdges: 1,
+        conflictRecordsDeleted: 1,
+        idempotencyRecordsDeleted: 1,
+        ingestionRecordsDeleted: 1,
+      });
+      expect(result.deletedByTable).toMatchObject({
+        brain_sources: 1,
+        brain_source_versions: 1,
+        brain_chunks: 1,
+        brain_signals: 1,
+        brain_claims: 1,
+        brain_promotions: 1,
+        brain_facts: 1,
+        brain_contradictions: 1,
+        brain_memories: 1,
+      });
       const remaining = await client.query<{ table_name: string; row_id: string; fields: unknown }>(
-        `SELECT table_name,row_id,fields FROM cloud_sync_rows WHERE tenant_id=$1 AND workspace_id=$2`, [TENANT_A, WORKSPACE_A]);
-      expect(remaining.rows.map((row) => `${row.table_name}:${row.row_id}`)).toContain(`brain_procedures:${procedureId}`);
+        `SELECT table_name,row_id,fields FROM cloud_sync_rows WHERE tenant_id=$1 AND workspace_id=$2`,
+        [TENANT_A, WORKSPACE_A],
+      );
+      expect(remaining.rows.map((row) => `${row.table_name}:${row.row_id}`)).toContain(
+        `brain_procedures:${procedureId}`,
+      );
       const survivor = remaining.rows.find((row) => row.row_id === survivorMemoryId);
-      const survivorFields = typeof survivor?.fields === 'string' ? JSON.parse(survivor.fields) : survivor?.fields as Record<string, unknown>;
+      const survivorFields =
+        typeof survivor?.fields === 'string'
+          ? JSON.parse(survivor.fields)
+          : (survivor?.fields as Record<string, unknown>);
       const supersedes = survivorFields?.['supersedes_id'];
-      expect(typeof supersedes === 'object' && supersedes !== null && 'value' in supersedes ? supersedes.value : undefined).toBeNull();
-      const leaked = await client.query(`SELECT 1 FROM cloud_sync_changes WHERE tenant_id=$1 AND workspace_id=$2
-        AND change::text LIKE '%secret%' LIMIT 1`, [TENANT_A, WORKSPACE_A]);
+      expect(
+        typeof supersedes === 'object' && supersedes !== null && 'value' in supersedes
+          ? supersedes.value
+          : undefined,
+      ).toBeNull();
+      const leaked = await client.query(
+        `SELECT 1 FROM cloud_sync_changes WHERE tenant_id=$1 AND workspace_id=$2
+        AND change::text LIKE '%secret%' LIMIT 1`,
+        [TENANT_A, WORKSPACE_A],
+      );
       expect(leaked.rows).toHaveLength(0);
-      const fences = await client.query<{ count: number }>(`SELECT count(*)::int AS count FROM cloud_erasure_source_fences
-        WHERE tenant_id=$1 AND workspace_id=$2 AND operation_id=$3`, [TENANT_A, WORKSPACE_A, operationId]);
+      const fences = await client.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM cloud_erasure_source_fences
+        WHERE tenant_id=$1 AND workspace_id=$2 AND operation_id=$3`,
+        [TENANT_A, WORKSPACE_A, operationId],
+      );
       expect(fences.rows[0]?.count).toBe(9);
     });
   });
@@ -290,76 +583,216 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     const refs: string[] = [];
     const referenceStateVersion = 1;
     const contentDigest = await cloudBrainContentDigest(content);
-    const contentVersion = await sourceVersionDigest({ sourceId, versions: [{ id: versionId, version: 1, contentHash }] });
-    const referenceSetDigest = await cloudReferenceSetDigest({ sourceId, sourceVersionId: versionId, objectRefIds: refs });
-    const sourceVersion = await cloudBrainSourceVersion({ protocolVersion: 'cloud-ingest-v2', sourceId,
-      sourceVersionId: versionId, tenantId: TENANT_A, workspaceId: WORKSPACE_A, contentDigest,
-      objectRefIds: refs, referenceStateVersion });
+    const contentVersion = await sourceVersionDigest({
+      sourceId,
+      versions: [{ id: versionId, version: 1, contentHash }],
+    });
+    const referenceSetDigest = await cloudReferenceSetDigest({
+      sourceId,
+      sourceVersionId: versionId,
+      objectRefIds: refs,
+    });
+    const sourceVersion = await cloudBrainSourceVersion({
+      protocolVersion: 'cloud-ingest-v2',
+      sourceId,
+      sourceVersionId: versionId,
+      tenantId: TENANT_A,
+      workspaceId: WORKSPACE_A,
+      contentDigest,
+      objectRefIds: refs,
+      referenceStateVersion,
+    });
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
-      await client.query(`INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
+      await client.query(
+        `INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
         VALUES ($1,$2,'brain_sources',$3,$4::jsonb),($1,$2,'brain_source_versions',$5,$6::jsonb)`,
-      [TENANT_A, WORKSPACE_A, sourceId, JSON.stringify({ cloud_object_ref_ids: { value: refs } }),
-        versionId, JSON.stringify({ source_id: { value: sourceId }, version: { value: 1 },
-          content_hash: { value: contentHash }, content_text: { value: content } })]);
-      await client.query(`INSERT INTO cloud_source_ingestions(tenant_id,workspace_id,id,source_id,actor_id,mode,status,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          sourceId,
+          JSON.stringify({ cloud_object_ref_ids: { value: refs } }),
+          versionId,
+          JSON.stringify({
+            source_id: { value: sourceId },
+            version: { value: 1 },
+            content_hash: { value: contentHash },
+            content_text: { value: content },
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_source_ingestions(tenant_id,workspace_id,id,source_id,actor_id,mode,status,
           content_version,source_version,source_version_id,content_digest,reference_state_version,snapshot_digest,
           reference_state,object_ref_ids,finalized_at)
         VALUES ($1,$2,$3,$4,$5,'text_only','finalized',$6,$7,$8,$9,$10,$11,'verified_empty','{}',now())`,
-      [TENANT_A, WORKSPACE_A, ingestionId, sourceId, USER_A, contentVersion, sourceVersion, versionId,
-        contentDigest, referenceStateVersion, referenceSetDigest]);
-      await client.query(`INSERT INTO cloud_erasure_reference_sets(tenant_id,workspace_id,snapshot_id,source_kind,source_id,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          ingestionId,
+          sourceId,
+          USER_A,
+          contentVersion,
+          sourceVersion,
+          versionId,
+          contentDigest,
+          referenceStateVersion,
+          referenceSetDigest,
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_reference_sets(tenant_id,workspace_id,snapshot_id,source_kind,source_id,
           source_version,snapshot_digest,reference_state_version,object_ids,current,ingestion_id,content_version,completeness)
         VALUES ($1,$2,$3,'brain_source',$4,$5,$6,$7,'{}',true,$8,$9,'verified_empty')`,
-      [TENANT_A, WORKSPACE_A, crypto.randomUUID(), sourceId, sourceVersion, referenceSetDigest,
-        referenceStateVersion, ingestionId, contentVersion]);
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          crypto.randomUUID(),
+          sourceId,
+          sourceVersion,
+          referenceSetDigest,
+          referenceStateVersion,
+          ingestionId,
+          contentVersion,
+        ],
+      );
       await expect(currentBrainIngestionSnapshot(client, TENANT_A, WORKSPACE_A, sourceId)).resolves.toEqual({
-        sourceVersion, contentDigest, referenceSetDigest, referenceStateVersion, objectRefIds: [],
+        sourceVersion,
+        contentDigest,
+        referenceSetDigest,
+        referenceStateVersion,
+        objectRefIds: [],
       });
-      await client.query(`INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
+      await client.query(
+        `INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
           source_version,request_digest,actor_id,capability_id,approval_id,status,reference_state_version,hold_state_version,
           reservation_id,reservation_expires_at,receipt_id)
         VALUES ($1,$2,$3,$4,'brain_source',$5,$6,$7,$8,'brain.sources.erase',$9,'eligible','{}','{}',$10,now()+interval '5 minutes',$11)`,
-      [TENANT_A, WORKSPACE_A, operationId, erasureId, sourceId, sourceVersion, 'd'.repeat(64), USER_A,
-        approvalId, reservationId, crypto.randomUUID()]);
-      await client.query(`INSERT INTO cloud_erasure_attempts(tenant_id,workspace_id,operation_id,attempt_id,attempt_no,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          operationId,
+          erasureId,
+          sourceId,
+          sourceVersion,
+          'd'.repeat(64),
+          USER_A,
+          approvalId,
+          reservationId,
+          crypto.randomUUID(),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_attempts(tenant_id,workspace_id,operation_id,attempt_id,attempt_no,
           request_digest,approval_id,approval_input_hash,approval_scope_hash)
         VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8)`,
-      [TENANT_A, WORKSPACE_A, operationId, attemptId, 'd'.repeat(64), approvalId, 'a'.repeat(64), 'b'.repeat(64)]);
-      const claimed = await claimLocalErasurePurge(client, TENANT_A, WORKSPACE_A,
-        operationId, attemptId, reservationId, false);
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          operationId,
+          attemptId,
+          'd'.repeat(64),
+          approvalId,
+          'a'.repeat(64),
+          'b'.repeat(64),
+        ],
+      );
+      const claimed = await claimLocalErasurePurge(
+        client,
+        TENANT_A,
+        WORKSPACE_A,
+        operationId,
+        attemptId,
+        reservationId,
+        false,
+      );
       expect(claimed).toMatchObject({ ok: true, claimGeneration: 1, replayed: false });
       if (claimed.ok) {
-        expect(await claimLocalErasurePurge(client, TENANT_A, WORKSPACE_A,
-          operationId, attemptId, reservationId, false)).toEqual({ ...claimed, replayed: true });
+        expect(
+          await claimLocalErasurePurge(
+            client,
+            TENANT_A,
+            WORKSPACE_A,
+            operationId,
+            attemptId,
+            reservationId,
+            false,
+          ),
+        ).toEqual({ ...claimed, replayed: true });
       }
       const expiredOperation = '13131313-1313-4313-8313-131313131313';
       const expiredErasure = '14141414-1414-4414-8414-141414141414';
       const expiredAttempt = '15151515-1515-4515-8515-151515151515';
       const expiredApproval = '16161616-1616-4616-8616-161616161616';
       const expiredReservation = '17171717-1717-4717-8717-171717171717';
-      await client.query(`INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
+      await client.query(
+        `INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
           source_version,request_digest,actor_id,capability_id,approval_id,status,reference_state_version,hold_state_version,
           reservation_id,reservation_expires_at,receipt_id)
         VALUES ($1,$2,$3,$4,'brain_source',$5,$6,$7,$8,'brain.sources.erase',$9,'eligible','{}','{}',$10,now()-interval '1 second',$11)`,
-      [TENANT_A, WORKSPACE_A, expiredOperation, expiredErasure, sourceId, sourceVersion, 'e'.repeat(64), USER_A,
-        expiredApproval, expiredReservation, crypto.randomUUID()]);
-      await client.query(`INSERT INTO cloud_erasure_attempts(tenant_id,workspace_id,operation_id,attempt_id,attempt_no,
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          expiredOperation,
+          expiredErasure,
+          sourceId,
+          sourceVersion,
+          'e'.repeat(64),
+          USER_A,
+          expiredApproval,
+          expiredReservation,
+          crypto.randomUUID(),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_attempts(tenant_id,workspace_id,operation_id,attempt_id,attempt_no,
           request_digest,approval_id,approval_input_hash,approval_scope_hash)
         VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8)`,
-      [TENANT_A, WORKSPACE_A, expiredOperation, expiredAttempt, 'e'.repeat(64), expiredApproval, 'c'.repeat(64), 'b'.repeat(64)]);
-      expect(await claimLocalErasurePurge(client, TENANT_A, WORKSPACE_A,
-        expiredOperation, expiredAttempt, expiredReservation, false)).toEqual({ ok: false, code: 'RESERVATION_EXPIRED' });
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          expiredOperation,
+          expiredAttempt,
+          'e'.repeat(64),
+          expiredApproval,
+          'c'.repeat(64),
+          'b'.repeat(64),
+        ],
+      );
+      expect(
+        await claimLocalErasurePurge(
+          client,
+          TENANT_A,
+          WORKSPACE_A,
+          expiredOperation,
+          expiredAttempt,
+          expiredReservation,
+          false,
+        ),
+      ).toEqual({ ok: false, code: 'RESERVATION_EXPIRED' });
       const newerVersionId = '18181818-1818-4818-8818-181818181818';
-      await client.query(`INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
+      await client.query(
+        `INSERT INTO cloud_sync_rows(tenant_id,workspace_id,table_name,row_id,fields)
         VALUES ($1,$2,'brain_source_versions',$3,$4::jsonb)`,
-      [TENANT_A, WORKSPACE_A, newerVersionId, JSON.stringify({ source_id: { value: sourceId }, version: { value: 2 },
-        content_hash: { value: '1'.repeat(64) }, content_text: { value: 'updated source text' } })]);
-      await expect(currentBrainIngestionSnapshot(client, TENANT_A, WORKSPACE_A, sourceId))
-        .rejects.toThrow('SOURCE_STATE_UNAVAILABLE');
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          newerVersionId,
+          JSON.stringify({
+            source_id: { value: sourceId },
+            version: { value: 2 },
+            content_hash: { value: '1'.repeat(64) },
+            content_text: { value: 'updated source text' },
+          }),
+        ],
+      );
+      await expect(currentBrainIngestionSnapshot(client, TENANT_A, WORKSPACE_A, sourceId)).rejects.toThrow(
+        'SOURCE_STATE_UNAVAILABLE',
+      );
     });
     await scoped(TENANT_B, WORKSPACE_B, async (client) => {
-      await expect(currentBrainIngestionSnapshot(client, TENANT_B, WORKSPACE_B, sourceId))
-        .rejects.toThrow('SOURCE_REFERENCES_UNAVAILABLE');
+      await expect(currentBrainIngestionSnapshot(client, TENANT_B, WORKSPACE_B, sourceId)).rejects.toThrow(
+        'SOURCE_REFERENCES_UNAVAILABLE',
+      );
     });
   });
 
@@ -374,7 +807,18 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
         `INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
           source_version,request_digest,actor_id,capability_id,approval_id,status,receipt_id)
          VALUES ($1,$2,$3,$4,'brain_source',$5,$6,$7,$8,'brain.sources.erase',$9,'completed',$10)`,
-        [TENANT_A, WORKSPACE_A, operationId, operationId, erasedSource, digest, requestDigest, USER_A, TEST_APPROVAL, operationId],
+        [
+          TENANT_A,
+          WORKSPACE_A,
+          operationId,
+          operationId,
+          erasedSource,
+          digest,
+          requestDigest,
+          USER_A,
+          TEST_APPROVAL,
+          operationId,
+        ],
       );
       await client.query(
         `INSERT INTO cloud_erasure_source_fences(tenant_id,workspace_id,source_kind,source_id,
@@ -382,11 +826,17 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
          VALUES ($1,$2,'brain_source',$3,'brain_sources',$4,$5,$6)`,
         [TENANT_A, WORKSPACE_A, erasedSource, rowId, operationId, digest],
       );
-      expect(await hasErasureFence(client, TENANT_A, WORKSPACE_A, [{ table: 'brain_sources', id: rowId }])).toBe(true);
-      expect(await hasErasureFence(client, TENANT_A, WORKSPACE_A, [{ table: 'brain_sources', id: ROW }])).toBe(false);
+      expect(
+        await hasErasureFence(client, TENANT_A, WORKSPACE_A, [{ table: 'brain_sources', id: rowId }]),
+      ).toBe(true);
+      expect(
+        await hasErasureFence(client, TENANT_A, WORKSPACE_A, [{ table: 'brain_sources', id: ROW }]),
+      ).toBe(false);
     });
     await scoped(TENANT_B, WORKSPACE_B, async (client) => {
-      expect(await hasErasureFence(client, TENANT_B, WORKSPACE_B, [{ table: 'brain_sources', id: rowId }])).toBe(false);
+      expect(
+        await hasErasureFence(client, TENANT_B, WORKSPACE_B, [{ table: 'brain_sources', id: rowId }]),
+      ).toBe(false);
     });
   });
 
@@ -565,6 +1015,285 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     ]);
   });
 
+  it('migrates the Invest inbox with scoped RLS and keeps the source allowlist read-only to the Worker', async () => {
+    const sourceId = '71717171-7171-4171-8171-717171717171';
+    const keyId = '72727272-7272-4272-8272-727272727272';
+    const eventId = crypto.randomUUID();
+    const eventRecordId = crypto.randomUUID();
+    const jobId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO cloud_invest_signal_sources
+        (tenant_id,workspace_id,source_id,key_id,signing_alg,public_jwk,allowed_algorithm_ids,allowed_symbols)
+       VALUES ($1,$2,$3,$4,'ES256','{"kty":"EC","crv":"P-256","x":"${'a'.repeat(43)}","y":"${'b'.repeat(43)}"}'::jsonb,
+               ARRAY['paper-alpha'],ARRAY['ACME'])`,
+      [TENANT_A, WORKSPACE_A, sourceId, keyId],
+    );
+    await scoped(TENANT_A, WORKSPACE_A, async (client) => {
+      await client.query(
+        `INSERT INTO cloud_invest_signal_rate_windows(tenant_id,workspace_id,source_id,window_start,request_count)
+         VALUES ($1,$2,$3,date_trunc('minute',now()),1)`,
+        [TENANT_A, WORKSPACE_A, sourceId],
+      );
+      await client.query(
+        `INSERT INTO cloud_invest_signal_events
+          (id,tenant_id,workspace_id,source_id,key_id,event_id,payload_digest,envelope,event_expires_at,status)
+         VALUES ($1,$2,$3,$4,$5,$6,decode($7,'hex'),$8::jsonb,now()+interval '5 minutes','pending')`,
+        [
+          eventRecordId,
+          TENANT_A,
+          WORKSPACE_A,
+          sourceId,
+          keyId,
+          eventId,
+          'a'.repeat(64),
+          JSON.stringify({
+            protocol: 'xyra.invest.signal.v1',
+            eventId,
+            sourceId,
+            tenantId: TENANT_A,
+            workspaceId: WORKSPACE_A,
+            payloadDigest: 'a'.repeat(64),
+            verification: { signature: 'verified', keyId },
+          }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO cloud_queue_jobs(id,tenant_id,workspace_id,job_type,idempotency_key,payload,status)
+         VALUES ($1,$2,$3,'invest.signal.received',$4,$5::jsonb,'pending')`,
+        [
+          jobId,
+          TENANT_A,
+          WORKSPACE_A,
+          `${sourceId}:${eventId}`,
+          JSON.stringify({ eventRecordId, payloadDigest: 'a'.repeat(64) }),
+        ],
+      );
+      await client.query(
+        'UPDATE cloud_invest_signal_events SET queue_job_id=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3',
+        [TENANT_A, WORKSPACE_A, eventRecordId, jobId],
+      );
+      const visible = await client.query('SELECT id FROM cloud_invest_signal_events WHERE tenant_id=$1', [
+        TENANT_A,
+      ]);
+      expect(visible.rows).toHaveLength(1);
+      const hidden = await client.query('SELECT id FROM cloud_invest_signal_events WHERE tenant_id=$1', [
+        TENANT_B,
+      ]);
+      expect(hidden.rows).toHaveLength(0);
+    });
+    await scoped(TENANT_B, WORKSPACE_B, async (client) => {
+      const hidden = await client.query('SELECT id FROM cloud_invest_signal_events WHERE id=$1', [
+        eventRecordId,
+      ]);
+      expect(hidden.rows).toHaveLength(0);
+      await expect(
+        client.query(
+          `INSERT INTO cloud_invest_signal_events
+          (id,tenant_id,workspace_id,source_id,key_id,event_id,payload_digest,envelope,event_expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,decode($7,'hex'),'{}'::jsonb,now()+interval '1 minute')`,
+          [crypto.randomUUID(), TENANT_A, WORKSPACE_A, sourceId, keyId, crypto.randomUUID(), 'b'.repeat(64)],
+        ),
+      ).rejects.toThrow();
+    });
+    await scoped(TENANT_A, WORKSPACE_A, async (client) => {
+      await expect(
+        client.query('UPDATE cloud_invest_signal_sources SET active=false WHERE source_id=$1', [sourceId]),
+      ).rejects.toThrow();
+    });
+    // The denied UPDATE above aborts its transaction. Retire this RLS fixture as owner so
+    // the later claim test cannot treat its intentionally minimal envelope as pending.
+    await db.query("UPDATE cloud_invest_signal_events SET status='expired' WHERE id=$1", [eventRecordId]);
+    const privileges = await db.query<{
+      source_delete: boolean;
+      event_delete: boolean;
+      source_update: boolean;
+    }>(`
+      SELECT has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_sources','DELETE') AS source_delete,
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_events','DELETE') AS event_delete,
+             has_table_privilege('xyra_cloud_runtime_app','cloud_invest_signal_sources','UPDATE') AS source_update`);
+    expect(privileges.rows[0]).toEqual({ source_delete: false, event_delete: false, source_update: false });
+  });
+
+  it('commits signed inbox and ID-only outbox atomically, then fences claim replay and stale device ack', async () => {
+    const sourceId = '73737373-7373-4373-8373-737373737373';
+    const keyId = '74747474-7474-4474-8474-747474747474';
+    const keyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+      'sign',
+      'verify',
+    ]);
+    const publicJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+    const source: InvestSignalSourceKey = {
+      tenantId: TENANT_A,
+      workspaceId: WORKSPACE_A,
+      sourceId,
+      keyId,
+      signingAlg: 'ES256',
+      publicJwk,
+      allowedAlgorithmIds: ['paper-alpha'],
+      allowedSymbols: ['ACME'],
+      maxAgeSeconds: 300,
+      maxLifetimeSeconds: 900,
+      maxEventsPerMinute: 4,
+    };
+    await db.query(
+      `INSERT INTO cloud_invest_signal_sources
+        (tenant_id,workspace_id,source_id,key_id,signing_alg,public_jwk,allowed_algorithm_ids,allowed_symbols,
+         max_age_seconds,max_lifetime_seconds,max_events_per_minute)
+       VALUES ($1,$2,$3,$4,'ES256',$5::jsonb,ARRAY['paper-alpha'],ARRAY['ACME'],300,900,4)`,
+      [TENANT_A, WORKSPACE_A, sourceId, keyId, JSON.stringify(publicJwk)],
+    );
+    const createWebhook = async (body: InvestSignalBody): Promise<RawInvestWebhook> => {
+      const rawBody = new TextEncoder().encode(JSON.stringify(body));
+      const timestampSeconds = Math.floor(Date.now() / 1000);
+      const prefix = new TextEncoder().encode(`${timestampSeconds}.`);
+      const signed = new Uint8Array(prefix.length + rawBody.length);
+      signed.set(prefix);
+      signed.set(rawBody, prefix.length);
+      const signature = new Uint8Array(
+        await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keyPair.privateKey, signed),
+      );
+      return { sourceId, keyId, timestampSeconds, rawBody, signature };
+    };
+    const makeBody = (eventId: string, quantity = '1.25'): InvestSignalBody => {
+      const now = Date.now();
+      return {
+        protocol: INVEST_SIGNAL_PROTOCOL,
+        eventId,
+        occurredAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + 300_000).toISOString(),
+        algorithmId: 'paper-alpha',
+        signalId: crypto.randomUUID(),
+        symbol: 'ACME',
+        side: 'buy',
+        quantity,
+      };
+    };
+    const webhook = await createWebhook(makeBody('atomic-event-001'));
+    const accepted = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      acceptInvestSignalInTransaction(client, webhook, source),
+    );
+    expect(accepted.kind).toBe('accepted');
+    if (accepted.kind !== 'accepted') throw new Error('expected accepted signal');
+    const storedEnvelope = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      client.query<{ envelope: unknown }>('SELECT envelope FROM cloud_invest_signal_events WHERE id=$1', [
+        accepted.eventRecordId,
+      ]),
+    );
+    expect(storedEnvelope.rows[0]?.envelope).toMatchObject({
+      eventId: 'atomic-event-001',
+      receivedAt: expect.any(String),
+      signalId: expect.any(String),
+    });
+    expect(storedEnvelope.rows[0]?.envelope).toMatchObject({
+      verification: { signature: 'verified', keyId },
+    });
+    const duplicate = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      acceptInvestSignalInTransaction(client, webhook, source),
+    );
+    expect(duplicate).toMatchObject({
+      kind: 'duplicate',
+      jobId: accepted.jobId,
+      eventRecordId: accepted.eventRecordId,
+    });
+    const conflictingWebhook = await createWebhook(makeBody('atomic-event-001', '2'));
+    expect(
+      await scoped(TENANT_A, WORKSPACE_A, (client) =>
+        acceptInvestSignalInTransaction(client, conflictingWebhook, source),
+      ),
+    ).toEqual({ kind: 'conflict' });
+
+    const consumerA = {
+      tenantId: TENANT_A,
+      workspaceId: WORKSPACE_A,
+      principalId: USER_A,
+      deviceId: '75757575-7575-4575-8575-757575757575',
+    };
+    const consumerB = { ...consumerA, deviceId: '76767676-7676-4676-8676-767676767676' };
+    const claimInput = {
+      protocol: INVEST_SIGNAL_CONSUME_PROTOCOL,
+      idempotencyKey: crypto.randomUUID(),
+    } as const;
+    const claim = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      claimInvestSignalInTransaction(client, consumerA, claimInput),
+    );
+    expect(claim.status).toBe('claimed');
+    if (claim.status !== 'claimed') throw new Error('expected a signal claim');
+    const claimReplay = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      claimInvestSignalInTransaction(client, consumerA, claimInput),
+    );
+    expect(claimReplay.status).toBe('claimed');
+    if (claimReplay.status !== 'claimed') throw new Error('expected idempotent claim replay');
+    expect(claimReplay.lease).toEqual(claim.lease);
+    expect(
+      await scoped(TENANT_A, WORKSPACE_A, (client) =>
+        claimInvestSignalInTransaction(client, consumerB, {
+          ...claimInput,
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      ),
+    ).toEqual({ status: 'empty' });
+
+    await db.query(
+      "UPDATE cloud_invest_signal_events SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [accepted.eventRecordId],
+    );
+    const reclaimed = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      claimInvestSignalInTransaction(client, consumerB, {
+        ...claimInput,
+        idempotencyKey: crypto.randomUUID(),
+      }),
+    );
+    expect(reclaimed.status).toBe('claimed');
+    if (reclaimed.status !== 'claimed') throw new Error('expected fenced reclaim');
+    expect(reclaimed.lease.fence).toBeGreaterThan(claim.lease.fence);
+
+    const ackBase = {
+      protocol: INVEST_SIGNAL_CONSUME_PROTOCOL,
+      eventId: 'atomic-event-001',
+      payloadDigest: accepted.envelope.payloadDigest,
+      decisionId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+    } as const;
+    await expect(
+      scoped(TENANT_A, WORKSPACE_A, (client) =>
+        acknowledgeInvestSignalInTransaction(client, consumerA, { ...ackBase, leaseId: claim.lease.leaseId }),
+      ),
+    ).rejects.toThrow('SIGNAL_LEASE_INVALID');
+    const ack = await scoped(TENANT_A, WORKSPACE_A, (client) =>
+      acknowledgeInvestSignalInTransaction(client, consumerB, {
+        ...ackBase,
+        leaseId: reclaimed.lease.leaseId,
+      }),
+    );
+    expect(ack.replayed).toBe(false);
+    expect(
+      await scoped(TENANT_A, WORKSPACE_A, (client) =>
+        acknowledgeInvestSignalInTransaction(client, consumerB, {
+          ...ackBase,
+          leaseId: reclaimed.lease.leaseId,
+        }),
+      ),
+    ).toMatchObject({ replayed: true, status: 'acked' });
+
+    const durable = await scoped(TENANT_A, WORKSPACE_A, async (client) => {
+      const events = await client.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM cloud_invest_signal_events WHERE id=$1`,
+        [accepted.eventRecordId],
+      );
+      const jobs = await client.query<{ payload: unknown; job_type: string }>(
+        `SELECT payload,job_type FROM cloud_queue_jobs WHERE id=$1`,
+        [accepted.jobId],
+      );
+      return { events: events.rows[0]?.count, jobs: jobs.rows[0] };
+    });
+    expect(durable.events).toBe('1');
+    expect(durable.jobs?.job_type).toBe('invest.signal.received');
+    expect(durable.jobs?.payload).toEqual({
+      eventRecordId: accepted.eventRecordId,
+      payloadDigest: accepted.envelope.payloadDigest,
+    });
+  });
+
   it('atomically commits row state, per-field sequence, compacted pull log, conflict and cache outbox', async () => {
     const first = pushRequest('first', Date.now() - 10, 'first-key-sync-0001');
     const second = pushRequest('second', Date.now(), 'second-key-sync-0002');
@@ -573,11 +1302,15 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
       await lockWorkspaceSequence(client, TENANT_A, WORKSPACE_A);
       const seqState = await client.query<{ last_seq: number }>(
-        'SELECT last_seq FROM cloud_sync_sequences WHERE tenant_id=$1 AND workspace_id=$2', [TENANT_A, WORKSPACE_A],
+        'SELECT last_seq FROM cloud_sync_sequences WHERE tenant_id=$1 AND workspace_id=$2',
+        [TENANT_A, WORKSPACE_A],
       );
       const baseSeq = seqState.rows[0]?.last_seq ?? 0;
-      await client.query(`UPDATE cloud_sync_outbox SET delivered_at=now()
-        WHERE tenant_id=$1 AND workspace_id=$2 AND delivered_at IS NULL`, [TENANT_A, WORKSPACE_A]);
+      await client.query(
+        `UPDATE cloud_sync_outbox SET delivered_at=now()
+        WHERE tenant_id=$1 AND workspace_id=$2 AND delivered_at IS NULL`,
+        [TENANT_A, WORKSPACE_A],
+      );
       const engine = new SyncAuthorityEngine(new NeonSyncStore(client, TENANT_A, WORKSPACE_A));
       await engine.push(access(TENANT_A, WORKSPACE_A), first!, Date.now(), await hashRequest(first!));
       const committed = await engine.push(
@@ -644,8 +1377,16 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
       delivery += 1;
       return delivery === 2;
     };
-    expect(await drainSyncOutbox('pglite://', deliver, 10, runScoped)).toEqual({ delivered: 0, failed: 1, pruned: 0 });
-    expect(await drainSyncOutbox('pglite://', deliver, 10, runScoped)).toEqual({ delivered: 1, failed: 0, pruned: 0 });
+    expect(await drainSyncOutbox('pglite://', deliver, 10, runScoped)).toEqual({
+      delivered: 0,
+      failed: 1,
+      pruned: 0,
+    });
+    expect(await drainSyncOutbox('pglite://', deliver, 10, runScoped)).toEqual({
+      delivered: 1,
+      failed: 0,
+      pruned: 0,
+    });
     const outbox = await db.query<{ pending: number; attempts: number }>(
       `SELECT count(*) FILTER (WHERE delivered_at IS NULL)::int AS pending,sum(attempts)::int AS attempts
          FROM cloud_sync_outbox WHERE tenant_id=$1 AND workspace_id=$2 AND server_seq>=$3`,
@@ -681,7 +1422,12 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
       const engine = new SyncAuthorityEngine(new NeonSyncStore(client, TENANT_A, WORKSPACE_A));
       await lockWorkspaceSequence(client, TENANT_A, WORKSPACE_A);
       await engine.push(access(TENANT_A, WORKSPACE_A), oldRequest, Date.now(), await hashRequest(oldRequest));
-      await engine.push(access(TENANT_A, WORKSPACE_A), recentRequest, Date.now(), await hashRequest(recentRequest));
+      await engine.push(
+        access(TENANT_A, WORKSPACE_A),
+        recentRequest,
+        Date.now(),
+        await hashRequest(recentRequest),
+      );
     });
     // Age the record as fixture setup with the migration owner, then exercise pruning as the
     // restricted runtime role in a tenant/workspace-scoped transaction.
@@ -691,7 +1437,9 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
       [TENANT_A, WORKSPACE_A, `${TENANT_A}:${WORKSPACE_A}:${USER_A}:nodea:${oldRequest.idempotencyKey}`],
     );
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
-      await new NeonSyncStore(client, TENANT_A, WORKSPACE_A).pruneIdempotency(Date.now() - 7 * 24 * 3_600_000);
+      await new NeonSyncStore(client, TENANT_A, WORKSPACE_A).pruneIdempotency(
+        Date.now() - 7 * 24 * 3_600_000,
+      );
     });
     const remaining = await db.query<{ idempotency_key: string }>(
       `SELECT idempotency_key FROM cloud_sync_idempotency
@@ -836,7 +1584,9 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
         [TENANT_A],
       );
       expect(expired.rows).toHaveLength(1);
-      await expect(client.query(`DELETE FROM cloud_webhook_receipts WHERE provider='probe'`)).rejects.toThrow();
+      await expect(
+        client.query(`DELETE FROM cloud_webhook_receipts WHERE provider='probe'`),
+      ).rejects.toThrow();
     });
   });
 });

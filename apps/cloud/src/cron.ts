@@ -19,6 +19,11 @@ export async function runScheduledMaintenance(
       const deleted = await client.query(
         'DELETE FROM cloud_dpop_replays WHERE expires_at < now() RETURNING 1',
       );
+      // Per-source webhook quota buckets are minute-granular and needed for only two days.
+      // The migration's RLS delete policy independently enforces this cutoff.
+      await client.query(
+        "DELETE FROM cloud_invest_signal_rate_windows WHERE window_start < now() - interval '2 days'",
+      );
       await client.query(
         `UPDATE cloud_cron_runs SET finished_at=now(),outcome='succeeded'
           WHERE job_name='dpop-replay-cleanup' AND window_start=to_timestamp($1 / 1000.0)`,
