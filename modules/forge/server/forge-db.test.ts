@@ -123,6 +123,8 @@ describe('Forge schema and workspace isolation', () => {
     await expect(forge.decideRiskAcceptance(actorA, { acceptanceId: riskRequest.id, decision: 'approved', reason: 'Self approval' })).rejects.toThrow('FORGE_RISK_ACCEPTANCE_REQUIRES_INDEPENDENT_APPROVER');
     expect((await forge.decideRiskAcceptance(secondActor, { acceptanceId: riskRequest.id, decision: 'approved', reason: 'Reviewed mitigation and follow-up' }))?.status).toBe('approved');
     await expect(forge.decideRiskAcceptance(secondActor, { acceptanceId: riskRequest.id, decision: 'rejected', reason: 'Conflicting second decision' })).rejects.toThrow('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
+    expect((await forge.evaluateGateSet(actorA, [{ id: 'req:XIO-REQ-FRG-008', requirementId: 'XIO-REQ-FRG-008', kind: 'human', status: 'fail', hard: true, evidenceIds: [] }])).overall).toBe('pass');
+    expect((await forge.evaluateGateSet(actorA, [{ id: 'req:XIO-REQ-FRG-008', requirementId: 'XIO-REQ-FRG-008', kind: 'deterministic', status: 'fail', hard: true, evidenceIds: [evidenceRecord.id] }])).overall).toBe('fail');
     expect((await forge.gateMatrix(actorA, { requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] })).overall).toBe('pass');
     const proposal = await forge.requestPromotionRecord(actorA, { commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', evidenceIds: [evidenceRecord.id], requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] });
     expect(proposal).toMatchObject({ state: 'proposed', evidenceIds: [evidenceRecord.id], missingGateIds: [] });

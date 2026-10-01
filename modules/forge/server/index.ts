@@ -8,7 +8,7 @@ export * from './repository';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { ForgeRepository } from './repository';
 import { forgeCapabilities } from '../contracts';
-import { evaluateGates, planSchedule, rollbackPromotion } from './engine';
+import { planSchedule, rollbackPromotion } from './engine';
 import { compileSpecCorpus } from './compiler';
 
 export interface ForgeCall {
@@ -48,8 +48,7 @@ const ForgeRegistration = {
     });
     bus.register(manifest, forgeCapabilities.gates, async (input, call) => {
       const request = forgeCapabilities.gates.input.parse(input);
-      const result = evaluateGates(request.gates, []);
-      return repository.recordGateEvaluation(actor(call), result);
+      return repository.evaluateGateSet(actor(call), request.gates);
     });
     bus.register(manifest, forgeCapabilities.promotion, async (input, call) => repository.requestPromotionRecord(actor(call), forgeCapabilities.promotion.input.parse(input)));
     bus.register(manifest, forgeCapabilities.evidence, async (input, call) => requireRepository(repository).createEvidence(actor(call), forgeCapabilities.evidence.input.parse(input)));

@@ -2,8 +2,8 @@ import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceDecisionRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
-import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
+import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, Gate, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceDecisionRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
+import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix, evaluateGates } from './engine';
 import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
 
@@ -438,9 +438,16 @@ export class ForgeRepository {
     }
     return (await this.escalations(actor)).find((item) => item.id === request.escalationId);
   }
-  async recordGateEvaluation(actor: ForgeActor, evaluation: { gates: Array<{ id: string; requirementId: string; kind: 'deterministic' | 'human' | 'ai-judgment'; status: 'pass' | 'fail' | 'pending' | 'blocked'; hard: boolean; evidenceIds: string[] }> }) {
+  async recordGateEvaluation(actor: ForgeActor, evaluation: { gates: Array<{ id: string; requirementId: string; kind: 'deterministic' | 'human' | 'ai-judgment'; status: 'pass' | 'fail' | 'pending' | 'blocked'; hard: boolean; evidenceIds: string[] }>; overall: 'pass' | 'fail' | 'blocked'; aiJudgmentAllowed: false; deterministicBeforeJudgment: true }) {
     for (const gate of evaluation.gates) await this.store.query(this.scope(actor), 'INSERT INTO forge_gates(id,tenant_id,workspace_id,requirement_id,kind,status,hard,evidence_ids,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)', [`${uuidv7()}:${gate.id}`, actor.tenantId, actor.workspaceId, gate.requirementId, gate.kind, gate.status, gate.hard, json(gate.evidenceIds), actor.id]);
     return evaluation;
+  }
+  async evaluateGateSet(actor: ForgeActor, rawGates: unknown) {
+    const gates = z.array(Gate).parse(rawGates);
+    const eligibleIds = gates.filter((gate) => gate.kind === 'human' && gate.hard && gate.status === 'fail').map((gate) => gate.id);
+    const { rows } = eligibleIds.length ? await this.store.query<Record<string, unknown> & { gate_id: string; reason: string; impact: string; mitigation: string; review_at: string; decided_by: string }>(this.scope(actor), "SELECT r.gate_id,r.reason,r.impact,r.mitigation,r.review_at,d.decided_by FROM forge_risk_acceptances r JOIN forge_risk_acceptance_decisions d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.acceptance_id=r.id AND d.decision='approved' WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.gate_id=ANY($3::text[]) AND r.review_at>now() ORDER BY d.created_at DESC", [actor.tenantId, actor.workspaceId, eligibleIds]) : { rows: [] };
+    const acceptances = rows.map((row) => ({ gateId: row.gate_id, reason: row.reason, impact: row.impact, mitigation: row.mitigation, reviewAt: timestamp(row.review_at), approvedBy: row.decided_by }));
+    return this.recordGateEvaluation(actor, evaluateGates(gates, acceptances));
   }
   async riskAcceptances(actor: ForgeActor) {
     const { rows } = await this.store.query<Record<string, unknown> & { id: string; gate_id: string; requirement_id: string; reason: string; impact: string; mitigation: string; review_at: string; requested_by: string; created_at: string; decision: 'approved'|'rejected'|null; decision_reason: string|null; decided_by: string|null; decided_at: string|null }>(this.scope(actor), 'SELECT r.id,r.gate_id,r.requirement_id,r.reason,r.impact,r.mitigation,r.review_at,r.requested_by,r.created_at,d.decision,d.reason AS decision_reason,d.decided_by,d.created_at AS decided_at FROM forge_risk_acceptances r LEFT JOIN forge_risk_acceptance_decisions d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.acceptance_id=r.id ORDER BY r.created_at DESC');
