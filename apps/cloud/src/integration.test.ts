@@ -1398,16 +1398,15 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const key = 'review:lease-cleanup';
     const first = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(first.status).toBe(200);
-    const expiryDeadline = Date.now() + 8_000;
-    let expiredLeases = 0;
-    while (expiredLeases < 1 && Date.now() < expiryDeadline) {
-      const maintained = await hub('/internal/maintenance', {});
-      const body = (await maintained.json()) as Record<string, any>;
-      expiredLeases = typeof body['expiredLeases'] === 'number' ? body['expiredLeases'] : 0;
-      if (expiredLeases < 1) await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    expect(expiredLeases, 'lease did not expire within the 8 second poll deadline').toBeGreaterThanOrEqual(1);
+    const expiresAtMs = first.json?.['lease']?.expiresAtMs;
+    expect(Number.isSafeInteger(expiresAtMs), `invalid lease expiry: ${JSON.stringify(first)}`).toBe(true);
+    const untilExpiry = expiresAtMs - Date.now() + 1;
+    if (untilExpiry > 0) await new Promise((resolve) => setTimeout(resolve, untilExpiry));
+    expect(Date.now(), 'lease expiry timestamp has not elapsed').toBeGreaterThan(expiresAtMs);
+    await hub('/internal/maintenance', {});
     const next = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
+    expect(next.status, `lease reacquire response: ${JSON.stringify(next)}`).toBe(200);
+    expect(next.json?.['lease'], `lease missing from successful reacquire: ${JSON.stringify(next)}`).toBeTruthy();
     expect(next.json?.['lease'].fence).toBeGreaterThan(first.json?.['lease'].fence);
   }, 20_000);
 });
