@@ -15,6 +15,30 @@ const RunInput = z.object({
   leaseScope: z.object({ jobId: z.string().min(1), window: z.string().min(1) }).optional(),
 });
 
+/** Immutable review subject resolved by the trusted host from a Forge council assignment. */
+export const PreparedReviewBinding = z.strictObject({
+  councilId: z.uuid(),
+  assignmentId: z.uuid(),
+  targetId: z.uuid(),
+  repositoryId: z.string().trim().min(1).max(300),
+  reviewContractId: z.string().trim().min(1).max(200),
+  reviewContractSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  role: z.string().trim().min(1).max(100),
+  reviewerPrincipalId: z.uuid(),
+  subjectCommitSha: z.string().regex(/^[0-9a-f]{40,64}$/),
+  artifacts: z.array(z.strictObject({ id: z.uuid(), sha256: z.string().regex(/^[0-9a-f]{64}$/) })).max(100),
+});
+export type PreparedReviewBinding = z.infer<typeof PreparedReviewBinding>;
+
+/** Public run intent covered by the CapabilityBus approval digest. */
+export const AgentRunAdmissionRequest = z.strictObject({
+  runId: z.uuid(),
+  profileId: z.uuid(),
+  prompt: z.string().trim().min(1).max(100_000),
+  review: z.strictObject({ councilId: z.uuid(), assignmentId: z.uuid(), role: z.string().trim().min(1).max(100) }).optional(),
+});
+export type AgentRunAdmissionRequest = z.infer<typeof AgentRunAdmissionRequest>;
+
 /** Inputs only a trusted host may resolve. Do not construct this from a WebView payload. */
 export interface TrustedAgentRunPreparation {
   readonly runId: string;
@@ -27,6 +51,10 @@ export interface TrustedAgentRunPreparation {
   readonly route: RouteRequest;
   readonly signal?: AbortSignal;
   readonly leaseScope?: AgentRunInputType['leaseScope'];
+  /** Resolved from the immutable server-side council assignment; never copied from public input. */
+  readonly reviewBinding?: PreparedReviewBinding;
+  /** Exact parsed bus input whose digest is bound by verifiedApproval. */
+  readonly approvedInput?: AgentRunAdmissionRequest;
 }
 
 /** Capability-bus authority retained with the prepared input for the host queue/audit boundary. */
@@ -35,6 +63,8 @@ export interface PreparedRunAuthority {
   readonly tenantId: string;
   readonly workspaceId: string;
   readonly verifiedApproval: VerifiedApproval | null;
+  readonly reviewBinding?: PreparedReviewBinding;
+  readonly approvedInput?: AgentRunAdmissionRequest;
 }
 
 export class PreparedAgentRun {
@@ -66,18 +96,44 @@ export class PreparedAgentRun {
     if (approval && (approval.tenantId !== principal.tenantId || approval.workspaceId !== workspaceId || approval.principalId !== principal.id)) {
       throw new Error('RUN_APPROVAL_SCOPE_MISMATCH');
     }
+    const reviewBinding = context.reviewBinding === undefined ? undefined : PreparedReviewBinding.parse(context.reviewBinding);
+    if (reviewBinding && reviewBinding.reviewerPrincipalId !== principal.id) throw new Error('REVIEW_REVIEWER_PRINCIPAL_MISMATCH');
+    const approvedInput = context.approvedInput === undefined ? undefined : AgentRunAdmissionRequest.parse(context.approvedInput);
+    if ((approval === null) !== (approvedInput === undefined)) throw new Error('RUN_APPROVAL_INPUT_REQUIRED');
+    if (approvedInput && (
+      approvedInput.runId !== runId || approvedInput.profileId !== profile.id || approvedInput.prompt !== context.prompt
+    )) throw new Error('RUN_APPROVED_INPUT_MISMATCH');
+    if (reviewBinding) {
+      if (!approvedInput?.review || approvedInput.review.councilId !== reviewBinding.councilId ||
+        approvedInput.review.assignmentId !== reviewBinding.assignmentId || approvedInput.review.role !== reviewBinding.role) {
+        throw new Error('RUN_REVIEW_BINDING_MISMATCH');
+      }
+    } else if (approvedInput?.review) {
+      throw new Error('RUN_REVIEW_BINDING_REQUIRED');
+    }
     const input = RunInput.parse({
       runId, workspaceId, principal, profile, prompt: context.prompt, spawn, route,
       ...(context.signal === undefined ? {} : { signal: context.signal }),
       ...(context.leaseScope === undefined ? {} : { leaseScope: context.leaseScope }),
     }) as AgentRunInputType;
-    return new PreparedAgentRun(input, {
+    const authority: PreparedRunAuthority = {
       principalId: principal.id,
       tenantId: principal.tenantId,
       workspaceId,
       verifiedApproval: approval,
-    });
+      ...(reviewBinding === undefined ? {} : { reviewBinding }),
+      ...(approvedInput === undefined ? {} : { approvedInput }),
+    };
+    return new PreparedAgentRun(freezePlain(input), freezePlain(authority));
   }
+}
+
+function freezePlain<T>(value: T): T {
+  if (!value || typeof value !== 'object') return value;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return value;
+  for (const child of Object.values(value as Record<string, unknown>)) freezePlain(child);
+  return Object.freeze(value);
 }
 
 function withinBudget(spawn: SpawnContractType, profile: AgentProfileType): boolean {

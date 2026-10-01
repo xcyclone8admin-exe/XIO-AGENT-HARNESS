@@ -10,7 +10,7 @@
   "exports": {
     "./manifest": "./manifest.ts",
     "./contracts": "./contracts.ts",
-    "./server": "./server/profile-service.ts"
+    "./server": "./server/index.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
