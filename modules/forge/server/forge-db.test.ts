@@ -83,6 +83,8 @@ describe('Forge schema and workspace isolation', () => {
     expect((await forge.sources(actorA)).map((item) => item.id)).toContain(source.id);
     const ingested = await forge.ingestSource(actorA, { label: 'Local pasted source', locator: 'notes/local.md', content: 'approved local source contents' });
     expect(ingested.sha256).toMatch(/^[0-9a-f]{64}$/);
+    const secondActor = { id: '019a0000-0000-7000-8000-000000000023', tenantId: tenantA, workspaceId: workspaceA };
+    await expect(forge.decideSource(actorA, { sourceId: ingested.id, decision: 'approved', reason: 'Self approval' })).rejects.toThrow('FORGE_SOURCE_DECISION_REQUIRES_INDEPENDENT_REVIEWER');
     const storedSource = await scoped.query<Record<string, unknown> & { content: string }>(scopeA, 'SELECT content FROM forge_sources WHERE id=$1', [ingested.id]);
     expect(storedSource.rows[0]?.content).toBe('approved local source contents');
     const corpus = compileSpecCorpus({ title: 'Release plan', requirements: [{ id: 'REQ-1', statement: 'Preserve approved intent' }] });
@@ -108,6 +110,9 @@ describe('Forge schema and workspace isolation', () => {
     await expect(forge.createNode(actorA, project.id, { parentId: planNode.id, kind: 'subtask', title: 'Invalid hierarchy', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null })).rejects.toThrow('FORGE_NODE_PARENT_KIND_INVALID');
     expect((await forge.updateNode(actorA, { nodeId: task.id, parentId: waveNode.id })).parentId).toBe(waveNode.id);
     await expect(forge.updateNode(actorA, { nodeId: task.id, parentId: dependent.id })).rejects.toThrow('FORGE_NODE_PARENT_KIND_INVALID');
+    await expect(forge.compileTicketContext(actorA, { ticketId: task.id, budgetTokens: 8000, sourceIds: [ingested.id] })).rejects.toThrow('FORGE_CONTEXT_SOURCE_NOT_FOUND_IN_WORKSPACE');
+    expect(await forge.decideSource(secondActor, { sourceId: ingested.id, decision: 'approved', reason: 'Hash and locator reviewed' })).toMatchObject({ status: 'approved' });
+    await expect(forge.decideSource(secondActor, { sourceId: ingested.id, decision: 'rejected', reason: 'Conflicting decision' })).rejects.toThrow('FORGE_SOURCE_ALREADY_DECIDED');
     const evidenceRecord = await forge.createEvidence(actorA, { requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest fixture', deterministic: true, result: 'pass', payload: { test: 'green' }, ticketId: task.id });
     expect((await forge.nodes(actorA, project.id)).find((node) => node.id === task.id)?.evidenceIds).toContain(evidenceRecord.id);
     const context = await forge.compileTicketContext(actorA, { ticketId: task.id, budgetTokens: 8000, sourceIds: [ingested.id] });
@@ -116,7 +121,6 @@ describe('Forge schema and workspace isolation', () => {
     expect(context.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
     const riskRequest = await forge.requestRiskAcceptance(actorA, { gateId: 'req:XIO-REQ-FRG-008', requirementId: 'XIO-REQ-FRG-008', reason: 'Temporary accepted residual risk', impact: 'Limited rollback window', mitigation: 'Review after follow-up tests', reviewAt: new Date(Date.now() + 86_400_000).toISOString() });
     await expect(forge.decideRiskAcceptance(actorA, { acceptanceId: riskRequest.id, decision: 'approved', reason: 'Self approval' })).rejects.toThrow('FORGE_RISK_ACCEPTANCE_REQUIRES_INDEPENDENT_APPROVER');
-    const secondActor = { id: '019a0000-0000-7000-8000-000000000023', tenantId: tenantA, workspaceId: workspaceA };
     expect((await forge.decideRiskAcceptance(secondActor, { acceptanceId: riskRequest.id, decision: 'approved', reason: 'Reviewed mitigation and follow-up' }))?.status).toBe('approved');
     await expect(forge.decideRiskAcceptance(secondActor, { acceptanceId: riskRequest.id, decision: 'rejected', reason: 'Conflicting second decision' })).rejects.toThrow('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
     expect((await forge.gateMatrix(actorA, { requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] })).overall).toBe('pass');

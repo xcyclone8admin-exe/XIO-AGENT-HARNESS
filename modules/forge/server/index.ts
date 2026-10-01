@@ -81,6 +81,7 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.sources, (_input, call) => requireRepository(repository).sources(actor(call)));
     bus.register(manifest, forgeCapabilities.createSource, (input, call) => requireRepository(repository).createSource(actor(call), forgeCapabilities.createSource.input.parse(input)));
     bus.register(manifest, forgeCapabilities.ingestSource, (input, call) => requireRepository(repository).ingestSource(actor(call), forgeCapabilities.ingestSource.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.decideSource, (input, call) => requireRepository(repository).decideSource(actor(call), forgeCapabilities.decideSource.input.parse(input)));
     bus.register(manifest, forgeCapabilities.compileTicketContext, (input, call) => requireRepository(repository).compileTicketContext(actor(call), forgeCapabilities.compileTicketContext.input.parse(input)));
     bus.register(manifest, forgeCapabilities.schedules, (_input, call) => requireRepository(repository).schedules(actor(call)));
     bus.register(manifest, forgeCapabilities.runs, (_input, call) => requireRepository(repository).runs(actor(call)));

@@ -2,7 +2,7 @@ import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
+import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceDecisionRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
 import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
@@ -105,8 +105,19 @@ export class ForgeRepository {
     return HierarchyNode.parse({ id: archived.id, tenantId: archived.tenant_id, workspaceId: archived.workspace_id, projectId: archived.project_id, parentId: archived.parent_id, archivedAt: timestamp(archived.archived_at), kind: archived.kind, title: archived.title, description: archived.description, state: archived.state, priority: archived.priority, dependencies: archived.dependencies, requirements: archived.requirement_refs, acceptanceCriteria: archived.acceptance_criteria, evidenceIds: archived.evidence_ids, ownerId: archived.owner_id, createdBy: archived.created_by, createdAt: timestamp(archived.created_at), updatedAt: timestamp(archived.updated_at) });
   }
   async sources(actor: ForgeActor) {
-    const { rows } = await this.store.query<Record<string, unknown> & { id: string; label: string; locator: string; authority: string; status: string; sha256: string; created_at: string }>(this.scope(actor), 'SELECT id,label,locator,authority,status,sha256,created_at FROM forge_sources ORDER BY created_at DESC');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; label: string; locator: string; authority: string; status: string; sha256: string; created_at: string }>(this.scope(actor), 'SELECT s.id,s.label,s.locator,s.authority,COALESCE(d.decision,s.status) AS status,s.sha256,s.created_at FROM forge_sources s LEFT JOIN forge_source_decisions d ON d.tenant_id=s.tenant_id AND d.workspace_id=s.workspace_id AND d.source_id=s.id ORDER BY s.created_at DESC');
     return rows.map((row) => ({ id: row.id, label: row.label, locator: row.locator, authority: row.authority, status: row.status, sha256: row.sha256, createdAt: timestamp(row.created_at) }));
+  }
+  async decideSource(actor: ForgeActor, raw: unknown) {
+    const request = SourceDecisionRequest.parse(raw);
+    const source = await this.store.query<Record<string, unknown> & { created_by: string; status: string }>(this.scope(actor), 'SELECT s.created_by,COALESCE(d.decision,s.status) AS status FROM forge_sources s LEFT JOIN forge_source_decisions d ON d.tenant_id=s.tenant_id AND d.workspace_id=s.workspace_id AND d.source_id=s.id WHERE s.tenant_id=$1 AND s.workspace_id=$2 AND s.id=$3', [actor.tenantId, actor.workspaceId, request.sourceId]);
+    const row = source.rows[0];
+    if (!row) throw new Error('FORGE_SOURCE_NOT_FOUND');
+    if (row.status !== 'draft') throw new Error('FORGE_SOURCE_ALREADY_DECIDED');
+    if (row.created_by === actor.id) throw new Error('FORGE_SOURCE_DECISION_REQUIRES_INDEPENDENT_REVIEWER');
+    const inserted = await this.store.query(this.scope(actor), 'INSERT INTO forge_source_decisions(id,tenant_id,workspace_id,source_id,decision,reason,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,workspace_id,source_id) DO NOTHING RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.sourceId, request.decision, request.reason, actor.id]);
+    if (!inserted.rows.length) throw new Error('FORGE_SOURCE_ALREADY_DECIDED');
+    return (await this.sources(actor)).find((item) => item.id === request.sourceId);
   }
   async createSource(actor: ForgeActor, raw: unknown) {
     const input = SourceRecordCreate.parse(raw); const id = uuidv7();
@@ -131,7 +142,7 @@ export class ForgeRepository {
     const dependencyNodes = allNodes.filter((node) => dependencies.includes(node.id));
     const requirements = [...(Array.isArray(project.requirements) ? project.requirements as { id: string; statement: string }[] : []), ...(Array.isArray(ticket.requirement_refs) ? ticket.requirement_refs as { id: string; statement: string }[] : [])];
     const accepted = Array.isArray(ticket.acceptance_criteria) ? ticket.acceptance_criteria as string[] : [];
-    const { rows: selectedSources } = await this.store.query<Record<string, unknown> & { id: string; label: string; locator: string; authority: string; status: string; sha256: string; content: string | null }>(this.scope(actor), 'SELECT id,label,locator,authority,status,sha256,content FROM forge_sources WHERE tenant_id=$1 AND workspace_id=$2 ORDER BY created_at DESC', [actor.tenantId, actor.workspaceId]);
+    const { rows: selectedSources } = await this.store.query<Record<string, unknown> & { id: string; label: string; locator: string; authority: string; status: string; sha256: string; content: string | null }>(this.scope(actor), "SELECT s.id,s.label,s.locator,s.authority,d.decision AS status,s.sha256,s.content FROM forge_sources s JOIN forge_source_decisions d ON d.tenant_id=s.tenant_id AND d.workspace_id=s.workspace_id AND d.source_id=s.id AND d.decision='approved' WHERE s.tenant_id=$1 AND s.workspace_id=$2 ORDER BY s.created_at DESC", [actor.tenantId, actor.workspaceId]);
     const sources = selectedSources.filter((source) => input.sourceIds.includes(source.id));
     if (sources.length !== input.sourceIds.length) throw new Error('FORGE_CONTEXT_SOURCE_NOT_FOUND_IN_WORKSPACE');
     const projectSpecs = await this.specs(actor, ticket.project_id);
