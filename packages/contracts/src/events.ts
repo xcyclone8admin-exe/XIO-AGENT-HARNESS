@@ -22,7 +22,12 @@ export interface EventDescriptor<P extends z.ZodType = z.ZodType> {
   readonly containsPersonalData?: boolean;
 }
 
-export function defineEvent<P extends z.ZodType>(type: string, v: number, payload: P, opts?: { containsPersonalData?: boolean }): EventDescriptor<P> {
+export function defineEvent<P extends z.ZodType>(
+  type: string,
+  v: number,
+  payload: P,
+  opts?: { containsPersonalData?: boolean },
+): EventDescriptor<P> {
   return { type, v, payload, ...(opts ?? {}) };
 }
 

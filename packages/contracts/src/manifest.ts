@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ColumnSpec } from './fields';
 import { PERMISSION_RE, WorkspaceRole } from './identity';
 
 export const PILLARS = [
@@ -83,6 +84,7 @@ export const SERVER_STAMPED_FIELDS: readonly string[] = [
   'workspace_id',
   'created_by',
   'created_at',
+  'received_at',
 ];
 
 /** The sync Worker rejects writes to server-authority and guarded fields (ADR-0003 A1). */
@@ -95,6 +97,18 @@ export const TableDecl = z
     children: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).default([]),
     guardedColumns: z.array(z.string().min(1)).default([]),
     /**
+     * Guarded columns the local app role can never write (e.g. an agent profile's capability
+     * grants): its UPDATE grant is column-listed without them, and a module trigger rejects
+     * inserts that set them.
+     */
+    privilegedColumns: z.array(z.string().min(1)).default([]),
+    /** Named trusted-writer capabilities granted access to this local relation only. */
+    serverWriteCapabilities: z.array(z.string().regex(/^[a-z][a-z0-9_]{1,47}$/)).default([]),
+    /** Named trusted capabilities that may read this local relation without write privileges. */
+    serverReadCapabilities: z.array(z.string().regex(/^[a-z][a-z0-9_]{1,47}$/)).default([]),
+    /** Named trusted capabilities granted SELECT and INSERT only (for append-only relations). */
+    serverInsertCapabilities: z.array(z.string().regex(/^[a-z][a-z0-9_]{1,47}$/)).default([]),
+    /**
      * Device-writable fields for `synced`/`append` tables. Absent means the Worker
      * rejects every field change (fail closed). Never lists server-stamped fields.
      */
@@ -106,18 +120,73 @@ export const TableDecl = z
       .optional(),
     /** Permission a device change needs; absent on writable tables means any non-read-only role. */
     writePermission: z.string().min(1).optional(),
+    /** Permission to receive this table's rows in pull and conflict pages; absent means any member. */
+    readPermission: z.string().min(1).optional(),
+    /** Column the Worker stamps with server receipt time on insert; immutable, never device-writable. */
+    receivedAtField: z
+      .string()
+      .regex(/^[a-z][a-z0-9_]*$/)
+      .optional(),
+    /**
+     * Specs for every device-writable, actor and receipt column (CLD-R-007). Kept equal to the
+     * migrations by a PGlite parity test.
+     */
+    columns: z.record(z.string().regex(/^[a-z][a-z0-9_]*$/), ColumnSpec).optional(),
   })
   .superRefine((table, ctx) => {
     const writable = table.authority === 'synced' || table.authority === 'append';
-    if (!writable && (table.allowedFields || table.actorField || table.writePermission)) {
+    if (
+      !writable &&
+      (table.allowedFields || table.actorField || table.writePermission || table.receivedAtField)
+    ) {
       ctx.addIssue({
         code: 'custom',
         path: ['authority'],
-        message: 'allowedFields/actorField/writePermission apply only to synced or append tables',
+        message:
+          'allowedFields/actorField/writePermission/receivedAtField apply only to synced or append tables',
       });
     }
+    if (writable && !table.columns) {
+      ctx.addIssue({ code: 'custom', path: ['columns'], message: 'synced/append tables declare columns' });
+    }
+    if (table.authority === 'append' && !table.receivedAtField) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['receivedAtField'],
+        message: 'append tables declare a server receipt column (CLD-R-013)',
+      });
+    }
+    const specified = [
+      ...(table.allowedFields ?? []),
+      ...(table.actorField ? [table.actorField] : []),
+      ...(table.receivedAtField ? [table.receivedAtField] : []),
+    ];
+    for (const field of specified) {
+      if (table.columns && !table.columns[field]) {
+        ctx.addIssue({ code: 'custom', path: ['columns'], message: `${field} needs a column spec` });
+      }
+    }
+    if (table.actorField && table.columns?.[table.actorField]?.type !== 'uuid') {
+      ctx.addIssue({ code: 'custom', path: ['columns'], message: 'the actor column is a uuid' });
+    }
+    if (table.receivedAtField && table.columns?.[table.receivedAtField]?.type !== 'timestamptz') {
+      ctx.addIssue({ code: 'custom', path: ['columns'], message: 'the receipt column is a timestamptz' });
+    }
+    for (const column of table.privilegedColumns) {
+      if (!table.guardedColumns.includes(column)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['privilegedColumns'],
+          message: `${column} must also be guarded`,
+        });
+      }
+    }
     for (const field of table.allowedFields ?? []) {
-      if (SERVER_STAMPED_FIELDS.includes(field) || field === table.actorField) {
+      if (
+        SERVER_STAMPED_FIELDS.includes(field) ||
+        field === table.actorField ||
+        field === table.receivedAtField
+      ) {
         ctx.addIssue({
           code: 'custom',
           path: ['allowedFields'],
@@ -176,6 +245,10 @@ export function defineModule(m: ModuleManifestInput): ModuleManifest {
     }
   }
   for (const table of parsed.tables) {
+    for (const permission of [table.readPermission, table.writePermission]) {
+      if (permission !== undefined && !parsed.permissions.includes(permission))
+        throw new Error(`Module ${parsed.id}: table ${table.name} permission "${permission}" is undeclared`);
+    }
     if (table.authority === 'append' && table.class !== 'append')
       throw new Error(`Module ${parsed.id}: append authority requires append class`);
     if (table.authority === 'local' && table.class !== 'local')

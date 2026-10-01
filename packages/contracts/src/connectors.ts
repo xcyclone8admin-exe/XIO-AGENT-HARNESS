@@ -1,7 +1,14 @@
 import { z } from 'zod';
 
 /** Honest connector states (XIO README §5; ADR-0011). There is deliberately no "demo" or "simulated" state. */
-export const CONNECTOR_STATES = ['CONNECTED', 'NOT_CONFIGURED', 'DEGRADED', 'ERROR', 'REAUTH_REQUIRED', 'DISABLED'] as const;
+export const CONNECTOR_STATES = [
+  'CONNECTED',
+  'NOT_CONFIGURED',
+  'DEGRADED',
+  'ERROR',
+  'REAUTH_REQUIRED',
+  'DISABLED',
+] as const;
 export const ConnectorState = z.enum(CONNECTOR_STATES);
 export type ConnectorState = z.infer<typeof ConnectorState>;
 
