@@ -42,6 +42,10 @@ export default defineModule({
     // flow_approvals really have a foreign key into — flow_runs.run_id by itself repeats across
     // every lifecycle event row for a run and cannot back a real reference (migration 0003).
     { name: 'flow_run_registry', class: 'local', authority: 'local' },
+    // Mutable (claim/release/reclaim) concurrency fence for a scheduled dispatcher; server-only —
+    // no capability exposes it, so it is reachable only through FlowRepository.claimStep /
+    // advanceClaimedRun by a trusted host caller (migration 0004).
+    { name: 'flow_step_claims', class: 'local', authority: 'local' },
     {
       name: 'flow_runs',
       class: 'append',

@@ -2,8 +2,17 @@ import type { LocalScopedStore, Scope } from '@xyra/db';
 import { randomUUID } from 'node:crypto';
 import type { z } from 'zod';
 import { WorkflowCreate, type ApprovalDecision, type MissedJobPolicy, type RunStatus, type RunTrigger, type WorkflowDefinition, type WorkflowStep } from '../contracts';
-import type { StepHandlerRegistry } from './handlers';
+import type { StepContext, StepHandlerRegistry } from './handlers';
 import { topologicalOrder } from './dag';
+
+/** Default lease a claim holds before it is eligible for reclaim by another caller. */
+export const DEFAULT_CLAIM_LEASE_MS = 2 * 60_000;
+
+export interface StepClaim {
+  readonly claimToken: string;
+  readonly leaseExpiresAt: string;
+  readonly context: StepContext;
+}
 
 export interface FlowActor {
   readonly id: string;
@@ -43,6 +52,13 @@ interface RunRow extends Record<string, unknown> {
   created_by: string;
   created_at: string | Date;
   ended_at: string | Date | null;
+}
+
+interface ClaimRow extends Record<string, unknown> {
+  claim_token: string;
+  dispatch_id: string;
+  lease_expires_at: string | Date;
+  released_at: string | Date | null;
 }
 
 interface CheckpointRow extends Record<string, unknown> {
@@ -172,8 +188,12 @@ export class FlowRepository {
     return toRunStatus(row);
   }
 
-  /** Bounded by the workflow's max_concurrent_runs: refuses to start another run once the limit of currently-running runs is reached. */
-  async triggerRun(actor: FlowActor, workflowId: string, trigger: RunTrigger): Promise<RunStatus> {
+  /**
+   * Bounded by the workflow's max_concurrent_runs: refuses to start another run once the limit of
+   * currently-running runs is reached. `scheduledFor`, when the host's scheduler supplies it, is
+   * persisted verbatim in the run's detail — FLOW never invents or infers it from createdAt.
+   */
+  async triggerRun(actor: FlowActor, workflowId: string, trigger: RunTrigger, options?: { scheduledFor?: string }): Promise<RunStatus> {
     const scope = scopeOf(actor);
     const workflow = await this.requireWorkflow(actor, workflowId);
     if (!workflow.enabled) throw new Error('FLOW_WORKFLOW_DISABLED');
@@ -196,19 +216,20 @@ export class FlowRepository {
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [actor.tenantId, actor.workspaceId, runId, workflowId, trigger, actor.id],
     );
+    const detail = options?.scheduledFor ? { scheduledFor: options.scheduledFor } : {};
     await this.store.query(
       scope,
       `INSERT INTO flow_runs (id, run_id, tenant_id, workspace_id, workflow_id, trigger, state, step_index, attempt, detail, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, 'running', 0, 0, '{}'::jsonb, $7)`,
-      [randomUUID(), runId, actor.tenantId, actor.workspaceId, workflowId, trigger, actor.id],
+       VALUES ($1, $2, $3, $4, $5, $6, 'running', 0, 0, $7, $8)`,
+      [randomUUID(), runId, actor.tenantId, actor.workspaceId, workflowId, trigger, JSON.stringify(detail), actor.id],
     );
     return this.currentRun(actor, runId);
   }
 
   /**
-   * Executes the step at the run's current checkpoint, or — if that step already has a recorded
-   * checkpoint (a prior attempt crashed after checkpointing but before advancing the run event) —
-   * reuses that checkpoint's outcome without re-invoking the handler.
+   * Single-writer step advance: no concurrency fence. Safe for a manual trigger or a single-
+   * instance scheduler. A multi-instance dispatcher must use claimStep + advanceClaimedRun instead
+   * — this method does not protect against two concurrent callers racing the same run.
    */
   async advanceRun(actor: FlowActor, runId: string): Promise<RunStatus> {
     const current = await this.currentRun(actor, runId);
@@ -216,28 +237,121 @@ export class FlowRepository {
     const workflow = await this.requireWorkflow(actor, current.workflowId);
     const step = workflow.steps[current.stepIndex];
     if (!step) throw new Error('FLOW_RUN_STEP_OUT_OF_RANGE');
+    const context = this.stepContext(actor, current, step);
+    await this.executeStep(actor, current, workflow, step, context);
+    return this.currentRun(actor, runId);
+  }
 
+  /**
+   * Atomically claims the run's current step for exclusive execution. Fails with
+   * FLOW_STEP_ALREADY_CLAIMED if another caller already holds a live (unexpired, unreleased) claim
+   * on the same (run, step, attempt). The claim fence IS that tuple — the same one flow_checkpoints
+   * already enforces uniqueness on — so a claim can never span two different steps or attempts.
+   */
+  async claimStep(actor: FlowActor, runId: string, leaseMs: number = DEFAULT_CLAIM_LEASE_MS): Promise<StepClaim> {
+    const current = await this.currentRun(actor, runId);
+    if (current.state !== 'running') throw new Error('FLOW_RUN_NOT_RUNNING');
+    const workflow = await this.requireWorkflow(actor, current.workflowId);
+    const step = workflow.steps[current.stepIndex];
+    if (!step) throw new Error('FLOW_RUN_STEP_OUT_OF_RANGE');
+    const scope = scopeOf(actor);
+    const claimToken = randomUUID();
+    const context = this.stepContext(actor, current, step);
+    const leaseExpiresAt = new Date(Date.now() + leaseMs).toISOString();
+    const result = await this.store.query<{ claim_token: string }>(
+      scope,
+      `INSERT INTO flow_step_claims (tenant_id, workspace_id, run_id, step_index, attempt, claim_token, dispatch_id, claimed_by, lease_expires_at, released_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
+       ON CONFLICT (tenant_id, workspace_id, run_id, step_index, attempt) DO UPDATE SET
+         claim_token = EXCLUDED.claim_token, dispatch_id = EXCLUDED.dispatch_id, claimed_by = EXCLUDED.claimed_by,
+         claimed_at = now(), lease_expires_at = EXCLUDED.lease_expires_at, released_at = NULL
+       WHERE flow_step_claims.released_at IS NOT NULL OR flow_step_claims.lease_expires_at < now()
+       RETURNING claim_token`,
+      [actor.tenantId, actor.workspaceId, runId, current.stepIndex, current.attempt, claimToken, context.dispatchId, actor.id, leaseExpiresAt],
+    );
+    if (result.rows[0]?.claim_token !== claimToken) throw new Error('FLOW_STEP_ALREADY_CLAIMED');
+    return { claimToken, leaseExpiresAt, context };
+  }
+
+  /**
+   * Advances a run's current step on behalf of a caller holding a live claim from claimStep. The
+   * claim is re-verified (token match, unexpired, unreleased) immediately before the step executes
+   * and again immediately before its outcome is persisted, then released once the outcome lands —
+   * a stale claimant (one whose lease expired and was reclaimed by someone else) is rejected at
+   * either check and can write nothing.
+   */
+  async advanceClaimedRun(actor: FlowActor, runId: string, claimToken: string): Promise<RunStatus> {
+    const current = await this.currentRun(actor, runId);
+    if (current.state !== 'running') throw new Error('FLOW_RUN_NOT_RUNNING');
+    const workflow = await this.requireWorkflow(actor, current.workflowId);
+    const step = workflow.steps[current.stepIndex];
+    if (!step) throw new Error('FLOW_RUN_STEP_OUT_OF_RANGE');
+    await this.requireLiveClaim(actor, runId, current.stepIndex, current.attempt, claimToken);
+    const context = this.stepContext(actor, current, step);
+    await this.executeStep(actor, current, workflow, step, context, async () => {
+      await this.requireLiveClaim(actor, runId, current.stepIndex, current.attempt, claimToken);
+    });
+    await this.releaseClaim(actor, runId, current.stepIndex, current.attempt);
+    return this.currentRun(actor, runId);
+  }
+
+  private stepContext(actor: FlowActor, current: RunStatus, step: WorkflowStep): StepContext {
+    return {
+      tenantId: actor.tenantId,
+      workspaceId: actor.workspaceId,
+      principalId: actor.id,
+      workflowId: current.workflowId,
+      runId: current.runId,
+      trigger: current.trigger,
+      stepId: step.id,
+      stepIndex: current.stepIndex,
+      attempt: current.attempt,
+      dispatchId: `${current.runId}:${current.stepIndex}:${current.attempt}`,
+    };
+  }
+
+  /**
+   * Shared step-execution core for both advanceRun and advanceClaimedRun: the approval gate,
+   * checkpoint-reuse-or-execute, and next-event decision are identical either way — only who may
+   * call it, and whether a claim is re-verified before the outcome is persisted, differs.
+   * `beforePersist` (claimed path only) re-checks claim liveness right before the checkpoint write.
+   */
+  private async executeStep(
+    actor: FlowActor,
+    current: RunStatus,
+    workflow: WorkflowDefinition,
+    step: WorkflowStep,
+    context: StepContext,
+    beforePersist?: () => Promise<void>,
+  ): Promise<void> {
+    const runId = current.runId;
     if (step.requiresApproval) {
       const approval = await this.findApproval(actor, runId, current.stepIndex, current.attempt);
       if (!approval) {
+        await beforePersist?.();
         await this.appendRunEvent(actor, current, { state: 'awaiting_approval', stepIndex: current.stepIndex, attempt: current.attempt, ended: false });
-        return this.currentRun(actor, runId);
+        return;
       }
       if (approval.decision === 'reject') {
+        await beforePersist?.();
         await this.appendRunEvent(actor, current, { state: 'dead_letter', stepIndex: current.stepIndex, attempt: current.attempt, ended: true, detail: { rejected: true } });
-        return this.currentRun(actor, runId);
+        return;
       }
     }
 
     let checkpoint = await this.findCheckpoint(actor, runId, current.stepIndex, current.attempt);
     if (!checkpoint) {
       try {
-        const output = await this.handlers.run(step.handler, step.input, { runId, stepId: step.id, attempt: current.attempt });
+        const output = await this.handlers.run(step.handler, step.input, context);
+        await beforePersist?.();
         checkpoint = await this.recordCheckpoint(actor, runId, current.stepIndex, step.id, current.attempt, 'succeeded', output, null);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        await beforePersist?.();
         checkpoint = await this.recordCheckpoint(actor, runId, current.stepIndex, step.id, current.attempt, 'failed', {}, message);
       }
+    } else {
+      await beforePersist?.();
     }
 
     if (checkpoint.status === 'succeeded') {
@@ -255,7 +369,28 @@ export class FlowRepository {
         await this.appendRunEvent(actor, current, { state: 'running', stepIndex: current.stepIndex, attempt: nextAttempt, ended: false });
       }
     }
-    return this.currentRun(actor, runId);
+  }
+
+  private async requireLiveClaim(actor: FlowActor, runId: string, stepIndex: number, attempt: number, claimToken: string): Promise<void> {
+    const scope = scopeOf(actor);
+    const result = await this.store.query<ClaimRow>(
+      scope,
+      'SELECT claim_token, dispatch_id, lease_expires_at, released_at FROM flow_step_claims WHERE run_id = $1 AND step_index = $2 AND attempt = $3',
+      [runId, stepIndex, attempt],
+    );
+    const claim = result.rows[0];
+    if (!claim || claim.claim_token !== claimToken || claim.released_at !== null || new Date(claim.lease_expires_at).getTime() < Date.now()) {
+      throw new Error('FLOW_CLAIM_INVALID_OR_EXPIRED');
+    }
+  }
+
+  private async releaseClaim(actor: FlowActor, runId: string, stepIndex: number, attempt: number): Promise<void> {
+    const scope = scopeOf(actor);
+    await this.store.query(
+      scope,
+      `UPDATE flow_step_claims SET released_at = now() WHERE run_id = $1 AND step_index = $2 AND attempt = $3 AND released_at IS NULL`,
+      [runId, stepIndex, attempt],
+    );
   }
 
   async cancelRun(actor: FlowActor, runId: string): Promise<RunStatus> {

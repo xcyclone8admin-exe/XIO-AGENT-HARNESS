@@ -293,6 +293,104 @@ describe('FLOW durable run execution', () => {
     const started = await flow.triggerRun(actorA, workflow.id, 'manual');
     await expect(flow.decideApproval(actorA, started.runId, 'approve', '')).rejects.toThrow('FLOW_RUN_NOT_AWAITING_APPROVAL');
   });
+
+  it('persists a host-supplied scheduledFor verbatim instead of inventing one from createdAt', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'scheduled', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const scheduledFor = '2026-03-01T09:00:00.000Z';
+    const started = await flow.triggerRun(actorA, workflow.id, 'schedule', { scheduledFor });
+    expect(started.detail).toMatchObject({ scheduledFor });
+    expect(started.detail.scheduledFor).not.toBe(started.createdAt);
+  });
+});
+
+describe('FLOW concurrent step claims', () => {
+  it('lets only one caller claim a given (run, step, attempt); the loser is rejected', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'claim-exclusive', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const winner = await flow.claimStep(actorA, started.runId);
+    expect(winner.context).toMatchObject({
+      tenantId: tenantA,
+      workspaceId: workspaceA,
+      principalId: actorIdA,
+      workflowId: workflow.id,
+      runId: started.runId,
+      trigger: 'manual',
+      stepId: 'only',
+      stepIndex: 0,
+      attempt: 0,
+      dispatchId: `${started.runId}:0:0`,
+    });
+    await expect(flow.claimStep(actorA, started.runId)).rejects.toThrow('FLOW_STEP_ALREADY_CLAIMED');
+  });
+
+  it('derives every context field server-side, never from the step\'s own input', async () => {
+    const workflow = await flow.createWorkflow(actorA, {
+      name: 'claim-context-integrity',
+      steps: [{ id: 'handoff', handler: 'noop', input: { workflowId: 'attacker-supplied', runId: 'attacker-supplied', dispatchId: 'attacker-supplied' } }],
+      maxAttempts: 3,
+      maxConcurrentRuns: 1,
+    });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const claim = await flow.claimStep(actorA, started.runId);
+    expect(claim.context.workflowId).toBe(workflow.id);
+    expect(claim.context.runId).toBe(started.runId);
+    expect(claim.context.dispatchId).toBe(`${started.runId}:0:0`);
+  });
+
+  it('completes the step and releases the claim through advanceClaimedRun', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'claim-advance', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const claim = await flow.claimStep(actorA, started.runId);
+    const completed = await flow.advanceClaimedRun(actorA, started.runId, claim.claimToken);
+    expect(completed.state).toBe('succeeded');
+    const released = await scoped.query<{ released_at: string | null }>(
+      { tenantId: tenantA, workspaceId: workspaceA },
+      'SELECT released_at FROM flow_step_claims WHERE run_id = $1 AND step_index = 0 AND attempt = 0',
+      [started.runId],
+    );
+    expect(released.rows[0]?.released_at).not.toBeNull();
+  });
+
+  it('refuses advanceClaimedRun with a wrong or already-released claim token', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'claim-wrong-token', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const claim = await flow.claimStep(actorA, started.runId);
+    await expect(flow.advanceClaimedRun(actorA, started.runId, '00000000-0000-0000-0000-000000000000')).rejects.toThrow('FLOW_CLAIM_INVALID_OR_EXPIRED');
+    await flow.advanceClaimedRun(actorA, started.runId, claim.claimToken);
+    // The run is now 'succeeded' (single-step workflow), so re-using the same token fails on run state first.
+    await expect(flow.advanceClaimedRun(actorA, started.runId, claim.claimToken)).rejects.toThrow('FLOW_RUN_NOT_RUNNING');
+  });
+
+  it('recovers an expired lease idempotently: a second claimant can take over, and the stale claimant cannot write', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'claim-lease-recovery', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const staleClaim = await flow.claimStep(actorA, started.runId, 1);
+    // Force the lease into the past instead of waiting out a real 1ms window.
+    await scoped.query(
+      { tenantId: tenantA, workspaceId: workspaceA },
+      `UPDATE flow_step_claims SET lease_expires_at = $1 WHERE run_id = $2 AND step_index = 0 AND attempt = 0`,
+      [new Date(Date.now() - 1000).toISOString(), started.runId],
+    );
+    const recoveredClaim = await flow.claimStep(actorA, started.runId);
+    expect(recoveredClaim.claimToken).not.toBe(staleClaim.claimToken);
+    await expect(flow.advanceClaimedRun(actorA, started.runId, staleClaim.claimToken)).rejects.toThrow('FLOW_CLAIM_INVALID_OR_EXPIRED');
+    const completed = await flow.advanceClaimedRun(actorA, started.runId, recoveredClaim.claimToken);
+    expect(completed.state).toBe('succeeded');
+    // Exactly one checkpoint was ever written for this (run, step, attempt) despite two claimants.
+    const checkpoints = await scoped.query(
+      { tenantId: tenantA, workspaceId: workspaceA },
+      'SELECT id FROM flow_checkpoints WHERE run_id = $1 AND step_index = 0 AND attempt = 0',
+      [started.runId],
+    );
+    expect(checkpoints.rows).toHaveLength(1);
+  });
+
+  it('refuses to claim a run that is not running', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'claim-not-running', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    await flow.cancelRun(actorA, started.runId);
+    await expect(flow.claimStep(actorA, started.runId)).rejects.toThrow('FLOW_RUN_NOT_RUNNING');
+  });
 });
 
 describe('FLOW missed-job policy', () => {

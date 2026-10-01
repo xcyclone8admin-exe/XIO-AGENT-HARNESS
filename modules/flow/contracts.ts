@@ -84,7 +84,12 @@ export const Checkpoint = z.object({
 });
 export type Checkpoint = z.infer<typeof Checkpoint>;
 
-export const TriggerRunRequest = z.object({ workflowId: UUID, trigger: RunTrigger.default('manual') });
+export const TriggerRunRequest = z.object({
+  workflowId: UUID,
+  trigger: RunTrigger.default('manual'),
+  /** Host-scheduler-supplied firing time for a 'schedule' trigger; persisted verbatim, never inferred. */
+  scheduledFor: z.iso.datetime({ offset: true }).optional(),
+});
 export const AdvanceRunRequest = z.object({ runId: UUID });
 export const CancelRunRequest = z.object({ runId: UUID });
 
