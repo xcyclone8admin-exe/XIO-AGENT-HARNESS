@@ -88,7 +88,8 @@ const DashboardSummary = z.object({
   systems_total: z.number().int(),
   agents_live: z.number().int(),
   agents_total: z.number().int(),
-  pending_approvals: z.number().int(),
+  /** null = unavailable; host runtime composes via core.approvals capability */
+  pending_approvals: z.number().int().nullable(),
   unread_alerts: z.number().int(),
 });
 

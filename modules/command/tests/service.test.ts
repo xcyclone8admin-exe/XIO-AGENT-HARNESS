@@ -44,7 +44,8 @@ describe('command service', () => {
     const summary = await service.dashboardSummary(workspace);
     expect(summary.greeting).toMatch(/morning|afternoon|evening|night/i);
     expect(summary.unread_alerts).toBe(0);
-    expect(summary.pending_approvals).toBe(0);
+    // pending_approvals is null (unavailable) until host runtime composes via core.approvals
+    expect(summary.pending_approvals).toBeNull();
   });
 
   test('chats, messages and alerts stay within their workspace', async () => {

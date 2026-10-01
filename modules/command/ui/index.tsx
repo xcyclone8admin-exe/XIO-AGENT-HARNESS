@@ -19,7 +19,7 @@ type DashboardSummary = {
   systems_total: number;
   agents_live: number;
   agents_total: number;
-  pending_approvals: number;
+  pending_approvals: number | null;
   unread_alerts: number;
 };
 
@@ -127,8 +127,8 @@ function Home({ workspaceId, api }: ModulePageProps) {
         <Panel>
           <Stat
             label="Pending approvals"
-            value={summary.loading ? '—' : String(s?.pending_approvals ?? 0)}
-            {...(s && s.pending_approvals > 0 ? { tone: 'caution' as const } : {})}
+            value={summary.loading ? '—' : s?.pending_approvals == null ? 'N/A' : String(s.pending_approvals)}
+            {...(s && s.pending_approvals != null && s.pending_approvals > 0 ? { tone: 'caution' as const } : {})}
           />
         </Panel>
         <Panel>
