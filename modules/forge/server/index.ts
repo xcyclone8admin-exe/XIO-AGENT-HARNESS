@@ -104,6 +104,7 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.saveSpecs, (input, call) => { const request = forgeCapabilities.saveSpecs.input.parse(input); return requireRepository(repository).saveSpecs(actor(call), request.projectId, request.documents); });
     bus.register(manifest, forgeCapabilities.compileSpecs, (input, call) => { const request = forgeCapabilities.compileSpecs.input.parse(input); const corpus = compileSpecCorpus(request); return requireRepository(repository).saveSpecs(actor(call), request.projectId, corpus.documents); });
     bus.register(manifest, forgeCapabilities.startCouncil, (input, call) => requireRepository(repository).startCouncil(actor(call), forgeCapabilities.startCouncil.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.assignCouncilReviewer, (input, call) => requireRepository(repository).assignCouncilReviewer(actor(call), forgeCapabilities.assignCouncilReviewer.input.parse(input)));
     bus.register(manifest, forgeCapabilities.councils, (_input, call) => requireRepository(repository).councils(actor(call)));
     bus.register(manifest, forgeCapabilities.submitCouncilDecision, (input, call) => requireRepository(repository).submitCouncilDecision(actor(call), forgeCapabilities.submitCouncilDecision.input.parse(input)));
     bus.register(manifest, forgeCapabilities.escalations, (_input, call) => requireRepository(repository).escalations(actor(call)));

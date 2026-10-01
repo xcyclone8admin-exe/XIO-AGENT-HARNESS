@@ -133,10 +133,19 @@ describe('Forge schema and workspace isolation', () => {
     expect(council?.status).toBe('open');
     const firstRole = council?.assignments[0]?.role;
     if (!council || !firstRole) throw new Error('test council assignment missing');
-    const partialCouncil = await forge.submitCouncilDecision(actorA, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] });
+    await expect(forge.submitCouncilDecision(actorA, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] })).rejects.toThrow('FORGE_COUNCIL_REVIEWER_ASSIGNMENT_REQUIRED');
+    await forge.assignCouncilReviewer(actorA, { councilId: council.id, role: firstRole, reviewerId: secondActor.id });
+    await expect(forge.assignCouncilReviewer(actorA, { councilId: council.id, role: council.assignments[1]!.role, reviewerId: secondActor.id })).rejects.toThrow('FORGE_COUNCIL_REVIEWER_MUST_BE_DISTINCT_PER_ROLE');
+    await expect(forge.submitCouncilDecision(actorA, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] })).rejects.toThrow('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+    const partialCouncil = await forge.submitCouncilDecision(secondActor, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] });
     expect(partialCouncil.status).toBe('in-review');
-    expect(partialCouncil.assignments.find((item) => item.role === firstRole)).toMatchObject({ status: 'submitted', evidenceSource: 'user-submitted', submittedBy: actor });
-    for (const assignment of partialCouncil.assignments.filter((item) => item.status === 'pending')) await forge.submitCouncilDecision(actorA, { councilId: council.id, role: assignment.role, decision: 'no-findings', findingId: null, evidenceIds: [] });
+    expect(partialCouncil.assignments.find((item) => item.role === firstRole)).toMatchObject({ status: 'submitted', reviewerId: secondActor.id, evidenceSource: 'user-submitted', submittedBy: secondActor.id });
+    let reviewerSequence = 24;
+    for (const assignment of partialCouncil.assignments.filter((item) => item.status === 'pending')) {
+      const reviewerId = `019a0000-0000-7000-8000-${String(reviewerSequence++).padStart(12, '0')}`;
+      await forge.assignCouncilReviewer(actorA, { councilId: council.id, role: assignment.role, reviewerId });
+      await forge.submitCouncilDecision({ id: reviewerId, tenantId: tenantA, workspaceId: workspaceA }, { councilId: council.id, role: assignment.role, decision: 'no-findings', findingId: null, evidenceIds: [] });
+    }
     expect((await forge.councils(actorA)).find((item) => item.id === council.id)?.status).toBe('complete');
     expect(await forge.councils({ id: actor, tenantId: tenantB, workspaceId: workspaceB })).toEqual([]);
     const plannerInput = { epicId: epic.id, approval: approvedRequest, config: { maxConcurrency: 1, maxBudgetUsd: 10, resourceLocks: [], substrateVerified: false, externalAdaptersEnabled: false }, tickets: await forge.nodes(actorA, project.id), spentUsd: 0, killSwitchEngaged: false };
