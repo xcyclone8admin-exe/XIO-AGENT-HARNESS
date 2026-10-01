@@ -1,11 +1,15 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { hashApprovalInput, hashApprovalScope, type Principal } from '@xyra/contracts';
+import { uuidv7 } from '@xyra/core';
+import { AgentRunner, ModelRouter, ProviderRegistry, type PreparedAgentRunResult, type PreparedReviewBinding } from '@xyra/agent-core';
 import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole, type Migration } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import manifest from '../manifest';
 import { GUARDED_PROFILE_FIELDS } from '../contracts';
 import { SwarmProfileService } from './profile-service';
+import { SwarmKillSwitchService, SwarmRunQueueService, type SwarmTrustedCallContext } from './runtime-service';
 
 type Db = Awaited<ReturnType<typeof openLocalStore>>;
 
@@ -20,6 +24,8 @@ const scopeB = { tenantId: tenantB, workspaceId: workspaceB };
 let db: Db;
 let scoped: LocalScopedStore;
 let profiles: SwarmProfileService;
+let queue: SwarmRunQueueService;
+let killSwitch: SwarmKillSwitchService;
 
 function load(owner: string, relativeDir: string): Migration[] {
   const dir = fileURLToPath(new URL(relativeDir, import.meta.url));
@@ -49,6 +55,8 @@ beforeAll(async () => {
   await db.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3),($4,$5,$6)', [workspaceA, tenantA, 'A', workspaceB, tenantB, 'B']);
   scoped = new LocalScopedStore(db);
   profiles = new SwarmProfileService(scoped);
+  queue = new SwarmRunQueueService(scoped, { maxPendingPerWorkspace: 20, maxQueuedPayloadBytes: 100_000, maxResultPayloadBytes: 200_000, maxRunDurationMs: 120_000 });
+  killSwitch = new SwarmKillSwitchService(scoped);
 }, 60_000);
 
 afterAll(async () => {
@@ -188,5 +196,187 @@ describe('append-only run records', () => {
     await outcome();
     await expect(outcome()).rejects.toThrow();
     await expect(scoped.query(scopeA, "UPDATE swarm_run_outcomes SET termination='FAILED' WHERE run_id=$1", [parent])).rejects.toThrow();
+  });
+});
+
+async function approvalFor(capabilityId: string, input: unknown, proofOverrides: Record<string, unknown> = {}) {
+  const proof = {
+    version: 1 as const,
+    approvalId: uuidv7(),
+    decisionId: uuidv7(),
+    tenantId: tenantA,
+    workspaceId: workspaceA,
+    principalId: actor,
+    requestedBy: actor,
+    approverId: '019a0000-0000-7000-8000-000000000022',
+    capabilityId,
+    inputDigest: await hashApprovalInput(input),
+    issuedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    ...proofOverrides,
+  };
+  const { scopeHash: _ignored, ...binding } = proof as typeof proof & { scopeHash?: string };
+  return { ...binding, scopeHash: await hashApprovalScope(binding) };
+}
+
+async function prepareApprovedRun(prompt: string, runId = uuidv7(), reviewBinding?: PreparedReviewBinding) {
+  const [profile] = await profiles.list(scopeA);
+  if (!profile) throw new Error('SWARM_TEST_PROFILE_REQUIRED');
+  const approvedInput = {
+    runId,
+    profileId: profile.id,
+    prompt,
+    ...(reviewBinding ? { review: { councilId: reviewBinding.councilId, assignmentId: reviewBinding.assignmentId, role: reviewBinding.role } } : {}),
+  };
+  const verifiedApproval = await approvalFor('swarm.runs.enqueue', approvedInput);
+  const principal: Principal = { kind: 'user', id: actor, tenantId: tenantA, workspaces: [{ id: workspaceA, role: 'owner', kind: 'standard' }], grants: [] };
+  const runner = new AgentRunner({ router: new ModelRouter(new ProviderRegistry()), capabilities: [], capabilityCaller: { call: async () => null } });
+  return runner.prepare({
+    runId, workspaceId: workspaceA, principal, verifiedApproval, approvedInput,
+    profile, prompt,
+    spawn: {
+      charter: profile.charter, stageProtocol: 'swarm-v1', contextManifest: {}, memoryScope: profile.memoryScope,
+      capabilityGrants: [], approvals: [], budgets: profile.budgets, outputContract: profile.outputSchema,
+      evidenceContract: { required: true, artifactTypes: ['review'] }, delegation: { depth: 0, maxDepth: 0 },
+    },
+    route: { preferred: { provider: profile.defaultProvider, model: profile.defaultModel }, fallbacks: [], requiredCapabilities: ['text'], qualityFloor: 'standard', privacyCeiling: 'local' },
+    ...(reviewBinding ? { reviewBinding } : {}),
+  });
+}
+
+function trustedContext(capabilityId: string, approval: Awaited<ReturnType<typeof approvalFor>> | null): SwarmTrustedCallContext {
+  const principal: Principal = { kind: 'user', id: actor, tenantId: tenantA, workspaces: [{ id: workspaceA, role: 'owner', kind: 'standard' }], grants: [] };
+  return { principal, actorId: actor, tenantId: tenantA, workspaceId: workspaceA, capabilityId, permission: capabilityId === 'swarm.runs.cancel' ? 'swarm:run:cancel' : 'swarm:kill-switch:manage', approval };
+}
+
+describe('durable SWARM admission and workspace kill switch', () => {
+  it('commits queue row and immutable event atomically, enforces approval digest and idempotency', async () => {
+    const prepared = await prepareApprovedRun('Review the exact commit and linked artifacts.');
+    const admitted = await queue.enqueue(prepared, 'run-admission-1');
+    expect(admitted).toMatchObject({ accepted: true, runId: prepared.input.runId, state: 'queued', reason: null });
+    await expect(queue.enqueue(prepared, 'run-admission-1')).resolves.toEqual(admitted);
+    const changed = await prepareApprovedRun('A different approved prompt.');
+    await expect(queue.enqueue(changed, 'run-admission-1')).rejects.toThrow('SWARM_QUEUE_IDEMPOTENCY_KEY_REUSED');
+
+    const rows = await scoped.query(scopeA, 'SELECT state,payload,approval_id FROM swarm_run_queue WHERE id=$1', [prepared.input.runId]);
+    expect(rows.rows[0]).toMatchObject({ state: 'queued', approval_id: prepared.authority.verifiedApproval?.approvalId });
+    expect(rows.rows[0]?.payload).toMatchObject({ prompt: 'Review the exact commit and linked artifacts.' });
+    const events = await scoped.query(scopeA, 'SELECT event_type,to_state FROM swarm_run_queue_events WHERE run_id=$1', [prepared.input.runId]);
+    expect(events.rows).toEqual([{ event_type: 'queued', to_state: 'queued' }]);
+
+    const approvedInput = prepared.authority.approvedInput;
+    if (!approvedInput) throw new Error('SWARM_TEST_APPROVED_INPUT_REQUIRED');
+    const badProof = await approvalFor('swarm.runs.enqueue', approvedInput, { inputDigest: '0'.repeat(64) });
+    const runner = new AgentRunner({ router: new ModelRouter(new ProviderRegistry()), capabilities: [], capabilityCaller: { call: async () => null } });
+    const forged = runner.prepare({ ...prepared.input, verifiedApproval: badProof, approvedInput });
+    await expect(queue.enqueue(forged, 'run-admission-forged')).rejects.toThrow('SWARM_APPROVAL_BINDING_INVALID');
+    await expect(queue.claimNext(scopeA, 'worker')).resolves.toEqual({ claimed: false, reason: 'execution_disabled_until_c1' });
+  });
+
+  it('persists the immutable council assignment and subject binding with the admitted run', async () => {
+    const binding: PreparedReviewBinding = {
+      councilId: uuidv7(), assignmentId: uuidv7(), targetId: uuidv7(), repositoryId: 'institutional-agent-os/repo',
+      reviewContractId: 'forge-council-review-v1', reviewContractSha256: 'e'.repeat(64),
+      role: 'ADVERSARY', reviewerPrincipalId: actor, subjectCommitSha: 'c'.repeat(40),
+      artifacts: [{ id: uuidv7(), sha256: 'd'.repeat(64) }],
+    };
+    const prepared = await prepareApprovedRun('Review only the bound immutable inputs.', uuidv7(), binding);
+    await expect(queue.enqueue(prepared, 'forge-review-run-1')).resolves.toMatchObject({ accepted: true, state: 'queued' });
+    const persisted = await scoped.query<{ payload: unknown } & Record<string, unknown>>(
+      scopeA, 'SELECT payload FROM swarm_run_queue WHERE id=$1', [prepared.input.runId]);
+    expect(persisted.rows[0]?.payload).toMatchObject({ reviewBinding: binding });
+  });
+
+  it('cancels queued runs and terminally recovers expired worker claims with fencing', async () => {
+    const prepared = await prepareApprovedRun('Cancel this queued run.');
+    await queue.enqueue(prepared, 'run-cancel-queued');
+    await expect(queue.cancel(trustedContext('swarm.runs.cancel', null), prepared.input.runId)).resolves.toEqual({ accepted: true });
+    await expect(queue.isCancellationRequested(scopeA, prepared.input.runId)).resolves.toBe(false);
+    await expect(queue.list(scopeA)).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ runId: prepared.input.runId, state: 'canceled', errorCode: 'CANCELED_BY_CALLER' })]));
+
+    const stranded = await prepareApprovedRun('A worker crashed while running this.');
+    await queue.enqueue(stranded, 'run-expired-claim');
+    const staleToken = uuidv7();
+    await db.query("UPDATE swarm_run_queue SET state='running',claim_token=$2,claimed_by='crashed-worker',claim_expires_at=now()-interval '1 second',started_at=now() WHERE id=$1", [stranded.input.runId, staleToken]);
+    await db.query('INSERT INTO swarm_runs(id,tenant_id,workspace_id,profile_id,parent_run_id,budgets,started_at,created_by) VALUES($1,$2,$3,$4,NULL,$5::jsonb,now(),$6)',
+      [stranded.input.runId, tenantA, workspaceA, stranded.input.profile.id, JSON.stringify(stranded.input.profile.budgets), actor]);
+    await db.query("INSERT INTO swarm_run_journal(id,tenant_id,workspace_id,run_id,seq,event_type,detail,occurred_at,created_by) VALUES($1,$2,$3,$4,0,'run.started','{}',now(),$5)",
+      [uuidv7(), tenantA, workspaceA, stranded.input.runId, actor]);
+    await expect(queue.recoverExpiredClaims(scopeA)).resolves.toBe(1);
+    const recovered = await scoped.query(scopeA, 'SELECT state,error_code,claim_token FROM swarm_run_queue WHERE id=$1', [stranded.input.runId]);
+    expect(recovered.rows[0]).toEqual({ state: 'failed', error_code: 'WORKER_LEASE_EXPIRED', claim_token: null });
+    await expect(db.query("UPDATE swarm_run_queue SET state='completed' WHERE id=$1 AND claim_token=$2", [stranded.input.runId, staleToken])).resolves.toMatchObject({ affectedRows: 0 });
+    const outcome = await scoped.query(scopeA, 'SELECT termination FROM swarm_run_outcomes WHERE run_id=$1', [stranded.input.runId]);
+    expect(outcome.rows).toEqual([{ termination: 'FAILED' }]);
+  });
+
+  it('runs only a prepared model review, journals the result, fences completion, and delivers to an idempotent sink', async () => {
+    const binding: PreparedReviewBinding = {
+      councilId: uuidv7(), assignmentId: uuidv7(), targetId: uuidv7(), repositoryId: 'institutional-agent-os/repo',
+      reviewContractId: 'forge-council-review-v1', reviewContractSha256: 'e'.repeat(64),
+      role: 'ADVERSARY', reviewerPrincipalId: actor, subjectCommitSha: 'f'.repeat(40),
+      artifacts: [{ id: uuidv7(), sha256: 'a'.repeat(64) }],
+    };
+    const prepared = await prepareApprovedRun('Inspect the supplied immutable review context.', uuidv7(), binding);
+    const registry = new ProviderRegistry();
+    let providerCalls = 0;
+    registry.registerProvider({ id: 'primary', complete: async (_request) => {
+      providerCalls += 1;
+      return providerCalls === 1
+        ? { output: '', toolCalls: [{ id: 'forbidden-write', capabilityId: 'forge.findings.create', input: {} }], usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.01 }, finishReason: 'tool_calls' }
+        : { output: 'Review output; Forge must validate before disposition.', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.01 }, finishReason: 'complete' };
+    } });
+    registry.registerModel({ id: 'fast', provider: 'primary', aliases: [], capabilities: ['text'], contextWindow: 1000, qualityTier: 'standard', latencyTier: 'fast', costTier: 'low', privacyTier: 'local', status: 'available' });
+    let capabilityCalls = 0;
+    const runner = new AgentRunner({ router: new ModelRouter(registry), capabilities: [], capabilityCaller: { call: async () => { capabilityCalls += 1; return null; } } });
+    let sinkCalls = 0;
+    const sink = { persist: async (result: PreparedAgentRunResult) => {
+      sinkCalls += 1;
+      expect(result.authority.reviewBinding).toEqual(binding);
+      expect(result.outputDigest).toMatch(/^[0-9a-f]{64}$/);
+      expect(result.artifactDigests).toEqual(expect.arrayContaining([{ id: `${result.runId}:output`, sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }]));
+      expect(result.result.events.some((event) => event.type === 'run.tool.denied')).toBe(true);
+      return { evidenceIds: [uuidv7()] };
+    } };
+
+    const execution = await queue.executePreparedReview(prepared, 'forge-review-execute-1', runner, 'review-worker-1', sink);
+    expect(execution).toMatchObject({ admission: { accepted: true, state: 'completed' }, result: { runId: prepared.input.runId, result: { termination: 'COMPLETED' } }, resultDelivery: { delivered: true } });
+    expect(providerCalls).toBe(2);
+    expect(capabilityCalls).toBe(0);
+    expect(sinkCalls).toBe(1);
+    const started = await scoped.query(scopeA, 'SELECT profile_id FROM swarm_runs WHERE id=$1', [prepared.input.runId]);
+    expect(started.rows).toHaveLength(1);
+    const journal = await scoped.query(scopeA, 'SELECT seq,event_type FROM swarm_run_journal WHERE run_id=$1 ORDER BY seq', [prepared.input.runId]);
+    expect(journal.rows[0]).toEqual({ seq: 0, event_type: 'run.started' });
+    expect(journal.rows.at(-1)?.event_type).toBe('run.terminated');
+    const outcome = await scoped.query(scopeA, 'SELECT termination,output FROM swarm_run_outcomes WHERE run_id=$1', [prepared.input.runId]);
+    expect(outcome.rows[0]).toMatchObject({ termination: 'COMPLETED', output: 'Review output; Forge must validate before disposition.' });
+    await expect(queue.deliverPendingReviewResult(scopeA, prepared.input.runId, sink)).resolves.toEqual({ delivered: true, evidenceIds: expect.any(Array) });
+    expect(sinkCalls).toBe(1);
+  });
+
+  it('persists kill-switch state/events, refuses pending runs, and rejects unauthorized mutation', async () => {
+    const prepared = await prepareApprovedRun('Queue this before engaging the switch.');
+    await expect(queue.enqueue(prepared, 'run-before-kill')).resolves.toMatchObject({ accepted: true, state: 'queued' });
+    await expect(killSwitch.getKillSwitch(scopeA)).resolves.toMatchObject({ engaged: false, reason: null, changedBy: actor, changedAt: expect.any(String) });
+
+    const input = { engaged: true, reason: 'Operator halt for review.' };
+    const approval = await approvalFor('swarm.kill-switch.set', input);
+    const context = trustedContext('swarm.kill-switch.set', approval);
+    await expect(killSwitch.setKillSwitch({ ...context, capabilityId: 'swarm.runs.cancel' }, true, input.reason)).rejects.toThrow('SWARM_TRUSTED_CAPABILITY_CONTEXT_REQUIRED');
+    await expect(killSwitch.setKillSwitch(context, true, input.reason)).resolves.toMatchObject({ engaged: true, reason: input.reason, changedBy: actor });
+    await expect(queue.enqueue(await prepareApprovedRun('This must be refused.'), 'run-during-kill')).resolves.toMatchObject({ accepted: false, reason: 'kill_switch_engaged' });
+    await expect(queue.list(scopeA)).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ runId: prepared.input.runId, state: 'refused', errorCode: 'KILL_SWITCH_ENGAGED' })]));
+    const events = await scoped.query(scopeA, 'SELECT event_type,from_state,to_state FROM swarm_run_queue_events WHERE run_id=$1 ORDER BY created_at,id', [prepared.input.runId]);
+    expect(events.rows).toEqual([{ event_type: 'queued', from_state: null, to_state: 'queued' }, { event_type: 'refused', from_state: 'queued', to_state: 'refused' }]);
+    const killEvents = await scoped.query(scopeA, 'SELECT engaged,reason,changed_by FROM swarm_kill_switch_events WHERE workspace_id=$1', [workspaceA]);
+    expect(killEvents.rows).toEqual([{ engaged: true, reason: input.reason, changed_by: actor }]);
+    await expect(db.query("UPDATE swarm_kill_switch_events SET reason='tampered' WHERE workspace_id=$1", [workspaceA])).rejects.toThrow(/append-only/);
+  });
+
+  it('requires an approval proof whose digest matches the exact kill-switch request', async () => {
+    const input = { engaged: false, reason: null };
+    const wrongApproval = await approvalFor('swarm.kill-switch.set', { engaged: true, reason: 'different request' });
+    await expect(killSwitch.setKillSwitch(trustedContext('swarm.kill-switch.set', wrongApproval), false, input.reason)).rejects.toThrow('SWARM_APPROVAL_BINDING_INVALID');
   });
 });

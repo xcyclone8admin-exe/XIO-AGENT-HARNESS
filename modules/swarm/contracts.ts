@@ -1,4 +1,4 @@
-import { AgentProfile, NightShiftLeash, RunBudget, type AgentRunResult } from '@xyra/agent-core';
+import { AgentProfile, AgentRunAdmissionRequest, NightShiftLeash, RunBudget, type AgentRunResult } from '@xyra/agent-core';
 import { defineCapability } from '@xyra/contracts';
 import { z } from 'zod';
 
@@ -13,6 +13,18 @@ const AgentRunSummary = z.object({
     failures: z.number().int().nonnegative(),
     costUsd: z.number().nonnegative(),
   }),
+});
+const KillSwitchState = z.object({
+  engaged: z.boolean(),
+  reason: z.string().nullable(),
+  changedBy: z.uuid().nullable(),
+  changedAt: z.iso.datetime({ offset: true }).nullable(),
+});
+const QueueAdmission = z.object({
+  accepted: z.boolean(),
+  runId: z.uuid().nullable(),
+  state: z.enum(['queued', 'claimed', 'running', 'completed', 'failed', 'canceled', 'refused']).nullable(),
+  reason: z.string().nullable(),
 });
 
 /**
@@ -73,6 +85,16 @@ export const swarmCapabilities = {
     input: Empty,
     output: z.array(AgentRunSummary),
   }),
+  enqueueRun: defineCapability({
+    id: 'swarm.runs.enqueue',
+    title: 'Queue an approved bounded agent run',
+    description: 'Durably admit a host-prepared run after trusted profile, route and approval resolution',
+    kind: 'consequential',
+    permission: 'swarm:run:write',
+    approvalPolicy: 'swarm.runs.enqueue',
+    input: AgentRunAdmissionRequest,
+    output: QueueAdmission,
+  }),
   cancelRun: defineCapability({
     id: 'swarm.runs.cancel',
     title: 'Cancel agent run',
@@ -100,6 +122,25 @@ export const swarmCapabilities = {
     permission: 'swarm:run:write',
     input: z.object({ runId: z.uuid(), budget: RunBudget }),
     output: z.object({ accepted: z.boolean() }),
+  }),
+  killSwitch: defineCapability({
+    id: 'swarm.kill-switch.read',
+    title: 'Read workspace agent kill switch',
+    description: 'Read the server-owned kill-switch state for this workspace',
+    kind: 'read',
+    permission: 'swarm:kill-switch:read',
+    input: Empty,
+    output: KillSwitchState,
+  }),
+  setKillSwitch: defineCapability({
+    id: 'swarm.kill-switch.set',
+    title: 'Set workspace agent kill switch',
+    description: 'Engage or release the durable workspace-wide agent kill switch',
+    kind: 'consequential',
+    permission: 'swarm:kill-switch:manage',
+    approvalPolicy: 'swarm.kill-switch.set',
+    input: z.strictObject({ engaged: z.boolean(), reason: z.string().trim().max(500).nullable() }),
+    output: KillSwitchState,
   }),
 } as const;
 
