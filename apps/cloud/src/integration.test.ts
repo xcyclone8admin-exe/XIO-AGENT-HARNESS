@@ -407,9 +407,10 @@ describe('auth on the real Worker', () => {
       const result = await call('POST', route, null, {});
       expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
     }
-    expect(
-      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(70_000) }),
-    ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
+    // workerd may reject this payload before Worker code runs; bounded-json.test.ts
+    // asserts the application error code independently of transport limits.
+    expect(await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(70_000) }).then((r) => r.status))
+      .toBe(413);
   });
   it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
     await seed(U1, { role: 'owner' });
@@ -1395,6 +1396,8 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     }
     expect(expiredLeases, 'lease did not expire within the 8 second poll deadline').toBeGreaterThanOrEqual(1);
     const next = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
+    expect(next.status, `lease reacquire response: ${JSON.stringify(next)}`).toBe(200);
+    expect(next.json?.['lease'], `lease missing from successful reacquire: ${JSON.stringify(next)}`).toBeTruthy();
     expect(next.json?.['lease'].fence).toBeGreaterThan(first.json?.['lease'].fence);
   }, 20_000);
 });

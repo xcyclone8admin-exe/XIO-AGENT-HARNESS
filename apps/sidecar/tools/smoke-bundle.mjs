@@ -10,6 +10,7 @@ const port = reservation.address().port;
 await new Promise((resolve) => reservation.close(resolve));
 
 const token = randomBytes(32).toString('base64url');
+const nativeSyncToken = randomBytes(32).toString('base64url');
 const child = spawn(process.execPath, [fileURLToPath(new URL('../dist/main.mjs', import.meta.url))], {
   env: {
     ...process.env,
@@ -17,12 +18,16 @@ const child = spawn(process.execPath, [fileURLToPath(new URL('../dist/main.mjs',
     XYRA_DATA_DIR: 'memory://',
     XYRA_OS_SUBJECT: 'smoke:local',
     XYRA_DISPLAY_NAME: 'Smoke test',
-    XYRA_LAUNCH_TOKEN: token,
     XYRA_ALLOWED_ORIGINS: 'http://tauri.localhost',
   },
-  stdio: ['ignore', 'pipe', 'pipe'],
+  stdio: ['pipe', 'pipe', 'pipe'],
   windowsHide: true,
 });
+child.stdin.end(`${JSON.stringify({
+  protocolVersion: 'xyra-native-bootstrap-v1',
+  launchToken: token,
+  nativeSyncToken,
+})}\n`);
 let stderr = '';
 child.stderr.setEncoding('utf8').on('data', (chunk) => {
   stderr += chunk;

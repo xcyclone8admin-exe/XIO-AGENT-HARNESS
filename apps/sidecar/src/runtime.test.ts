@@ -48,6 +48,28 @@ test('local runtime serves an authenticated, scoped workspace session', async ()
     expect(created.status, JSON.stringify(await created.clone().json())).toBe(200);
     const createdBody = await created.json() as { data: { id: string; name: string } };
     expect(createdBody.data.name).toBe('Runtime Forge');
+
+    const moduleCalls = [
+      ['command.dashboard.summary', {}],
+      ['comms.threads.list', {}],
+      ['growth.contacts.list', {}],
+    ] as const;
+    const results = await Promise.all(moduleCalls.map(([capabilityId, input]) =>
+      fetch(`http://127.0.0.1:${port}/api/v1/call/${capabilityId}`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${session.launchToken}`,
+          origin: 'http://tauri.localhost',
+          'content-type': 'application/json',
+          'idempotency-key': `runtime-${capabilityId.replaceAll('.', '-')}`,
+        },
+        body: JSON.stringify({ workspaceId, input }),
+      }),
+    ));
+    expect(results.map((result) => result.status), 'BIZ module registrars must be callable in the integrated runtime')
+      .toEqual([200, 200, 200]);
+    const dashboard = await results[0]!.json() as { data: { pending_approvals: number | null } };
+    expect(dashboard.data.pending_approvals).toBeNull();
   } finally {
     await session.close();
   }

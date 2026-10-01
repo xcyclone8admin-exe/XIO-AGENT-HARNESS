@@ -7,6 +7,12 @@ import { bootstrapLocalIdentity, CoreService } from '@xyra/mod-core/server';
 import { MoneyService } from '@xyra/mod-money/server';
 import { OpsService } from '@xyra/mod-ops/server';
 import { BrainService } from '@xyra/mod-brain/server';
+import makeCommandServer from '@xyra/mod-command/server';
+import commandManifest from '@xyra/mod-command/manifest';
+import makeCommsServer from '@xyra/mod-comms/server';
+import commsManifest from '@xyra/mod-comms/manifest';
+import makeGrowthServer from '@xyra/mod-growth/server';
+import growthManifest from '@xyra/mod-growth/manifest';
 import { createForgeServer, ForgeRepository, type ForgeBus } from '@xyra/mod-forge/server';
 import forgeManifest from '@xyra/mod-forge/manifest';
 import { MIGRATIONS } from './generated/migrations';
@@ -64,6 +70,9 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       async () => new Set(),
     );
     registerFoundationCapabilities(bus, new CoreService(scoped), new OpsService(scoped));
+    makeCommandServer(scoped).register(bus, commandManifest);
+    makeCommsServer(scoped).register(bus, commsManifest);
+    makeGrowthServer(scoped).register(bus, growthManifest);
     new MoneyService(new PGliteLedgerWriter(db)).register(bus);
     const brain = new BrainService(scoped);
     registerBrainCapabilities(bus, brain);
