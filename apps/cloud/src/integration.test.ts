@@ -408,7 +408,7 @@ describe('auth on the real Worker', () => {
       expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
     }
     expect(
-      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(300_000) }),
+      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(70_000) }),
     ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
   });
   it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
