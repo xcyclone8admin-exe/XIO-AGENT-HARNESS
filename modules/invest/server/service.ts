@@ -6,6 +6,8 @@ import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/l
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
 import { allocateFifoTaxLots } from './tax-lots';
+import { runMomentumStopTargetBacktest, type OhlcBar, type MomentumStopTargetStrategy } from './backtest';
+import { calculateTimeWeightedStatement, type PerformanceMark, type PerformanceStatement } from './performance';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
 
@@ -47,6 +49,12 @@ export class InvestService {
     reg(investCapabilities.createInstrument, (input, call) => this.createInstrument(this.scope(call), this.actor(call), input as { symbol: string; assetClass: 'equity'|'crypto'|'fixed_income'|'fund'; quantityScale: number; exchangeCode: string|null }));
     reg(investCapabilities.recordPrice, (input, call) => this.recordPrice(this.scope(call), this.actor(call), input as { instrumentId: string; priceUnits: string; source: string; sourceAt: string; volatilityBps: number; payloadHash: string }));
     reg(investCapabilities.recordMarketSession, (input, call) => this.recordMarketSession(this.scope(call), input as { exchangeCode: string; sessionDate: string; opensAt: string; closesAt: string; isOpen: boolean; source: string }));
+    reg(investCapabilities.runBacktest, (input, call) => this.runBacktest(this.scope(call), this.actor(call), input as {instrumentId:string;dataVersion:number;sourceName:string;sourceRef:string;bars:OhlcBar[];strategy:MomentumStopTargetStrategy}));
+    reg(investCapabilities.backtestRuns, (input, call) => this.backtestRuns(this.scope(call),input as {instrumentId:string}));
+    reg(investCapabilities.performanceMarks, (input, call) => this.performanceMarks(this.scope(call),input as {portfolioId:string}));
+    reg(investCapabilities.capturePerformanceMark, (input, call) => this.capturePerformanceMark(this.scope(call),call,input as {portfolioId:string;benchmarkIndexUnits:string;benchmarkSource:string;benchmarkRef:string}));
+    reg(investCapabilities.createPerformanceStatement, (input, call) => this.createPerformanceStatement(this.scope(call),call,input as {portfolioId:string;fromMarkId:string;toMarkId:string}));
+    reg(investCapabilities.performanceStatements, (input, call) => this.performanceStatements(this.scope(call),input as {portfolioId:string}));
     reg(investCapabilities.createMandate, (input, call) => this.createMandate(this.scope(call), this.actor(call), input as MandateDraftInput));
     reg(investCapabilities.icQueue, (_input, call) => this.icQueue(this.scope(call)));
     reg(investCapabilities.voteMemo, (input, call) => this.voteMemo(this.scope(call), call, input as { memoId: string; vote: 'approve'|'reject'|'recuse'; reason: string }));
@@ -324,6 +332,129 @@ export class InvestService {
     if (!result.rows[0]) throw new Error('Market session insert failed'); return result.rows[0];
   }
 
+  async runBacktest(scope: InvestScope, actorId: string, input: {instrumentId:string;dataVersion:number;sourceName:string;sourceRef:string;bars:OhlcBar[];strategy:MomentumStopTargetStrategy}): Promise<{
+    runId:string;engineVersion:'momentum-next-bar-v1';dataVersion:number;strategyId:string;strategyVersion:number;dataHash:string;strategyHash:string;
+    trades:Array<{entryBar:number;exitBar:number;entryPriceUnits:string;exitPriceUnits:string;quantityUnits:string;grossPnlUnits:string;feesUnits:string;netPnlUnits:string;exitReason:'stop'|'target'|'end_of_data'}>;totalFeesUnits:string;netPnlUnits:string;
+  }> {
+    const instrument = await this.scoped.query<{quantity_scale:number}>(scope,`SELECT quantity_scale FROM invest_instruments WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,[scope.tenantId,scope.workspaceId,input.instrumentId]);
+    const row = instrument.rows[0]; if (!row) throw new Error('Backtest instrument is outside the authenticated workspace or does not exist');
+    const result = runMomentumStopTargetBacktest(input.bars,input.strategy,row.quantity_scale);
+    const resultHash = createHash('sha256').update(JSON.stringify(result)).digest('hex');
+    const stored = await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,async (tx) => {
+      const datasetInsert = await tx.query<{id:string}>(`INSERT INTO invest_backtest_datasets(id,tenant_id,workspace_id,instrument_id,data_version,source_name,source_ref,bars,data_hash,created_by)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) ON CONFLICT(tenant_id,workspace_id,instrument_id,data_version) DO NOTHING RETURNING id`,
+        [uuidv7(),scope.tenantId,scope.workspaceId,input.instrumentId,input.dataVersion,input.sourceName,input.sourceRef,JSON.stringify(input.bars),result.dataHash,actorId]);
+      let datasetId=datasetInsert.rows[0]?.id;
+      if (!datasetId) {
+        const dataset = (await tx.query<{id:string;data_hash:string;source_name:string;source_ref:string}>(`SELECT id,data_hash,source_name,source_ref FROM invest_backtest_datasets WHERE tenant_id=$1 AND workspace_id=$2 AND instrument_id=$3 AND data_version=$4`,
+          [scope.tenantId,scope.workspaceId,input.instrumentId,input.dataVersion])).rows[0];
+        if (!dataset || dataset.data_hash !== result.dataHash || dataset.source_name !== input.sourceName || dataset.source_ref !== input.sourceRef) throw new Error('Backtest data version already exists with different content or provenance');
+        datasetId=dataset.id;
+      }
+      const strategyConfig = {...input.strategy,quantityScale:row.quantity_scale};
+      const strategyInsert = await tx.query<{id:string}>(`INSERT INTO invest_backtest_strategies(id,tenant_id,workspace_id,strategy_key,strategy_version,config,strategy_hash,created_by)
+        VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8) ON CONFLICT(tenant_id,workspace_id,strategy_key,strategy_version) DO NOTHING RETURNING id`,
+        [uuidv7(),scope.tenantId,scope.workspaceId,input.strategy.id,input.strategy.version,JSON.stringify(strategyConfig),result.strategyHash,actorId]);
+      let strategyId=strategyInsert.rows[0]?.id;
+      if (!strategyId) {
+        const strategy = (await tx.query<{id:string;strategy_hash:string}>(`SELECT id,strategy_hash FROM invest_backtest_strategies WHERE tenant_id=$1 AND workspace_id=$2 AND strategy_key=$3 AND strategy_version=$4`,
+          [scope.tenantId,scope.workspaceId,input.strategy.id,input.strategy.version])).rows[0];
+        if (!strategy || strategy.strategy_hash !== result.strategyHash) throw new Error('Backtest strategy version already exists with different configuration');
+        strategyId=strategy.id;
+      }
+      const prior = await tx.query<{id:string;result:typeof result}>(`SELECT id,result FROM invest_backtest_runs WHERE tenant_id=$1 AND workspace_id=$2 AND dataset_id=$3 AND strategy_id=$4`,
+        [scope.tenantId,scope.workspaceId,datasetId,strategyId]);
+      if (prior.rows[0]) return {runId:prior.rows[0].id,...prior.rows[0].result};
+      const runId = uuidv7();
+      await tx.query(`INSERT INTO invest_backtest_runs(id,tenant_id,workspace_id,dataset_id,strategy_id,engine_version,result,result_hash,total_fees_units,net_pnl_units,created_by)
+        VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11)`,[runId,scope.tenantId,scope.workspaceId,datasetId,strategyId,result.engineVersion,JSON.stringify(result),resultHash,result.totalFeesUnits,result.netPnlUnits,actorId]);
+      return {runId,...result};
+    });
+    return {runId:stored.runId,engineVersion:stored.engineVersion,dataVersion:input.dataVersion,strategyId:input.strategy.id,strategyVersion:input.strategy.version,
+      dataHash:stored.dataHash,strategyHash:stored.strategyHash,trades:stored.trades,totalFeesUnits:stored.totalFeesUnits,netPnlUnits:stored.netPnlUnits};
+  }
+
+  async backtestRuns(scope:InvestScope,input:{instrumentId:string}):Promise<Array<{id:string;data_version:number;source_name:string;source_ref:string;data_hash:string;strategy_key:string;strategy_version:number;strategy_hash:string;engine_version:string;total_fees_units:string;net_pnl_units:string;created_at:string}>> {
+    return (await this.scoped.query<{id:string;data_version:number;source_name:string;source_ref:string;data_hash:string;strategy_key:string;strategy_version:number;strategy_hash:string;engine_version:string;total_fees_units:string;net_pnl_units:string;created_at:string}>(scope,`SELECT r.id,d.data_version,d.source_name,d.source_ref,d.data_hash,s.strategy_key,s.strategy_version,s.strategy_hash,r.engine_version,
+        r.total_fees_units::text,r.net_pnl_units::text,r.created_at::text
+      FROM invest_backtest_runs r JOIN invest_backtest_datasets d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.id=r.dataset_id
+      JOIN invest_backtest_strategies s ON s.tenant_id=r.tenant_id AND s.workspace_id=r.workspace_id AND s.id=r.strategy_id
+      WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND d.instrument_id=$3 ORDER BY r.created_at DESC LIMIT 100`,[scope.tenantId,scope.workspaceId,input.instrumentId])).rows;
+  }
+
+  async performanceMarks(scope:InvestScope,input:{portfolioId:string}):Promise<Array<{id:string;portfolio_id:string;captured_at:string;nav_units:string;cash_units:string;benchmark_index_units:string;benchmark_source:string;benchmark_ref:string;external_flow_units:string;cumulative_fee_units:string}>> {
+    return (await this.scoped.query<{id:string;portfolio_id:string;captured_at:string;nav_units:string;cash_units:string;benchmark_index_units:string;benchmark_source:string;benchmark_ref:string;external_flow_units:string;cumulative_fee_units:string}>(scope,
+      `SELECT id,portfolio_id,captured_at::text,nav_units::text,cash_units::text,benchmark_index_units::text,benchmark_source,benchmark_ref,external_flow_units::text,cumulative_fee_units::text
+       FROM invest_performance_marks WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 ORDER BY captured_at,id LIMIT 10000`,[scope.tenantId,scope.workspaceId,input.portfolioId])).rows;
+  }
+
+  async capturePerformanceMark(scope:InvestScope,call:Call,input:{portfolioId:string;benchmarkIndexUnits:string;benchmarkSource:string;benchmarkRef:string}):Promise<{id:string;portfolio_id:string;captured_at:string;nav_units:string;cash_units:string;benchmark_index_units:string;benchmark_source:string;benchmark_ref:string;external_flow_units:string;cumulative_fee_units:string}> {
+    const actorId=this.requireHumanOwner(scope,call);
+    return this.paperLedger.withPaperTradeTransaction(scope,async (tx)=>{
+      const portfolio=(await tx.query<{book_id:string;base_asset:string}>(`SELECT book_id,base_asset FROM invest_portfolios WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status='active'`,
+        [scope.tenantId,scope.workspaceId,input.portfolioId])).rows[0];
+      if(!portfolio) throw new Error('Active PAPER portfolio not found');
+      const cash=(await tx.query<{units:string}>(`SELECT COALESCE(b.units,0)::text AS units FROM ledger_accounts a LEFT JOIN ledger_balances b
+        ON b.tenant_id=a.tenant_id AND b.workspace_id=a.workspace_id AND b.book_id=a.book_id AND b.account_id=a.id AND b.asset=$4
+        WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.book_id=$3 AND a.code='cash'`,[scope.tenantId,scope.workspaceId,portfolio.book_id,portfolio.base_asset])).rows[0];
+      if(!cash) throw new Error('PAPER cash account is missing');
+      const holdings=(await tx.query<{instrument_id:string;quantity_units:string;quantity_scale:number;price_units:string|null}>(`SELECT i.id AS instrument_id,COALESCE(b.units,0)::text AS quantity_units,i.quantity_scale,q.price_units::text
+        FROM invest_instruments i JOIN ledger_accounts a ON a.tenant_id=i.tenant_id AND a.workspace_id=i.workspace_id AND a.book_id=$3 AND a.code='position:'||i.id::text
+        LEFT JOIN ledger_balances b ON b.tenant_id=a.tenant_id AND b.workspace_id=a.workspace_id AND b.book_id=a.book_id AND b.account_id=a.id AND b.asset=i.asset_code
+        LEFT JOIN LATERAL(SELECT price_units FROM invest_market_prices WHERE tenant_id=i.tenant_id AND workspace_id=i.workspace_id AND instrument_id=i.id ORDER BY received_at DESC LIMIT 1) q ON true
+        WHERE i.tenant_id=$1 AND i.workspace_id=$2 AND i.active=true`,[scope.tenantId,scope.workspaceId,portfolio.book_id])).rows;
+      let nav=BigInt(cash.units);
+      for(const holding of holdings){const qty=BigInt(holding.quantity_units);if(qty<0n)throw new Error('Negative PAPER ledger position detected');if(qty===0n)continue;
+        if(!holding.price_units)throw new Error(`Missing quote for performance valuation instrument ${holding.instrument_id}`);
+        nav+=notionalUnits(qty.toString(),holding.price_units,holding.quantity_scale);}
+      if(nav<=0n)throw new Error('PAPER portfolio NAV must be positive to capture a performance mark');
+      const capturedAt=(await tx.query<{captured_at:string}>(`SELECT now()::text AS captured_at`)).rows[0]!.captured_at;
+      const prior=(await tx.query<{captured_at:string;cumulative_fee_units:string}>(`SELECT captured_at::text,cumulative_fee_units::text FROM invest_performance_marks
+        WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 ORDER BY captured_at DESC,id DESC LIMIT 1`,[scope.tenantId,scope.workspaceId,input.portfolioId])).rows[0];
+      let externalFlow='0';
+      if(prior){const capital=(await tx.query<{id:string}>(`SELECT id FROM ledger_accounts WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$3 AND code='capital'`,[scope.tenantId,scope.workspaceId,portfolio.book_id])).rows[0];
+        if(capital)externalFlow=(await tx.query<{units:string}>(`SELECT (-COALESCE(sum(e.units),0))::text AS units FROM ledger_entries e JOIN ledger_transactions t
+          ON t.tenant_id=e.tenant_id AND t.workspace_id=e.workspace_id AND t.id=e.transaction_id
+          WHERE e.tenant_id=$1 AND e.workspace_id=$2 AND e.book_id=$3 AND e.account_id=$4 AND e.asset=$5 AND t.environment='paper' AND t.posted_at>$6 AND t.posted_at<=$7`,
+          [scope.tenantId,scope.workspaceId,portfolio.book_id,capital.id,portfolio.base_asset,prior.captured_at,capturedAt])).rows[0]?.units??'0';}
+      const fees=(await tx.query<{units:string}>(`SELECT COALESCE(sum(f.fee_units),0)::text AS units FROM invest_fills f JOIN invest_orders o
+        ON o.tenant_id=f.tenant_id AND o.workspace_id=f.workspace_id AND o.id=f.order_id WHERE f.tenant_id=$1 AND f.workspace_id=$2 AND o.portfolio_id=$3 AND f.created_at<=$4`,
+        [scope.tenantId,scope.workspaceId,input.portfolioId,capturedAt])).rows[0]?.units??'0';
+      const id=uuidv7();
+      const saved=await tx.query<{id:string;portfolio_id:string;captured_at:string;nav_units:string;cash_units:string;benchmark_index_units:string;benchmark_source:string;benchmark_ref:string;external_flow_units:string;cumulative_fee_units:string}>(
+        `INSERT INTO invest_performance_marks(id,tenant_id,workspace_id,portfolio_id,captured_at,nav_units,cash_units,benchmark_index_units,benchmark_source,benchmark_ref,external_flow_units,cumulative_fee_units,created_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id,portfolio_id,captured_at::text,nav_units::text,cash_units::text,benchmark_index_units::text,benchmark_source,benchmark_ref,external_flow_units::text,cumulative_fee_units::text`,
+        [id,scope.tenantId,scope.workspaceId,input.portfolioId,capturedAt,nav.toString(),cash.units,input.benchmarkIndexUnits,input.benchmarkSource,input.benchmarkRef,externalFlow,fees,actorId]);
+      if(!saved.rows[0])throw new Error('Performance mark was not recorded');return saved.rows[0];
+    });
+  }
+
+  async createPerformanceStatement(scope:InvestScope,call:Call,input:{portfolioId:string;fromMarkId:string;toMarkId:string}):Promise<{id:string;portfolio_id:string;created_at:string;report:PerformanceStatement}> {
+    const actorId=this.requireHumanOwner(scope,call);
+    const marks=(await this.scoped.query<PerformanceMark>(scope,`SELECT id,captured_at::text AS "capturedAt",nav_units::text AS "navUnits",benchmark_index_units::text AS "benchmarkIndexUnits",
+        external_flow_units::text AS "externalFlowUnits",cumulative_fee_units::text AS "cumulativeFeeUnits" FROM invest_performance_marks
+      WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND captured_at BETWEEN
+        (SELECT captured_at FROM invest_performance_marks WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND id=$4) AND
+        (SELECT captured_at FROM invest_performance_marks WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND id=$5)
+      ORDER BY captured_at,id`,[scope.tenantId,scope.workspaceId,input.portfolioId,input.fromMarkId,input.toMarkId])).rows;
+    if(marks.length<2||marks[0]?.id!==input.fromMarkId||marks[marks.length-1]?.id!==input.toMarkId)throw new Error('Statement marks must be ordered marks from the same portfolio');
+    const report=calculateTimeWeightedStatement(marks);const hash=createHash('sha256').update(JSON.stringify(report)).digest('hex');
+    return this.scoped.withServerScope(scope,'invest_paper',scope.hlc,async(tx)=>{
+      const prior=(await tx.query<{id:string;created_at:string;result:PerformanceStatement}>(`SELECT id,created_at::text,result FROM invest_performance_reports
+        WHERE tenant_id=$1 AND workspace_id=$2 AND from_mark_id=$3 AND to_mark_id=$4`,[scope.tenantId,scope.workspaceId,input.fromMarkId,input.toMarkId])).rows[0];
+      if(prior)return{id:prior.id,portfolio_id:input.portfolioId,created_at:prior.created_at,report:prior.result};
+      const saved=(await tx.query<{id:string;created_at:string;result:PerformanceStatement}>(`INSERT INTO invest_performance_reports(id,tenant_id,workspace_id,portfolio_id,from_mark_id,to_mark_id,calculation_version,result,result_hash,created_by)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) RETURNING id,created_at::text,result`,
+        [uuidv7(),scope.tenantId,scope.workspaceId,input.portfolioId,input.fromMarkId,input.toMarkId,report.calculationVersion,JSON.stringify(report),hash,actorId])).rows[0];
+      if(!saved)throw new Error('Performance statement was not stored');return{id:saved.id,portfolio_id:input.portfolioId,created_at:saved.created_at,report:saved.result};
+    });
+  }
+
+  async performanceStatements(scope:InvestScope,input:{portfolioId:string}):Promise<Array<{id:string;portfolio_id:string;created_at:string;report:PerformanceStatement}>> {
+    return (await this.scoped.query<{id:string;portfolio_id:string;created_at:string;report:PerformanceStatement}>(scope,`SELECT id,portfolio_id,created_at::text,result AS report FROM invest_performance_reports
+      WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 ORDER BY created_at DESC LIMIT 100`,[scope.tenantId,scope.workspaceId,input.portfolioId])).rows;
+  }
+
   async createMandate(scope: InvestScope, actorId: string, input: MandateDraftInput): Promise<{id:string;version:number;status:'in_review'}> {
     const limits = GuardrailLimits.parse(input.limits);
     if (input.effectiveUntil && Date.parse(input.effectiveUntil) <= Date.parse(input.effectiveFrom)) throw new Error('Mandate expiry must follow its effective date');
@@ -378,8 +509,8 @@ export class InvestService {
   async activateMandate(scope: InvestScope, call: Call, input: {memoId:string}): Promise<{id:string;version:number;status:'approved';expiresAt:string}> {
     const approverId = this.requireHumanOwner(scope, call);
     return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
-      const memo = await tx.query<{portfolio_id:string;version:number;risk_review:Record<string,unknown>;status:string}>(
-        `SELECT portfolio_id,version,risk_review,status FROM invest_ic_memos WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
+      const memo = await tx.query<{portfolio_id:string;version:number;title:string;created_by:string;risk_review:Record<string,unknown>;status:string}>(
+        `SELECT portfolio_id,version,title,created_by,risk_review,status FROM invest_ic_memos WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
         [scope.tenantId, scope.workspaceId, input.memoId]);
       const row = memo.rows[0]; if (!row || row.status !== 'in_review') throw new Error('IC memo is not approvable');
       const votes = await tx.query<{approvals:number;rejections:number}>(`SELECT count(*) FILTER(WHERE vote='approve')::int AS approvals,
@@ -389,6 +520,9 @@ export class InvestService {
       if (total.approvals < 2 || total.rejections > 0) throw new Error('Mandate requires two independent approvals and no rejection');
       const draft = row.risk_review['mandateDraft'] as MandateDraft;
       if (!draft) throw new Error('IC memo has no mandate draft');
+      const previousMandate = await tx.query<{limits:Record<string,unknown>}>(`SELECT limits FROM invest_mandates
+        WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status='approved' AND effective_from<=now() AND effective_until>now()
+        ORDER BY version DESC LIMIT 1 FOR UPDATE`, [scope.tenantId,scope.workspaceId,row.portfolio_id]);
       const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60_000).toISOString();
       const effectiveUntil = draft.effectiveUntil ?? expiresAt;
       const mandate = await tx.query<{id:string;version:number}>(`INSERT INTO invest_mandates(id,tenant_id,workspace_id,portfolio_id,version,effective_from,effective_until,limits,status,approved_by,approved_at,created_by)
@@ -396,6 +530,13 @@ export class InvestService {
         [uuidv7(), scope.tenantId, scope.workspaceId, row.portfolio_id, row.version, draft.effectiveFrom, effectiveUntil,
           JSON.stringify({ ...draft.limits, allowedAssetClasses: draft.allowedAssetClasses, allowedInstrumentIds: draft.allowedInstrumentIds, benchmark: draft.benchmark }), approverId, approverId]);
       if (!mandate.rows[0]) throw new Error('Approved mandate insert failed');
+      const proposedLimits = { ...draft.limits, allowedAssetClasses: draft.allowedAssetClasses, allowedInstrumentIds: draft.allowedInstrumentIds, benchmark: draft.benchmark };
+      if (previousMandate.rows[0] && JSON.stringify(previousMandate.rows[0].limits) !== JSON.stringify(proposedLimits)) {
+        await tx.query(`INSERT INTO invest_limit_changes(id,tenant_id,workspace_id,portfolio_id,mandate_id,previous_limits,proposed_limits,reason,approved_by,approved_at,created_by)
+          VALUES($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9,now(),$10)`,
+          [uuidv7(),scope.tenantId,scope.workspaceId,row.portfolio_id,mandate.rows[0].id,JSON.stringify(previousMandate.rows[0].limits),JSON.stringify(proposedLimits),
+            `IC-approved mandate v${row.version}: ${row.title}`.slice(0,1000),approverId,row.created_by]);
+      }
       await tx.query(`UPDATE invest_ic_memos SET status='approved',expires_at=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,
         [scope.tenantId, scope.workspaceId, input.memoId, expiresAt]);
       await tx.query(`INSERT INTO invest_ic_memo_events(id,tenant_id,workspace_id,memo_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'approved',$5::jsonb,$6)`,

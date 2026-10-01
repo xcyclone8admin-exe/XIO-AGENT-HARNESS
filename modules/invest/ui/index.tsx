@@ -142,7 +142,10 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   const breaches = useCapability<Breach[]>(api, workspaceId, caps.breaches.id);
   const [symbol, setSymbol] = useState(''); const [exchange, setExchange] = useState(''); const [price, setPrice] = useState('');
   const [memoTitle, setMemoTitle] = useState(''); const [thesis, setThesis] = useState(''); const [sourceRef, setSourceRef] = useState('');
-  const [maxOrderNotional, setMaxOrderNotional] = useState('1000'); const [busy, setBusy] = useState(false); const [message, setMessage] = useState<string|null>(null);
+  const [policy, setPolicy] = useState({ maxOrderNotionalUnits:'1000', maxPositionNotionalUnits:'100000000', maxDailyLossUnits:'1000000', maxOrdersPerHour:'10',
+    maxPriceDeviationBps:'500', quoteFreshnessSeconds:'300', duplicateWindowSeconds:'60', maxConcentrationBps:'5000', maxCorrelatedExposureBps:'10000',
+    maxLeverageBps:'10000', maxDrawdownBps:'2000', targetVolatilityBps:'2000', blockedSymbols:'', watchSymbols:'' });
+  const [busy, setBusy] = useState(false); const [message, setMessage] = useState<string|null>(null);
   const [marketSession, setMarketSession] = useState(true);
   const [statementSource, setStatementSource] = useState('Manual custodian statement');
   const [statementRef, setStatementRef] = useState('');
@@ -176,13 +179,21 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
     const payload = new TextEncoder().encode(sourceRef.trim());
     const digest = await crypto.subtle.digest('SHA-256', payload);
     const sourceHash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2,'0')).join('');
+    const policyTextKeys = ['maxOrderNotionalUnits','maxPositionNotionalUnits','maxDailyLossUnits'] as const;
+    const policyNumberKeys = ['maxOrdersPerHour','maxPriceDeviationBps','quoteFreshnessSeconds','duplicateWindowSeconds','maxConcentrationBps','maxCorrelatedExposureBps','maxLeverageBps','maxDrawdownBps','targetVolatilityBps'] as const;
+    if (policyTextKeys.some((key)=>!/^([1-9]\d{0,37})$/.test(policy[key])) || policyNumberKeys.some((key)=>!/^\d+$/.test(policy[key]))) {
+      setMessage('Risk values must be positive canonical integers.'); return;
+    }
+    const symbols = (value:string) => [...new Set(value.split(',').map((item)=>item.trim().toUpperCase()).filter(Boolean))];
     await write(caps.createMandate.id, { portfolioId: selectedPortfolio.id, version: Math.max(0, ...(memoQueue.data?.filter((memo) => memo.portfolio_id === selectedPortfolio.id).map((memo) => memo.version) ?? [])) + 1,
       title: memoTitle, thesis, sources: [{ label: 'User supplied research reference', ref: sourceRef, sha256: sourceHash }],
       effectiveFrom: new Date(Date.now()-60_000).toISOString(), effectiveUntil: null,
       allowedAssetClasses: ['equity'], allowedInstrumentIds: instruments.data.map((instrument) => instrument.id), benchmark: 'PAPER-CASH',
-      limits: { maxOrderNotionalUnits: maxOrderNotional, maxPositionNotionalUnits: '100000000', maxDailyLossUnits: '1000000', maxOrdersPerHour: 10,
-        maxPriceDeviationBps: 500, quoteFreshnessSeconds: 300, duplicateWindowSeconds: 60, maxConcentrationBps: 5000,
-        maxCorrelatedExposureBps: 10000, maxLeverageBps: 10000, maxDrawdownBps: 2000, targetVolatilityBps: 2000 } });
+      limits: { maxOrderNotionalUnits:policy.maxOrderNotionalUnits, maxPositionNotionalUnits:policy.maxPositionNotionalUnits, maxDailyLossUnits:policy.maxDailyLossUnits,
+        maxOrdersPerHour:Number(policy.maxOrdersPerHour), maxPriceDeviationBps:Number(policy.maxPriceDeviationBps), quoteFreshnessSeconds:Number(policy.quoteFreshnessSeconds),
+        duplicateWindowSeconds:Number(policy.duplicateWindowSeconds), maxConcentrationBps:Number(policy.maxConcentrationBps), maxCorrelatedExposureBps:Number(policy.maxCorrelatedExposureBps),
+        maxLeverageBps:Number(policy.maxLeverageBps), maxDrawdownBps:Number(policy.maxDrawdownBps), targetVolatilityBps:Number(policy.targetVolatilityBps),
+        blockedSymbols:symbols(policy.blockedSymbols), watchSymbols:symbols(policy.watchSymbols) } });
   }
   async function voteMemo(memoId: string, vote: 'approve'|'reject'|'recuse') {
     await write(caps.voteMemo.id, { memoId, vote, reason: vote === 'approve' ? 'Reviewed source-cited thesis and risk policy' : vote === 'reject' ? 'IC review rejected this mandate draft' : 'IC member recused from this decision' });
@@ -218,8 +229,13 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
         <label className="space-y-1 text-xs text-fg-muted">Memo title<Input aria-label="Memo title" value={memoTitle} onChange={(event) => setMemoTitle(event.target.value)} maxLength={240} /></label>
         <label className="space-y-1 text-xs text-fg-muted">Source reference<Input aria-label="Source reference" value={sourceRef} onChange={(event) => setSourceRef(event.target.value)} maxLength={1000} /></label>
         <label className="space-y-1 text-xs text-fg-muted sm:col-span-2">Investment thesis<textarea aria-label="Investment thesis" className="min-h-20 w-full rounded-md border border-line bg-surface px-3 py-2 text-sm text-fg" value={thesis} onChange={(event) => setThesis(event.target.value)} maxLength={20000} /></label>
-        <label className="block max-w-xs space-y-1 text-xs text-fg-muted">Maximum order notional, minor units<Input aria-label="Maximum order notional" inputMode="numeric" value={maxOrderNotional} onChange={(event) => setMaxOrderNotional(event.target.value)} /></label>
-        <span className="self-end"><Button loading={busy} disabled={!memoTitle.trim() || !thesis.trim() || !sourceRef.trim() || !/^[1-9]\d{0,37}$/.test(maxOrderNotional)} onClick={() => void createMandate()}>Submit for IC review</Button></span>
+        <div className="grid gap-3 sm:col-span-2 sm:grid-cols-3">
+          {(['maxOrderNotionalUnits','maxPositionNotionalUnits','maxDailyLossUnits'] as const).map((key)=><label key={key} className="space-y-1 text-xs text-fg-muted">{key.replace(/([A-Z])/g,' $1')} (minor units)<Input aria-label={key} inputMode="numeric" value={policy[key]} onChange={(event)=>setPolicy((current)=>({...current,[key]:event.target.value}))} /></label>)}
+          {(['maxOrdersPerHour','maxPriceDeviationBps','quoteFreshnessSeconds','duplicateWindowSeconds','maxConcentrationBps','maxCorrelatedExposureBps','maxLeverageBps','maxDrawdownBps','targetVolatilityBps'] as const).map((key)=><label key={key} className="space-y-1 text-xs text-fg-muted">{key.replace(/([A-Z])/g,' $1')}<Input aria-label={key} inputMode="numeric" value={policy[key]} onChange={(event)=>setPolicy((current)=>({...current,[key]:event.target.value}))} /></label>)}
+          <label className="space-y-1 text-xs text-fg-muted">Restricted symbols, comma-separated<Input aria-label="Restricted symbols" value={policy.blockedSymbols} onChange={(event)=>setPolicy((current)=>({...current,blockedSymbols:event.target.value}))} placeholder="ACME, XYZ" /></label>
+          <label className="space-y-1 text-xs text-fg-muted">Watch symbols, comma-separated<Input aria-label="Watch symbols" value={policy.watchSymbols} onChange={(event)=>setPolicy((current)=>({...current,watchSymbols:event.target.value}))} placeholder="ABC, QRS" /></label>
+        </div>
+        <span className="self-end"><Button loading={busy} disabled={!memoTitle.trim() || !thesis.trim() || !sourceRef.trim() || !/^[1-9]\d{0,37}$/.test(policy.maxOrderNotionalUnits)} onClick={() => void createMandate()}>Submit for IC review</Button></span>
       </div>}
       {message ? <p role="status" className="mt-3 text-sm text-fg-muted">{message}</p> : null}
     </Panel>
@@ -257,9 +273,104 @@ function KillSwitch({ workspaceId, api, portfolioId }: { workspaceId:string|null
   return <Panel title="Portfolio trading kill switch" description="Engaging halts proposals and cancels open orders. Resuming requires an explicit action.">{state.error ? <ErrorState error={state.error} onRetry={state.refresh} title="Risk state could not be loaded" /> : state.loading || !state.data ? <LoadingState label="Loading persisted PAPER risk state" rows={1} /> : <><div className="flex items-center justify-between gap-3"><span className="text-sm">{engaged ? <Badge tone="negative">HALTED</Badge> : <Badge tone="positive">ACTIVE</Badge>}{engaged && state.data.killReason ? <span className="ml-2 text-fg-muted">{state.data.killReason}</span> : null}</span><Button variant={engaged ? 'primary' : 'secondary'} loading={busy} onClick={() => void toggle()}>{engaged ? 'Explicitly resume PAPER' : 'Halt PAPER trading'}</Button></div><p className="mt-2 text-xs text-fg-muted">Daily loss: {state.data.dailyLossUnits} minor units · {state.data.riskDate}</p></>}{error ? <p role="alert" className="mt-2 text-sm text-negative">{error}</p> : null}</Panel>;
 }
 
+type BacktestReply = {runId:string;engineVersion:string;dataVersion:number;strategyId:string;strategyVersion:number;dataHash:string;strategyHash:string;trades:Array<{entryBar:number;exitBar:number;entryPriceUnits:string;exitPriceUnits:string;quantityUnits:string;grossPnlUnits:string;feesUnits:string;netPnlUnits:string;exitReason:string}>;totalFeesUnits:string;netPnlUnits:string};
+function BacktestsPage({workspaceId,api}:ModulePageProps) {
+  const instruments = useCapability<Instrument[]>(api,workspaceId,caps.instruments.id);
+  const [instrumentId,setInstrumentId] = useState(''); const [dataVersion,setDataVersion] = useState('1');
+  const [sourceName,setSourceName] = useState('User-supplied historical bars'); const [sourceRef,setSourceRef] = useState('');
+  const [strategyId,setStrategyId] = useState('momentum-stop-target'); const [strategyVersion,setStrategyVersion] = useState('1');
+  const [quantityUnits,setQuantityUnits] = useState('1'); const [stopBps,setStopBps] = useState('500'); const [targetBps,setTargetBps] = useState('1000'); const [feeBps,setFeeBps] = useState('10');
+  const [barsJson,setBarsJson] = useState(''); const [busy,setBusy] = useState(false); const [error,setError] = useState<string|null>(null); const [result,setResult] = useState<BacktestReply|null>(null);
+  const history = useCapability<Array<{id:string;data_version:number;source_name:string;source_ref:string;data_hash:string;strategy_key:string;strategy_version:number;strategy_hash:string;engine_version:string;total_fees_units:string;net_pnl_units:string;created_at:string}>>(api,workspaceId,caps.backtestRuns.id,instrumentId ? {instrumentId} : undefined);
+  async function run() {
+    if (!api || !workspaceId || !instrumentId) return;
+    let bars:unknown;
+    try { bars=JSON.parse(barsJson) as unknown; if (!Array.isArray(bars)) throw new Error('Expected a JSON array'); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'OHLC data must be a JSON array'); return; }
+    setBusy(true); setError(null); setResult(null);
+    try {
+      const response=await api.write<BacktestReply>(workspaceId,caps.runBacktest.id,{instrumentId,dataVersion:Number(dataVersion),sourceName,sourceRef,bars,
+        strategy:{id:strategyId,version:Number(strategyVersion),quantityUnits,stopBps:Number(stopBps),targetBps:Number(targetBps),feeBps:Number(feeBps)}});
+      setResult(response); history.refresh();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'PAPER backtest failed'); }
+    finally { setBusy(false); }
+  }
+  return <div className="space-y-5">
+    <PageHeader eyebrow="Invest / research" title="PAPER backtests" description="Reproducible integer-unit OHLC simulations with versioned inputs." />
+    <PaperBanner />
+    {instruments.error ? <ErrorState error={instruments.error} onRetry={instruments.refresh} title="Instruments could not be loaded" /> : null}
+    <Panel title="Versioned input data and strategy" description="OHLC bars are manual/imported evidence. This workflow does not contact a market provider or create orders in a portfolio.">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <label className="space-y-1 text-xs text-fg-muted">Instrument<select className="h-9 w-full rounded-md border border-line bg-surface px-3 text-sm text-fg" value={instrumentId} onChange={(event)=>setInstrumentId(event.target.value)}><option value="">Choose instrument</option>{instruments.data?.map((item)=><option key={item.id} value={item.id}>{item.symbol}</option>)}</select></label>
+        <label className="space-y-1 text-xs text-fg-muted">Dataset version<Input aria-label="Dataset version" inputMode="numeric" value={dataVersion} onChange={(event)=>setDataVersion(event.target.value)} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Data source<Input aria-label="Data source" value={sourceName} onChange={(event)=>setSourceName(event.target.value)} maxLength={120} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Source reference<Input aria-label="Source reference" value={sourceRef} onChange={(event)=>setSourceRef(event.target.value)} maxLength={500} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Strategy key<Input aria-label="Strategy key" value={strategyId} onChange={(event)=>setStrategyId(event.target.value)} maxLength={120} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Strategy version<Input aria-label="Strategy version" inputMode="numeric" value={strategyVersion} onChange={(event)=>setStrategyVersion(event.target.value)} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Quantity units<Input aria-label="Backtest quantity units" inputMode="numeric" value={quantityUnits} onChange={(event)=>setQuantityUnits(event.target.value)} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Stop loss (bps)<Input aria-label="Stop loss basis points" inputMode="numeric" value={stopBps} onChange={(event)=>setStopBps(event.target.value)} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Target (bps)<Input aria-label="Target basis points" inputMode="numeric" value={targetBps} onChange={(event)=>setTargetBps(event.target.value)} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Fee (bps each side)<Input aria-label="Fee basis points" inputMode="numeric" value={feeBps} onChange={(event)=>setFeeBps(event.target.value)} /></label>
+      </div>
+      <label className="mt-3 block space-y-1 text-xs text-fg-muted">OHLC bars JSON (UTC timestamps, integer price units)<textarea aria-label="OHLC bars JSON" className="min-h-48 w-full rounded-md border border-line bg-surface px-3 py-2 font-mono text-sm text-fg" value={barsJson} onChange={(event)=>setBarsJson(event.target.value)} placeholder={'[{"at":"2026-01-01T00:00:00.000Z","openUnits":"100","highUnits":"105","lowUnits":"95","closeUnits":"100"}, ...]'} /></label>
+      <Button className="mt-3" loading={busy} disabled={!instrumentId || !sourceName.trim() || !sourceRef.trim() || !strategyId.trim() || !barsJson.trim()} onClick={()=>void run()}>Run and persist PAPER backtest</Button>
+      {error ? <p role="alert" className="mt-2 text-sm text-negative">{error}</p> : null}
+    </Panel>
+    {result ? <Panel title="Immutable simulation result" description={`Run ${result.runId} · engine ${result.engineVersion} · data v${result.dataVersion} · ${result.strategyId} v${result.strategyVersion}`}>
+      <p className="font-mono text-xs text-fg-muted">data {result.dataHash} · strategy {result.strategyHash}</p>
+      <div className="mt-3 grid gap-3 sm:grid-cols-3"><Metric title="Net P/L units" value={result.netPnlUnits} icon={TrendingUp} /><Metric title="Fees units" value={result.totalFeesUnits} icon={CircleDollarSign} /><Metric title="Trades" value={result.trades.length} icon={Activity} /></div>
+      {result.trades.length ? <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-sm"><thead><tr><th>Bars</th><th>Entry / exit</th><th>Reason</th><th>Gross</th><th>Fees</th><th>Net</th></tr></thead><tbody>{result.trades.map((trade,index)=><tr key={`${trade.entryBar}-${index}`}><td>{trade.entryBar} → {trade.exitBar}</td><td className="font-mono">{trade.entryPriceUnits} / {trade.exitPriceUnits}</td><td>{trade.exitReason}</td><td className="font-mono">{trade.grossPnlUnits}</td><td className="font-mono">{trade.feesUnits}</td><td className="font-mono">{trade.netPnlUnits}</td></tr>)}</tbody></table></div> : <p className="mt-3 text-sm text-fg-muted">No entry signal occurred in the supplied bars.</p>}
+    </Panel> : null}
+    {instrumentId ? <Panel title="Persisted run history" description="Runs are tied to immutable dataset and strategy versions; reusing a version with changed content is rejected.">
+      {history.loading ? <LoadingState label="Loading saved backtests" rows={2} /> : null}{history.error ? <ErrorState error={history.error} onRetry={history.refresh} title="Backtest history could not be loaded" /> : null}
+      {!history.loading && !history.error && !history.data?.length ? <EmptyState icon={Activity} title="No saved runs for this instrument">Run a versioned simulation to create an immutable result record.</EmptyState> : null}
+      {history.data?.map((run)=><div key={run.id} className="flex flex-wrap justify-between gap-2 border-b border-line py-2 text-sm last:border-0"><span>{run.strategy_key} v{run.strategy_version} on data v{run.data_version} · {run.source_name}</span><span className="font-mono">net {run.net_pnl_units} · fees {run.total_fees_units}</span><span className="font-mono text-xs text-fg-subtle">{run.created_at} · {run.id}</span></div>)}
+    </Panel> : null}
+  </div>;
+}
+
+type PerformanceMarkRow = {id:string;portfolio_id:string;captured_at:string;nav_units:string;cash_units:string;benchmark_index_units:string;benchmark_source:string;benchmark_ref:string;external_flow_units:string;cumulative_fee_units:string};
+type PerformanceReportRow = {id:string;portfolio_id:string;created_at:string;report:{calculationVersion:string;fromMarkId:string;toMarkId:string;startNavUnits:string;endNavUnits:string;netExternalFlowUnits:string;feesUnits:string;twrBps:string;benchmarkReturnBps:string;relativeReturnBps:string;markCount:number}};
+function PerformancePage({workspaceId,api}:ModulePageProps) {
+  const portfolios=useCapability<Portfolio[]>(api,workspaceId,caps.portfolios.id);const portfolio=portfolios.data?.[0];
+  const marks=useCapability<PerformanceMarkRow[]>(api,workspaceId,caps.performanceMarks.id,portfolio?{portfolioId:portfolio.id}:undefined);
+  const statements=useCapability<PerformanceReportRow[]>(api,workspaceId,caps.performanceStatements.id,portfolio?{portfolioId:portfolio.id}:undefined);
+  const [benchmarkIndexUnits,setBenchmarkIndexUnits]=useState('100000');const [benchmarkSource,setBenchmarkSource]=useState('User-supplied benchmark');const [benchmarkRef,setBenchmarkRef]=useState('');
+  const [fromMarkId,setFromMarkId]=useState('');const [toMarkId,setToMarkId]=useState('');const [busy,setBusy]=useState(false);const [message,setMessage]=useState<string|null>(null);
+  async function capture(){if(!api||!workspaceId||!portfolio)return;setBusy(true);setMessage(null);try{const mark=await api.write<PerformanceMarkRow>(workspaceId,caps.capturePerformanceMark.id,{portfolioId:portfolio.id,benchmarkIndexUnits,benchmarkSource,benchmarkRef});
+    marks.refresh();statements.refresh();setMessage(`Captured ledger-derived NAV ${mark.nav_units}; external capital flow since prior mark ${mark.external_flow_units}.`);}
+    catch(cause){setMessage(cause instanceof Error?cause.message:'Performance mark failed');}finally{setBusy(false);}}
+  async function generate(){if(!api||!workspaceId||!portfolio||!fromMarkId||!toMarkId)return;setBusy(true);setMessage(null);try{const statement=await api.write<PerformanceReportRow>(workspaceId,caps.createPerformanceStatement.id,{portfolioId:portfolio.id,fromMarkId,toMarkId});
+    statements.refresh();setMessage(`Saved ${statement.report.calculationVersion} statement ${statement.id}.`);}
+    catch(cause){setMessage(cause instanceof Error?cause.message:'Statement generation failed');}finally{setBusy(false);}}
+  return <div className="space-y-5"><PageHeader eyebrow="Invest / reporting" title="PAPER performance" description="Ledger-derived NAV marks, external flows, fees and benchmark-relative time-weighted return."/><PaperBanner/>
+    {!portfolio?<Panel><EmptyState icon={BriefcaseBusiness} title="Create a PAPER portfolio first">Performance marks and statements are portfolio scoped.</EmptyState></Panel>:<>
+      <Panel title="Capture a sourced performance mark" description="NAV and cash come from the PAPER ledger; external capital flow and fees are derived from immutable entries. Benchmark values are manually sourced until a provider is connected.">
+        <div className="grid gap-3 sm:grid-cols-3"><label className="space-y-1 text-xs text-fg-muted">Benchmark index units<Input aria-label="Benchmark index units" inputMode="numeric" value={benchmarkIndexUnits} onChange={(event)=>setBenchmarkIndexUnits(event.target.value)}/></label>
+          <label className="space-y-1 text-xs text-fg-muted">Benchmark source<Input aria-label="Benchmark source" value={benchmarkSource} onChange={(event)=>setBenchmarkSource(event.target.value)} maxLength={120}/></label>
+          <label className="space-y-1 text-xs text-fg-muted">Source reference<Input aria-label="Benchmark source reference" value={benchmarkRef} onChange={(event)=>setBenchmarkRef(event.target.value)} maxLength={500}/></label></div>
+        <Button className="mt-3" loading={busy} disabled={!/^[1-9]\d{0,37}$/.test(benchmarkIndexUnits)||!benchmarkSource.trim()||!benchmarkRef.trim()} onClick={()=>void capture()}>Capture PAPER valuation</Button>
+      </Panel>
+      <Panel title="Valuation marks" description="Each mark stores the database capture time, sourced benchmark, ledger NAV and net capital flow since the preceding mark.">
+        {marks.loading?<LoadingState label="Loading performance marks" rows={2}/>:null}{marks.error?<ErrorState error={marks.error} onRetry={marks.refresh} title="Performance marks could not be loaded"/>:null}
+        {marks.data?.map((mark)=><div key={mark.id} className="flex flex-wrap justify-between gap-2 border-b border-line py-2 text-sm last:border-0"><span>{mark.captured_at} · NAV {mark.nav_units} · cash {mark.cash_units} · flow {mark.external_flow_units}</span><span>{mark.benchmark_source} {mark.benchmark_index_units}</span><span className="font-mono text-xs">{mark.id}</span></div>)}
+      </Panel>
+      <Panel title="Generate a versioned statement" description="The calculation chains integer fixed-point flow-adjusted returns; only marks from this portfolio are accepted.">
+        <div className="grid gap-3 sm:grid-cols-2"><label className="space-y-1 text-xs text-fg-muted">Start mark<select aria-label="Statement start mark" className="h-9 w-full rounded-md border border-line bg-surface px-3 text-sm text-fg" value={fromMarkId} onChange={(event)=>setFromMarkId(event.target.value)}><option value="">Choose start</option>{marks.data?.map((mark)=><option key={mark.id} value={mark.id}>{mark.captured_at} · {mark.id}</option>)}</select></label>
+          <label className="space-y-1 text-xs text-fg-muted">End mark<select aria-label="Statement end mark" className="h-9 w-full rounded-md border border-line bg-surface px-3 text-sm text-fg" value={toMarkId} onChange={(event)=>setToMarkId(event.target.value)}><option value="">Choose end</option>{marks.data?.map((mark)=><option key={mark.id} value={mark.id} disabled={mark.id===fromMarkId}>{mark.captured_at} · {mark.id}</option>)}</select></label></div>
+        <Button className="mt-3" loading={busy} disabled={!fromMarkId||!toMarkId||(marks.data?.length??0)<2} onClick={()=>void generate()}>Generate statement</Button>
+      </Panel>
+      <Panel title="Saved statements" description="Calculation version and result are immutable and reproducible from the selected marks.">
+        {statements.loading?<LoadingState label="Loading saved statements" rows={2}/>:null}{statements.error?<ErrorState error={statements.error} onRetry={statements.refresh} title="Statements could not be loaded"/>:null}
+        {!statements.loading&&!statements.error&&!statements.data?.length?<EmptyState icon={TrendingUp} title="No statements yet">Capture at least two marks, then select a period.</EmptyState>:null}
+        {statements.data?.map((row)=><div key={row.id} className="border-b border-line py-3 last:border-0"><p className="text-sm">{row.created_at} · {row.report.calculationVersion} · {row.report.markCount} marks</p><div className="mt-2 grid gap-2 sm:grid-cols-4"><Metric title="TWR bps" value={row.report.twrBps} icon={TrendingUp}/><Metric title="Benchmark bps" value={row.report.benchmarkReturnBps} icon={Activity}/><Metric title="Relative bps" value={row.report.relativeReturnBps} icon={ArrowDownUp}/><Metric title="Fees units" value={row.report.feesUnits} icon={CircleDollarSign}/></div><p className="mt-2 font-mono text-xs text-fg-subtle">{row.id} · {row.report.startNavUnits} → {row.report.endNavUnits} · net flows {row.report.netExternalFlowUnits}</p></div>)}
+      </Panel>
+    </>}{message?<p role="status" className="text-sm text-fg-muted">{message}</p>:null}</div>;
+}
+
 function Metric({ title, value, icon: Icon }: { title:string; value:string|number; icon:typeof TrendingUp }) {
   return <Panel><div className="flex items-start justify-between gap-3"><div><p className="text-xs text-fg-muted">{title}</p><p className="mt-2 font-mono text-lg font-semibold">{value}</p></div><Icon aria-hidden className="size-4 text-accent-text" /></div></Panel>;
 }
 
-const ui: ModuleUi = { pages: { '': InvestHome, orders: OrdersPage, risk: RiskAndMandates } };
+const ui: ModuleUi = { pages: { '': InvestHome, orders: OrdersPage, risk: RiskAndMandates, backtests: BacktestsPage, performance: PerformancePage } };
 export default ui;
