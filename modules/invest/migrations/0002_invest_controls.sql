@@ -144,6 +144,12 @@ CREATE TABLE invest_portfolio_risk_state (
   FOREIGN KEY (tenant_id, workspace_id, portfolio_id) REFERENCES invest_portfolios(tenant_id,workspace_id,id) ON DELETE RESTRICT,
   CHECK ((kill_switch AND kill_reason IS NOT NULL) OR NOT kill_switch)
 );
+CREATE FUNCTION invest_latest_risk_halt(p_tenant uuid,p_workspace uuid,p_portfolio uuid) RETURNS TABLE(kill_switch boolean,kill_reason text)
+  LANGUAGE sql STABLE SECURITY INVOKER AS $$
+  SELECT s.kill_switch,s.kill_reason FROM invest_portfolio_risk_state s
+  WHERE s.tenant_id=p_tenant AND s.workspace_id=p_workspace AND s.portfolio_id=p_portfolio
+  ORDER BY s.risk_date DESC LIMIT 1
+$$;
 
 CREATE TABLE invest_limit_changes (
   id uuid NOT NULL,
@@ -222,6 +228,9 @@ CREATE TABLE invest_ic_memo_events (
 CREATE FUNCTION invest_controls_scope(tenant_id uuid, workspace_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
   SELECT tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
     AND workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
+$$;
+CREATE FUNCTION invest_utc_risk_date(at_time timestamptz DEFAULT now()) RETURNS date LANGUAGE sql IMMUTABLE AS $$
+  SELECT (at_time AT TIME ZONE 'UTC')::date
 $$;
 DO $$ DECLARE name text; BEGIN
   FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_tax_lots','invest_tax_lot_events','invest_breach_events','invest_reconciliation_runs','invest_reconciliation_discrepancies','invest_reconciliation_events','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP

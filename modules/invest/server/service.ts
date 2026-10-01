@@ -5,6 +5,7 @@ import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
 import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/ledger/contracts';
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
+import { allocateFifoTaxLots } from './tax-lots';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
 
@@ -110,10 +111,15 @@ export class InvestService {
   async riskState(scope: InvestScope, input: { portfolioId: string }): Promise<{portfolioId:string;killSwitch:boolean;killReason:string|null;dailyLossUnits:string;riskDate:string}> {
     const row = await this.scoped.query<{kill_switch:boolean;kill_reason:string|null;daily_loss_units:string;risk_date:string}>(scope,
       `SELECT kill_switch,kill_reason,daily_loss_units::text,risk_date::text FROM invest_portfolio_risk_state
-       WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`,
+       WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,
       [scope.tenantId, scope.workspaceId, input.portfolioId]);
     const state = row.rows[0];
-    if (!state) throw new Error('Portfolio risk state not found');
+    if (!state) {
+      const previous = await this.scoped.query<{kill_switch:boolean;kill_reason:string|null}>(scope,
+        `SELECT kill_switch,kill_reason FROM invest_latest_risk_halt($1,$2,$3)`, [scope.tenantId,scope.workspaceId,input.portfolioId]);
+      return { portfolioId: input.portfolioId, killSwitch: previous.rows[0]?.kill_switch ?? false, killReason: previous.rows[0]?.kill_reason ?? null,
+        dailyLossUnits: '0', riskDate: new Date().toISOString().slice(0,10) };
+    }
     return { portfolioId: input.portfolioId, killSwitch: state.kill_switch, killReason: state.kill_reason,
       dailyLossUnits: state.daily_loss_units, riskDate: state.risk_date };
   }
@@ -262,9 +268,9 @@ export class InvestService {
         positionValues.push({ instrumentId: instrument.id, value });
       }
       const nav = cash + gross;
-      const prior = await tx.query<{day_open_nav_units:string;high_water_nav_units:string;daily_loss_units:string;kill_switch:boolean}>(
+      const prior = await tx.query<{day_open_nav_units:string;high_water_nav_units:string;daily_loss_units:string;kill_switch:boolean;kill_reason:string|null}>(
         `SELECT day_open_nav_units::text,high_water_nav_units::text,daily_loss_units::text,kill_switch FROM invest_portfolio_risk_state
-         WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date FOR UPDATE`,
+         WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date() FOR UPDATE`,
         [scope.tenantId, scope.workspaceId, portfolio.id]);
       const state = prior.rows[0]; const opening = BigInt(state?.day_open_nav_units ?? nav.toString());
       const highWater = BigInt(state?.high_water_nav_units ?? nav.toString());
@@ -272,12 +278,16 @@ export class InvestService {
       const drawdownHit = highWater > nav && (highWater-nav)*10_000n >= highWater*BigInt(limits.maxDrawdownBps);
       const dailyLossHit = loss >= BigInt(limits.maxDailyLossUnits);
       const autoHalt = dailyLossHit || drawdownHit;
-      await tx.query(`UPDATE invest_portfolio_risk_state SET high_water_nav_units=GREATEST(high_water_nav_units,$4),daily_loss_units=$5,
-          kill_switch=CASE WHEN $6 THEN true ELSE kill_switch END,
-          kill_reason=CASE WHEN $6 THEN $7 ELSE kill_reason END,updated_at=now()
-        WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`,
-        [scope.tenantId, scope.workspaceId, portfolio.id, nav.toString(), loss.toString(), autoHalt,
-          dailyLossHit ? 'Automatic PAPER halt: daily-loss mandate exceeded' : 'Automatic PAPER halt: drawdown limit exceeded']);
+      const lastHalt = state ? undefined : (await tx.query<{kill_switch:boolean;kill_reason:string|null}>(`SELECT kill_switch,kill_reason FROM invest_latest_risk_halt($1,$2,$3)`, [scope.tenantId,scope.workspaceId,portfolio.id])).rows[0];
+      const retainedHalt = state?.kill_switch ?? lastHalt?.kill_switch ?? false;
+      const retainedReason = retainedHalt && !autoHalt ? state?.kill_reason ?? lastHalt?.kill_reason : null;
+      const reason = dailyLossHit ? 'Automatic PAPER halt: daily-loss mandate exceeded' : drawdownHit ? 'Automatic PAPER halt: drawdown limit exceeded' : retainedReason;
+      await tx.query(`INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units,kill_switch,kill_reason)
+        VALUES($1,$2,$3,invest_utc_risk_date(),$4,$4,$5,$6,CASE WHEN $6 THEN $7 ELSE NULL END)
+        ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET high_water_nav_units=GREATEST(invest_portfolio_risk_state.high_water_nav_units,EXCLUDED.high_water_nav_units),
+          daily_loss_units=EXCLUDED.daily_loss_units,kill_switch=invest_portfolio_risk_state.kill_switch OR EXCLUDED.kill_switch,
+          kill_reason=CASE WHEN EXCLUDED.kill_switch THEN EXCLUDED.kill_reason ELSE invest_portfolio_risk_state.kill_reason END,updated_at=now()`,
+        [scope.tenantId, scope.workspaceId, portfolio.id, nav.toString(), loss.toString(), retainedHalt || autoHalt, reason]);
       const breaches: Array<{instrumentId:string|null;kind:string;detail:Record<string,string>}> = [];
       for (const position of positionValues) {
         if (position.value > BigInt(limits.maxPositionNotionalUnits)) breaches.push({ instrumentId:position.instrumentId, kind:'max_position_notional', detail:{value:position.value.toString(),limit:limits.maxPositionNotionalUnits} });
@@ -406,22 +416,24 @@ export class InvestService {
         { accountId: cash.id, asset: row.base_asset, units: input.units, memo: 'PAPER simulated opening capital' },
         { accountId: capital.id, asset: row.base_asset, units: `-${input.units}`, memo: 'PAPER simulated opening capital' },
       ] });
+    const navNow = (await this.summary(scope,{portfolioId:input.portfolioId})).navUnits;
     await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, (tx) => tx.query(
-      `INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units)
-       VALUES($1,$2,$3,(now() AT TIME ZONE 'UTC')::date,$4,$4,0)
-       ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET day_open_nav_units=invest_portfolio_risk_state.day_open_nav_units+$4,high_water_nav_units=GREATEST(invest_portfolio_risk_state.high_water_nav_units,invest_portfolio_risk_state.day_open_nav_units+$4),updated_at=now()`,
-      [scope.tenantId, scope.workspaceId, input.portfolioId, input.units]));
+      `INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units,kill_switch,kill_reason)
+       SELECT $1,$2,$3,invest_utc_risk_date(),$4,$4,0,COALESCE((SELECT kill_switch FROM invest_latest_risk_halt($1,$2,$3)),false),
+         (SELECT kill_reason FROM invest_latest_risk_halt($1,$2,$3)) FROM (SELECT 1) seed
+       ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET day_open_nav_units=invest_portfolio_risk_state.day_open_nav_units+$5,high_water_nav_units=GREATEST(invest_portfolio_risk_state.high_water_nav_units,invest_portfolio_risk_state.day_open_nav_units+$5),updated_at=now()`,
+      [scope.tenantId, scope.workspaceId, input.portfolioId, navNow, input.units]));
     return { transactionId, environment: 'paper' };
   }
 
   async setKillSwitch(scope: InvestScope, actorId: string, input: { portfolioId:string; engaged:boolean; reason:string }): Promise<{portfolioId:string;engaged:boolean;cancelledOrders:number}> {
-    const today = new Date().toISOString().slice(0,10);
+    const openingNav = (await this.summary(scope,{portfolioId:input.portfolioId})).navUnits;
     return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
       const portfolio = await tx.query<{id:string}>(`SELECT id FROM invest_portfolios WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.portfolioId]);
       if (!portfolio.rows[0]) throw new Error('Portfolio not found');
       await tx.query(`INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units,kill_switch,kill_reason)
-        VALUES($1,$2,$3,$4,0,0,0,$5,$6) ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET kill_switch=EXCLUDED.kill_switch,kill_reason=EXCLUDED.kill_reason,updated_at=now()`,
-        [scope.tenantId, scope.workspaceId, input.portfolioId, today, input.engaged, input.engaged ? input.reason : null]);
+        VALUES($1,$2,$3,invest_utc_risk_date(),$4,$4,0,$5,$6) ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET kill_switch=EXCLUDED.kill_switch,kill_reason=EXCLUDED.kill_reason,updated_at=now()`,
+        [scope.tenantId, scope.workspaceId, input.portfolioId, openingNav, input.engaged, input.engaged ? input.reason : null]);
       if (!input.engaged) return { portfolioId: input.portfolioId, engaged: false, cancelledOrders: 0 };
       const open = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
         [scope.tenantId, scope.workspaceId, input.portfolioId]);
@@ -446,7 +458,7 @@ export class InvestService {
     if (!inserted.rows[0]) throw new Error('Portfolio insert failed');
     await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, (tx) => tx.query(
       `INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units)
-       VALUES($1,$2,$3,(now() AT TIME ZONE 'UTC')::date,0,0,0)`, [scope.tenantId, scope.workspaceId, id]));
+       VALUES($1,$2,$3,invest_utc_risk_date(),0,0,0)`, [scope.tenantId, scope.workspaceId, id]));
     return inserted.rows[0];
   }
 
@@ -527,8 +539,11 @@ export class InvestService {
     const sessionOpen = String(row['asset_class']) === 'crypto' || await this.isMarketOpen(scope, String(row['exchange_code'] ?? ''), now);
     const currentRisk = await this.scoped.query<{day_open_nav_units:string;high_water_nav_units:string;daily_loss_units:string;kill_switch:boolean}>(scope,
       `SELECT day_open_nav_units::text,high_water_nav_units::text,daily_loss_units::text,kill_switch FROM invest_portfolio_risk_state
-       WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`, [scope.tenantId, scope.workspaceId, input.portfolioId]);
-    const state = currentRisk.rows[0];
+       WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`, [scope.tenantId, scope.workspaceId, input.portfolioId]);
+    const currentState = currentRisk.rows[0];
+    const lastHalt = currentState ? undefined : (await this.scoped.query<{kill_switch:boolean;kill_reason:string|null}>(scope,
+      `SELECT kill_switch,kill_reason FROM invest_latest_risk_halt($1,$2,$3)`,[scope.tenantId,scope.workspaceId,input.portfolioId])).rows[0];
+    const state = currentState ?? (lastHalt?.kill_switch ? { day_open_nav_units:nav.toString(),high_water_nav_units:nav.toString(),daily_loss_units:'0',kill_switch:true,kill_reason:lastHalt.kill_reason } : undefined);
     if (state?.kill_switch) throw new Error('PAPER trading kill switch is engaged');
     const drawdownLoss = state && BigInt(state.high_water_nav_units) > nav ? BigInt(state.high_water_nav_units) - nav : 0n;
     const dailyLoss = state ? (BigInt(state.daily_loss_units) > drawdownLoss ? BigInt(state.daily_loss_units) : drawdownLoss) : 0n;
@@ -550,7 +565,11 @@ export class InvestService {
       verdict.allowed, JSON.stringify(verdict.reasons), row['quote_id'], JSON.stringify(riskSnapshot), actorId]));
     if (!verdict.allowed) throw new Error(`Risk rejected: ${verdict.reasons.join('; ')}`);
     return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
-      const stateCheck = await tx.query<{kill_switch:boolean}>(`SELECT kill_switch FROM invest_portfolio_risk_state WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date FOR UPDATE`,
+      await tx.query(`INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units,kill_switch,kill_reason)
+        SELECT $1,$2,$3,invest_utc_risk_date(),$4,$4,0,COALESCE((SELECT kill_switch FROM invest_latest_risk_halt($1,$2,$3)),false),
+          (SELECT kill_reason FROM invest_latest_risk_halt($1,$2,$3)) FROM (SELECT 1) seed
+        ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO NOTHING`, [scope.tenantId,scope.workspaceId,input.portfolioId,nav.toString()]);
+      const stateCheck = await tx.query<{kill_switch:boolean}>(`SELECT kill_switch FROM invest_portfolio_risk_state WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date() FOR UPDATE`,
         [scope.tenantId, scope.workspaceId, input.portfolioId]);
       if (stateCheck.rows[0]?.kill_switch) throw new Error('PAPER trading kill switch is engaged');
       const inserted = await tx.query<OrderRow>(`INSERT INTO invest_orders(id,tenant_id,workspace_id,portfolio_id,instrument_id,mandate_id,risk_decision_id,environment,side,order_type,quantity_units,limit_price_units,status,idempotency_key,created_by)
@@ -598,6 +617,8 @@ export class InvestService {
          JOIN LATERAL (SELECT id,price_units,received_at FROM invest_market_prices WHERE tenant_id=o.tenant_id AND workspace_id=o.workspace_id AND instrument_id=o.instrument_id ORDER BY received_at DESC LIMIT 1) q ON true
          WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3 FOR UPDATE OF o`, [scope.tenantId, scope.workspaceId, input.orderId]);
       const row = result.rows[0]; if (!row || row['status'] !== 'approved' || row['environment'] !== 'paper') throw new Error('Only approved PAPER orders can execute');
+      const halt = await tx.query<{kill_switch:boolean}>(`SELECT kill_switch FROM invest_latest_risk_halt($1,$2,$3)`, [scope.tenantId,scope.workspaceId,row['portfolio_id']]);
+      if (halt.rows[0]?.kill_switch) throw new Error('PAPER trading kill switch is engaged');
       const quote = BigInt(String(row['price_units'])); const quantity = String(row['quantity_units']);
       const mandateLimits = GuardrailLimits.parse(row['mandate_limits']);
       if (Date.now() - new Date(row['received_at'] as string | Date).getTime() > mandateLimits.quoteFreshnessSeconds * 1000) throw new Error('Latest PAPER market quote is stale');
@@ -643,24 +664,16 @@ export class InvestService {
         await tx.query(`INSERT INTO invest_tax_lot_events(id,tenant_id,workspace_id,lot_id,fill_id,event_type,quantity_units,basis_units,proceeds_units,realized_gain_units)
           VALUES($1,$2,$3,$4,$5,'acquired',$6,$7,0,0)`, [uuidv7(), scope.tenantId, scope.workspaceId, lotId, fillId, quantity, notional.toString()]);
       } else {
-        let remaining = BigInt(quantity);
         const lots = await tx.query<{id:string;remaining_units:string;remaining_basis_units:string}>(`SELECT id,remaining_units::text,remaining_basis_units::text FROM invest_tax_lots
           WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND instrument_id=$4 AND remaining_units>0 ORDER BY opened_at,id FOR UPDATE`,
           [scope.tenantId, scope.workspaceId, row['portfolio_id'], row['instrument_id']]);
-        for (const lot of lots.rows) {
-          if (remaining === 0n) break;
-          const available = BigInt(lot.remaining_units); const consumed = available < remaining ? available : remaining;
-          const basisAvailable = BigInt(lot.remaining_basis_units);
-          const basis = consumed === available ? basisAvailable : basisAvailable * consumed / available;
-          const proceeds = notionalUnits(consumed.toString(), quote.toString(), Number(row['quantity_scale']));
-          const left = available - consumed; const basisLeft = basisAvailable - basis;
+        const allocations = allocateFifoTaxLots(lots.rows.map((lot)=>({id:lot.id,remainingUnits:lot.remaining_units,remainingBasisUnits:lot.remaining_basis_units})), quantity, quote.toString(), Number(row['quantity_scale']));
+        for (const allocation of allocations) {
           await tx.query(`UPDATE invest_tax_lots SET remaining_units=$4,remaining_basis_units=$5,closed_at=CASE WHEN $4::numeric=0 THEN now() ELSE NULL END
-            WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, lot.id, left.toString(), basisLeft.toString()]);
+            WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, allocation.lotId, allocation.remainingUnits, allocation.remainingBasisUnits]);
           await tx.query(`INSERT INTO invest_tax_lot_events(id,tenant_id,workspace_id,lot_id,fill_id,event_type,quantity_units,basis_units,proceeds_units,realized_gain_units)
-            VALUES($1,$2,$3,$4,$5,'disposed',$6,$7,$8,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, lot.id, fillId, consumed.toString(), basis.toString(), proceeds.toString(), (proceeds-basis).toString()]);
-          remaining -= consumed;
+            VALUES($1,$2,$3,$4,$5,'disposed',$6,$7,$8,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, allocation.lotId, fillId, allocation.consumedUnits, allocation.basisUnits, allocation.proceedsUnits, allocation.realizedGainUnits]);
         }
-        if (remaining !== 0n) throw new Error('PAPER FIFO tax lots do not reconcile to the ledger position');
       }
       await tx.query(`UPDATE invest_orders SET status='submitted' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);
       await this.orderEvent(tx, scope, actorId, input.orderId, 'submitted', 'approved', 'submitted', { environment: 'paper' });
@@ -688,17 +701,18 @@ export class InvestService {
       const navAfter = postCash + grossExposure;
       const riskState = await tx.query<{day_open_nav_units:string;high_water_nav_units:string;daily_loss_units:string;kill_switch:boolean}>(
         `SELECT day_open_nav_units::text,high_water_nav_units::text,daily_loss_units::text,kill_switch FROM invest_portfolio_risk_state
-         WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date FOR UPDATE`,
+         WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date() FOR UPDATE`,
         [scope.tenantId, scope.workspaceId, row['portfolio_id']]);
       const previous = riskState.rows[0];
       const dayOpen = BigInt(previous?.day_open_nav_units ?? navAfter.toString());
       const dailyLoss = [BigInt(previous?.daily_loss_units ?? '0'), dayOpen > navAfter ? dayOpen - navAfter : 0n].reduce((a,b) => a > b ? a : b);
       const autoHalt = dailyLoss >= BigInt(mandateLimits.maxDailyLossUnits);
-      await tx.query(`UPDATE invest_portfolio_risk_state SET high_water_nav_units=GREATEST(high_water_nav_units,$4),daily_loss_units=$5,
-          kill_switch=CASE WHEN $6 THEN true ELSE kill_switch END,
-          kill_reason=CASE WHEN $6 THEN 'Automatic PAPER halt: daily-loss mandate exceeded' ELSE kill_reason END,updated_at=now()
-        WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`,
-        [scope.tenantId, scope.workspaceId, row['portfolio_id'], navAfter.toString(), dailyLoss.toString(), autoHalt]);
+      await tx.query(`INSERT INTO invest_portfolio_risk_state(tenant_id,workspace_id,portfolio_id,risk_date,day_open_nav_units,high_water_nav_units,daily_loss_units,kill_switch,kill_reason)
+        VALUES($1,$2,$3,invest_utc_risk_date(),$4,$5,$6,$7,CASE WHEN $7 THEN 'Automatic PAPER halt: daily-loss mandate exceeded' ELSE NULL END)
+        ON CONFLICT(tenant_id,workspace_id,portfolio_id,risk_date) DO UPDATE SET high_water_nav_units=GREATEST(invest_portfolio_risk_state.high_water_nav_units,EXCLUDED.high_water_nav_units),
+          daily_loss_units=EXCLUDED.daily_loss_units,kill_switch=invest_portfolio_risk_state.kill_switch OR EXCLUDED.kill_switch,
+          kill_reason=CASE WHEN EXCLUDED.kill_switch THEN EXCLUDED.kill_reason ELSE invest_portfolio_risk_state.kill_reason END,updated_at=now()`,
+        [scope.tenantId, scope.workspaceId, row['portfolio_id'], previous?.day_open_nav_units ?? navAfter.toString(), navAfter.toString(), dailyLoss.toString(), autoHalt]);
       const breaches: Array<{kind:string;detail:Record<string,string>}> = [];
       if (currentPositionValue > BigInt(mandateLimits.maxPositionNotionalUnits)) breaches.push({ kind: 'max_position_notional', detail: { value: currentPositionValue.toString(), limit: mandateLimits.maxPositionNotionalUnits } });
       if (navAfter > 0n && currentPositionValue * 10_000n > navAfter * BigInt(mandateLimits.maxConcentrationBps)) breaches.push({ kind: 'position_concentration', detail: { value: currentPositionValue.toString(), nav: navAfter.toString(), limitBps: String(mandateLimits.maxConcentrationBps) } });
