@@ -8,12 +8,11 @@ import {
   type RegistrationResponseJSON,
   type WebAuthnCredential,
 } from '@simplewebauthn/server';
-import { issueAccessToken, verifyAccessToken } from './auth';
+import { isUuid, issueAccessToken, verifyAccessToken } from './auth';
 import { verifyDpopProofForToken } from './dpop';
 import { readCurrentAuthority, withNeonTransaction } from './neon';
 import type { CandidateClaims } from './model';
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i;
 const URL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const encoder = new TextEncoder();
 
@@ -147,9 +146,9 @@ export async function beginPasskeyAuthentication(
     !URL_TOKEN.test(body['pkceChallenge']) ||
     !validRedirect(body['redirectUri']) ||
     typeof body['deviceId'] !== 'string' ||
-    !UUID.test(body['deviceId']) ||
+    !isUuid(body['deviceId']) ||
     typeof body['workspaceId'] !== 'string' ||
-    !UUID.test(body['workspaceId'])
+    !isUuid(body['workspaceId'])
   )
     throw new AuthFlowError('INVALID_AUTH_REQUEST');
   const device = await publicDeviceKey(body['deviceJwk']);
@@ -255,7 +254,7 @@ export async function finishPasskeyRegistration(
   response: unknown,
 ): Promise<{ registered: true }> {
   if (!validWebAuthnConfig(config)) throw new AuthFlowError('AUTH_NOT_CONFIGURED', 503);
-  if (claims.kind !== 'user' || !UUID.test(transactionId) || !URL_TOKEN.test(state))
+  if (claims.kind !== 'user' || !isUuid(transactionId) || !URL_TOKEN.test(state))
     throw new AuthFlowError('INVALID_AUTH_REQUEST');
   if (!response || typeof response !== 'object' || Array.isArray(response))
     throw new AuthFlowError('INVALID_CREDENTIAL');
@@ -329,7 +328,7 @@ export async function finishPasskeyAuthentication(
   response: unknown,
 ): Promise<string> {
   if (!validWebAuthnConfig(config)) throw new AuthFlowError('AUTH_NOT_CONFIGURED', 503);
-  if (!UUID.test(transactionId) || !URL_TOKEN.test(state)) throw new AuthFlowError('INVALID_AUTH_REQUEST');
+  if (!isUuid(transactionId) || !URL_TOKEN.test(state)) throw new AuthFlowError('INVALID_AUTH_REQUEST');
   if (!response || typeof response !== 'object' || Array.isArray(response))
     throw new AuthFlowError('INVALID_CREDENTIAL');
   const credentialResponse = response as AuthenticationResponseJSON;
@@ -455,7 +454,7 @@ export async function exchangeAuthorizationCode(
   config: { privateJwk: string; publicJwk: string; audience: string; issuer: string },
 ): Promise<{ accessToken: string; refreshToken: string; expiresIn: 900; tokenType: 'DPoP' }> {
   if (
-    !UUID.test(input.transactionId) ||
+    !isUuid(input.transactionId) ||
     !URL_TOKEN.test(input.code) ||
     !/^[A-Za-z0-9._~-]{43,128}$/.test(input.verifier)
   )

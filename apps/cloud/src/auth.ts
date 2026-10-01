@@ -2,6 +2,10 @@ import type { CandidateClaims } from './model';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+export function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID.test(value);
+}
+
 export type AuthFailureCode =
   'MISSING_AUTH' | 'MALFORMED_TOKEN' | 'AUTH_NOT_CONFIGURED' | 'INVALID_SIGNATURE' | 'INVALID_CLAIMS';
 
@@ -83,7 +87,7 @@ const isNumericDate = (value: unknown): value is number =>
 
 function optionalUuid(value: unknown): string | undefined | null {
   if (value === undefined) return undefined;
-  return typeof value === 'string' && UUID.test(value) ? value : null;
+  return isUuid(value) ? value : null;
 }
 
 function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClaims | null {
