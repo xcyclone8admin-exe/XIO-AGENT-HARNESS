@@ -11,7 +11,7 @@ import { backtestStrategyIdentity, runMomentumStopTargetBacktest, type OhlcBar, 
 import { calculateTimeWeightedStatement, type PerformanceMark, type PerformanceStatement } from './performance';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
-import { INVEST_SIGNAL_PROTOCOL, type VerifiedInvestSignalEnvelope } from './invest-signals';
+import { INVEST_SIGNAL_PROTOCOL, investSignalEnvelopeDigest, INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM, INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION, type VerifiedInvestSignalEnvelope } from './invest-signals';
 import { validateScheduledCustodyContext, type PersistedCustodyStatementInbox, type PersistedCustodyStatement, type TrustedFlowStepContext } from './scheduled-reconciliation';
 
 type Call = { readonly principal: Principal; readonly workspaceId: string };
@@ -98,13 +98,18 @@ export class InvestService {
   async consumeCloudInvestSignal(scope:Scope,envelope:VerifiedInvestSignalEnvelope,claim:{leaseId:string;fence:number;expiresAt:string},actorId:string):Promise<{decisionId:string}>{
     const trustedScope:InvestScope={...scope,hlc:this.clock.now()};
     validateVerifiedInvestSignal(trustedScope,envelope,claim);
+    if(envelope.envelopeDigestVersion!==INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION||envelope.envelopeDigestAlgorithm!==INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM||
+       !/^[0-9a-f]{64}$/.test(envelope.envelopeDigest)||await investSignalEnvelopeDigest(envelope)!==envelope.envelopeDigest)
+      throw new Error('INVEST_SIGNAL_ENVELOPE_DIGEST_INVALID');
     if(decimalQuantityToUnits(envelope.quantity,12)<=0n) throw new Error('INVEST_SIGNAL_QUANTITY_INVALID');
     if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actorId)) throw new Error('INVEST_SIGNAL_ACTOR_INVALID');
-    const existing=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;claim_lease_id:string;claim_fence:number}>(
-      `SELECT id,payload_digest,claim_lease_id,claim_fence FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
+    const existing=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;envelope_digest_version:string;envelope_digest_algorithm:string;envelope_digest:string}>(
+      `SELECT id,payload_digest,envelope_digest_version,envelope_digest_algorithm,envelope_digest FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
     if(existing){
       if(existing.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+      if(existing.envelope_digest_version!==envelope.envelopeDigestVersion||existing.envelope_digest_algorithm!==envelope.envelopeDigestAlgorithm||existing.envelope_digest!==envelope.envelopeDigest)
+        throw new Error('INVEST_SIGNAL_ENVELOPE_DIGEST_CONFLICT');
       await this.persistSignalClaim(trustedScope,existing.id,envelope,claim);
       return {decisionId:existing.id};
     }
@@ -124,16 +129,18 @@ export class InvestService {
       instrumentMatches:instruments.length,quantityUnits:units?.toString()??null,
       decision:precisionRejected?'Rejected: quantity exceeds the matched instrument precision.':'Requires normal Invest risk/mandate evaluation and human PAPER approval; this signal does not authorize an order.'};
     await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query(
-      `INSERT INTO invest_signal_decisions(id,tenant_id,workspace_id,source_id,event_id,signal_id,payload_digest,algorithm_id,symbol,side,signal_quantity,
+      `INSERT INTO invest_signal_decisions(id,tenant_id,workspace_id,source_id,event_id,signal_id,payload_digest,envelope_digest_version,envelope_digest_algorithm,envelope_digest,algorithm_id,symbol,side,signal_quantity,
         decision_status,claim_lease_id,claim_fence,lease_expires_at,instrument_id,detail,decided_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$18,$12,$13,$14,$15,$16::jsonb,$17)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21)
        ON CONFLICT(tenant_id,workspace_id,source_id,event_id) DO NOTHING`,
-      [decisionId,trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId,envelope.signalId,envelope.payloadDigest,envelope.algorithmId,
-       envelope.symbol,envelope.side,envelope.quantity,claim.leaseId,claim.fence,claim.expiresAt,candidateInstrument?.id??null,JSON.stringify(detail),actorId,decisionStatus]));
-    const persisted=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;claim_lease_id:string;claim_fence:number}>(
-      `SELECT id,payload_digest,claim_lease_id,claim_fence FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
+      [decisionId,trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId,envelope.signalId,envelope.payloadDigest,envelope.envelopeDigestVersion,envelope.envelopeDigestAlgorithm,envelope.envelopeDigest,envelope.algorithmId,
+       envelope.symbol,envelope.side,envelope.quantity,decisionStatus,claim.leaseId,claim.fence,claim.expiresAt,candidateInstrument?.id??null,JSON.stringify(detail),actorId]));
+    const persisted=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;envelope_digest_version:string;envelope_digest_algorithm:string;envelope_digest:string}>(
+      `SELECT id,payload_digest,envelope_digest_version,envelope_digest_algorithm,envelope_digest FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
     if(!persisted||persisted.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+    if(persisted.envelope_digest_version!==envelope.envelopeDigestVersion||persisted.envelope_digest_algorithm!==envelope.envelopeDigestAlgorithm||persisted.envelope_digest!==envelope.envelopeDigest)
+      throw new Error('INVEST_SIGNAL_ENVELOPE_DIGEST_CONFLICT');
     await this.persistSignalClaim(trustedScope,persisted.id,envelope,claim);
     return {decisionId:persisted.id};
   }
@@ -1108,8 +1115,8 @@ function validateVerifiedInvestSignal(scope:InvestScope,signal:VerifiedInvestSig
   if(!signal||typeof signal!=='object'||!signal.verification||typeof signal.verification!=='object'||!lease||typeof lease!=='object')
     throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
   const exactKeys=(value:object,keys:string[])=>Object.keys(value).sort().join(',')===[...keys].sort().join(',');
-  if(!exactKeys(signal,['protocol','eventId','sourceId','tenantId','workspaceId','receivedAt','occurredAt','expiresAt','algorithmId','signalId','symbol','side','quantity','payloadDigest','verification'])||
-     !exactKeys(signal.verification,['signature','keyId'])||!exactKeys(lease,['leaseId','fence','expiresAt'])) throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
+  if(!exactKeys(signal,['protocol','eventId','sourceId','tenantId','workspaceId','receivedAt','occurredAt','expiresAt','algorithmId','signalId','symbol','side','quantity','payloadDigest','envelopeDigestVersion','envelopeDigestAlgorithm','envelopeDigest','verification'])||
+     !exactKeys(signal.verification,['signature','keyId','signingAlg'])||!exactKeys(lease,['leaseId','fence','expiresAt'])) throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
   const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const event=/^[A-Za-z0-9_.:-]{1,128}$/;
   const digest=/^[0-9a-f]{64}$/;
@@ -1119,6 +1126,7 @@ function validateVerifiedInvestSignal(scope:InvestScope,signal:VerifiedInvestSig
   if(signal.protocol!==INVEST_SIGNAL_PROTOCOL||!uuid.test(signal.sourceId)||!uuid.test(signal.signalId)||!uuid.test(signal.verification.keyId)||
      signal.tenantId!==scope.tenantId||signal.workspaceId!==scope.workspaceId||!event.test(signal.eventId)||!digest.test(signal.payloadDigest)||
      signal.verification.signature!=='verified'||
+     !['ES256','EdDSA'].includes(signal.verification.signingAlg)||
      !/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(signal.algorithmId)||!/^[A-Z0-9][A-Z0-9._/-]{0,31}$/.test(signal.symbol)||
      !['buy','sell'].includes(signal.side)||!/^(?:0|[1-9]\d{0,17})(?:\.\d{1,12})?$/.test(signal.quantity)||
      !timestamp.test(signal.receivedAt)||!timestamp.test(signal.occurredAt)||!timestamp.test(signal.expiresAt)||!timestamp.test(lease.expiresAt)||
