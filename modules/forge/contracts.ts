@@ -69,7 +69,7 @@ export const SchedulerConfig = z.object({ maxConcurrency: z.number().int().min(1
 export const ApprovalRecord = z.object({ id: UUID, epicId: UUID, workspaceId: UUID, scopeHash: z.string().length(64), status: ApprovalStatus, approvedBy: UUID.nullable(), createdAt: z.iso.datetime({ offset: true }), expiresAt: z.iso.datetime({ offset: true }) });
 export const ApprovalRequestCreate = z.object({ epicId: UUID });
 export const ApprovalDecisionCreate = z.object({ approvalId: UUID, decision: z.enum(['approved', 'rejected']), reason: z.string().min(1).max(4000) });
-export const ScheduleRequest = z.object({ epicId: UUID, approval: ApprovalRecord, config: SchedulerConfig, tickets: z.array(HierarchyNode), spentUsd: z.number().nonnegative(), killSwitchEngaged: z.boolean(), reservedTicketIds: z.array(UUID).default([]) });
+export const ScheduleRequest = z.object({ epicId: UUID, approval: ApprovalRecord, config: SchedulerConfig, tickets: z.array(HierarchyNode), spentUsd: z.number().nonnegative(), killSwitchEngaged: z.boolean(), reservedTicketIds: z.array(UUID).default([]), activeResourceLocks: z.array(z.string().min(1).max(256)).default([]) });
 export const ScheduleCommand = z.object({ epicId: UUID, approvalId: UUID, config: SchedulerConfig, spentUsd: z.number().nonnegative() });
 export const ScheduleResult = z.object({ runId: UUID, state: z.enum(['queued', 'stopped', 'blocked']), runnableTicketIds: z.array(UUID), blockedTicketIds: z.array(UUID), reason: z.string().nullable(), externalExecution: z.literal(false) });
 

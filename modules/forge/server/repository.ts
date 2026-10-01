@@ -254,20 +254,44 @@ export class ForgeRepository {
     const row = rows[0];
     if (!row || row.decision !== 'approved' || !row.decided_by || Date.parse(timestamp(row.expires_at)) <= Date.now()) throw new Error('FORGE_APPROVED_DURABLE_APPROVAL_REQUIRED');
     const approval = ApprovalRecord.parse({ id: row.id, epicId: row.epic_id, workspaceId: row.workspace_id, scopeHash: row.scope_hash, status: 'approved', approvedBy: row.decided_by, createdAt: timestamp(row.created_at), expiresAt: timestamp(row.expires_at) });
-    const tickets = (await this.nodesForProject(actor, row.project_id)).filter((ticket) => !ticket.archivedAt);
-    const reservations = await this.store.query<Record<string, unknown> & { runnable_ticket_ids: unknown }>(this.scope(actor), "SELECT runnable_ticket_ids FROM forge_schedules WHERE tenant_id=$1 AND workspace_id=$2 AND state='queued' AND epic_id=$3 ORDER BY created_at,id", [actor.tenantId, actor.workspaceId, row.epic_id]);
+    const projectNodes = (await this.nodesForProject(actor, row.project_id)).filter((ticket) => !ticket.archivedAt);
+    const nodeById = new Map(projectNodes.map((ticket) => [ticket.id, ticket]));
+    const tickets = projectNodes.filter((ticket) => {
+      let current: typeof ticket | undefined = ticket;
+      while (current) {
+        if (current.id === row.epic_id) return true;
+        current = current.parentId ? nodeById.get(current.parentId) : undefined;
+      }
+      return false;
+    });
+    const reservations = await this.store.query<Record<string, unknown> & { runnable_ticket_ids: unknown }>(this.scope(actor), "SELECT runnable_ticket_ids FROM forge_schedules WHERE tenant_id=$1 AND workspace_id=$2 AND state='queued' ORDER BY created_at,id", [actor.tenantId, actor.workspaceId]);
     const reservedTicketIds = [...new Set(reservations.rows.flatMap((item) => Array.isArray(item.runnable_ticket_ids) ? item.runnable_ticket_ids.filter((id): id is string => typeof id === 'string') : []))];
-    return { approval, tickets, reservedTicketIds };
+    const locks = await this.store.query<Record<string, unknown> & { resource_key: string }>(this.scope(actor), "SELECT resource_key FROM forge_resource_lock_leases WHERE tenant_id=$1 AND workspace_id=$2 AND status='active' ORDER BY resource_key", [actor.tenantId, actor.workspaceId]);
+    return { approval, tickets, reservedTicketIds, activeResourceLocks: locks.rows.map((item) => item.resource_key) };
   }
 
   async persistSchedule(actor: ForgeActor, request: { epicId: string; approval: { id: string }; config: { maxConcurrency: number; maxBudgetUsd: number; resourceLocks: string[] }; spentUsd: number }, result: { runId: string; state: 'queued' | 'stopped' | 'blocked'; runnableTicketIds: string[]; blockedTicketIds: string[]; reason: string | null }) {
+    let persisted = result;
     await this.store.query(this.scope(actor), 'INSERT INTO forge_schedules(id,tenant_id,workspace_id,epic_id,approval_id,state,max_concurrency,max_budget_usd,spent_usd,resource_locks,runnable_ticket_ids,blocked_ticket_ids,reason,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13,$14)', [result.runId, actor.tenantId, actor.workspaceId, request.epicId, request.approval.id, result.state, request.config.maxConcurrency, request.config.maxBudgetUsd, request.spentUsd, json(request.config.resourceLocks), json(result.runnableTicketIds), json(result.blockedTicketIds), result.reason, actor.id]);
-    const queued = result.state === 'queued' ? result.runnableTicketIds : [];
-    const blocked = result.state === 'stopped' ? result.blockedTicketIds.map((ticketId) => ({ ticketId, state: 'stopped' as const })) : result.blockedTicketIds.map((ticketId) => ({ ticketId, state: 'blocked' as const }));
-    for (const item of [...queued.map((ticketId) => ({ ticketId, state: 'queued' as const })), ...blocked]) {
-      await this.store.query(this.scope(actor), 'INSERT INTO forge_runs(id,tenant_id,workspace_id,schedule_id,ticket_id,state,external_execution,detail,created_by) VALUES($1,$2,$3,$4,$5,$6,false,$7::jsonb,$8)', [uuidv7(), actor.tenantId, actor.workspaceId, result.runId, item.ticketId, item.state, json({ reason: result.reason }), actor.id]);
+    if (result.state === 'queued') {
+      const lockKeys = [...new Set(request.config.resourceLocks)];
+      let conflict = false;
+      for (const key of lockKeys) {
+        const inserted = await this.store.query(this.scope(actor), "INSERT INTO forge_resource_lock_leases(id,tenant_id,workspace_id,resource_key,owner_schedule_id,status,created_by) VALUES($1,$2,$3,$4,$5,'active',$6) ON CONFLICT (tenant_id,workspace_id,resource_key) WHERE status='active' DO NOTHING RETURNING id", [uuidv7(), actor.tenantId, actor.workspaceId, key, result.runId, actor.id]);
+        if (!inserted.rows.length) { conflict = true; break; }
+      }
+      if (conflict) {
+        await this.store.query(this.scope(actor), "UPDATE forge_resource_lock_leases SET status='released',released_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND owner_schedule_id=$3 AND status='active'", [actor.tenantId, actor.workspaceId, result.runId]);
+        persisted = { ...result, state: 'blocked', runnableTicketIds: [], blockedTicketIds: [...new Set([...result.blockedTicketIds, ...result.runnableTicketIds])], reason: 'RESOURCE_LOCK_CONFLICT' };
+      }
     }
-    return this.schedule(actor, result.runId);
+    if (persisted !== result) await this.store.query(this.scope(actor), 'UPDATE forge_schedules SET state=$4,runnable_ticket_ids=$5::jsonb,blocked_ticket_ids=$6::jsonb,reason=$7 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, persisted.runId, persisted.state, json(persisted.runnableTicketIds), json(persisted.blockedTicketIds), persisted.reason]);
+    const queued = persisted.state === 'queued' ? persisted.runnableTicketIds : [];
+    const blocked = persisted.state === 'stopped' ? persisted.blockedTicketIds.map((ticketId) => ({ ticketId, state: 'stopped' as const })) : persisted.blockedTicketIds.map((ticketId) => ({ ticketId, state: 'blocked' as const }));
+    for (const item of [...queued.map((ticketId) => ({ ticketId, state: 'queued' as const })), ...blocked]) {
+      await this.store.query(this.scope(actor), 'INSERT INTO forge_runs(id,tenant_id,workspace_id,schedule_id,ticket_id,state,external_execution,detail,created_by) VALUES($1,$2,$3,$4,$5,$6,false,$7::jsonb,$8)', [uuidv7(), actor.tenantId, actor.workspaceId, persisted.runId, item.ticketId, item.state, json({ reason: persisted.reason }), actor.id]);
+    }
+    return this.schedule(actor, persisted.runId);
   }
   async schedules(actor: ForgeActor) {
     const { rows } = await this.store.query<Record<string, unknown> & { id: string; epic_id: string; approval_id: string; state: string; max_concurrency: number; max_budget_usd: number | string; spent_usd: number | string; resource_locks: unknown; runnable_ticket_ids: unknown; blocked_ticket_ids: unknown; reason: string | null; created_at: string }>(this.scope(actor), 'SELECT id,epic_id,approval_id,state,max_concurrency,max_budget_usd,spent_usd,resource_locks,runnable_ticket_ids,blocked_ticket_ids,reason,created_at FROM forge_schedules ORDER BY created_at DESC');
@@ -286,6 +310,7 @@ export class ForgeRepository {
     const current = await this.schedule(actor, scheduleId);
     if (current.state !== 'queued') throw new Error('FORGE_SCHEDULE_NOT_QUEUED');
     await this.store.query(this.scope(actor), "UPDATE forge_schedules SET state='canceled' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3", [actor.tenantId, actor.workspaceId, scheduleId]);
+    await this.store.query(this.scope(actor), "UPDATE forge_resource_lock_leases SET status='released',released_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND owner_schedule_id=$3 AND status='active'", [actor.tenantId, actor.workspaceId, scheduleId]);
     for (const ticketId of current.runnableTicketIds) await this.store.query(this.scope(actor), 'INSERT INTO forge_runs(id,tenant_id,workspace_id,schedule_id,ticket_id,state,external_execution,detail,created_by) VALUES($1,$2,$3,$4,$5,\'canceled\',false,$6::jsonb,$7)', [uuidv7(), actor.tenantId, actor.workspaceId, scheduleId, ticketId, json({ reason }), actor.id]);
     return this.schedule(actor, scheduleId);
   }
