@@ -92,6 +92,27 @@ describe('growth service', () => {
     ).rejects.toThrow();
   });
 
+  test('bus-verified approvalId is persisted in the enrollment record', async () => {
+    const ws = await makeWorkspace('G-G');
+    const contact = await service.createContact(ws, ws.userId, 'Carol', {});
+    const approvalId = uuidv7();
+
+    const [seq] = await db.query<{ id: string }>(
+      `INSERT INTO growth_sequences(id,tenant_id,workspace_id,name,created_by)
+       VALUES ($1,$2,$3,'Seq-approval',$4) RETURNING id`,
+      [uuidv7(), ws.tenantId, ws.workspaceId, ws.userId],
+    ).then((r) => r.rows);
+    if (!seq) throw new Error('seq insert failed');
+
+    await service.enrollContact(ws, ws.userId, seq.id, contact.id, approvalId);
+
+    const [enrollment] = await db.query<{ send_approval_id: string | null }>(
+      'SELECT send_approval_id FROM growth_sequence_enrollments WHERE workspace_id=$1',
+      [ws.workspaceId],
+    ).then((r) => r.rows);
+    expect(enrollment?.send_approval_id).toBe(approvalId);
+  });
+
   test('send capability requires approval policy on sequence', async () => {
     const ws = await makeWorkspace('G-E');
     const [seq] = await db.query<{ send_approval_policy: string | null }>(

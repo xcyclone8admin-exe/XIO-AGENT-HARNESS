@@ -46,25 +46,32 @@ export function makeGrowthServer(store: LocalScopedStore): ModuleServer {
         const { status } = c.sequences.input.parse(i);
         return svc.sequences(scope(call), status);
       });
-      // enroll is consequential; approval verification handled by bus before this runs.
+      // enroll is consequential; bus verifies the approval before this handler runs.
+      // call.approvalId is the bus-verified token — bind it to the enrollment record.
       bus.register(manifest, c.enroll, async (i, call) => {
         const { sequenceId, contactId } = c.enroll.input.parse(i);
-        await svc.enrollContact(scope(call), call.principal.id, sequenceId, contactId);
-        return { queued: true, approvalId: null };
+        await svc.enrollContact(scope(call), call.principal.id, sequenceId, contactId, call.approvalId);
+        return { queued: true, approvalId: call.approvalId ?? null };
       });
       bus.register(manifest, c.funnels, (_i, call) => svc.funnels(scope(call)));
       bus.register(manifest, c.contentPosts, (i, call) => {
         const { status } = c.contentPosts.input.parse(i);
         return svc.contentPosts(scope(call), status);
       });
-      // publishPost is consequential; returns queued:true after approval.
-      bus.register(manifest, c.publishPost, async () => ({ queued: true, approvalId: null }));
+      // publishPost requires an external publisher connector that is not yet available.
+      // Fail closed: do not fabricate success. The approval is not consumed for a preflight miss.
+      bus.register(manifest, c.publishPost, async () => {
+        throw new Error('publisher_unavailable: content publishing connector not connected');
+      });
       bus.register(manifest, c.adCampaigns, (i, call) => {
         const { status } = c.adCampaigns.input.parse(i);
         return svc.adCampaigns(scope(call), status);
       });
-      // spendAd is consequential; returns queued:true after approval.
-      bus.register(manifest, c.spendAd, async () => ({ queued: true, approvalId: null }));
+      // spendAd requires an external ad platform connector that is not yet available.
+      // Fail closed: do not fabricate success. The approval is not consumed for a preflight miss.
+      bus.register(manifest, c.spendAd, async () => {
+        throw new Error('ad_connector_unavailable: ad platform connector not connected');
+      });
       bus.register(manifest, c.brandDeals, (i, call) => {
         const { status } = c.brandDeals.input.parse(i);
         return svc.brandDeals(scope(call), status);
