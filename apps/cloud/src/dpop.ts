@@ -91,22 +91,30 @@ export async function verifyDpopProofForToken(
     !payload ||
     !signature ||
     header.typ !== 'dpop+jwt' ||
-    header.alg !== 'EdDSA' ||
+    (header.alg !== 'EdDSA' && header.alg !== 'ES256') ||
     !header.jwk ||
     typeof header.jwk !== 'object'
   )
     return null;
   const jwk = header.jwk as Record<string, unknown>;
-  if (
-    jwk['kty'] !== 'OKP' ||
-    jwk['crv'] !== 'Ed25519' ||
-    typeof jwk['x'] !== 'string' ||
-    'd' in jwk ||
-    'kid' in jwk
-  )
-    return null;
-  const x = jwk['x'];
-  const canonicalJwk = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x });
+  let canonicalJwk: string;
+  let publicJwk: JsonWebKey;
+  let algorithm: 'EdDSA' | 'ES256';
+  if (jwk['kty'] === 'OKP' && jwk['crv'] === 'Ed25519' && typeof jwk['x'] === 'string' &&
+      /^[A-Za-z0-9_-]{43}$/.test(jwk['x']) && Object.keys(jwk).length === 3 &&
+      ['kty', 'crv', 'x'].every((key) => key in jwk) && header.alg === 'EdDSA') {
+    publicJwk = { kty: 'OKP', crv: 'Ed25519', x: jwk['x'] };
+    canonicalJwk = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk['x'] });
+    algorithm = 'EdDSA';
+  } else if (jwk['kty'] === 'EC' && jwk['crv'] === 'P-256' && typeof jwk['x'] === 'string' &&
+      typeof jwk['y'] === 'string' && /^[A-Za-z0-9_-]{43}$/.test(jwk['x']) &&
+      /^[A-Za-z0-9_-]{43}$/.test(jwk['y']) && Object.keys(jwk).length === 4 &&
+      ['kty', 'crv', 'x', 'y'].every((key) => key in jwk) && header.alg === 'ES256') {
+    publicJwk = { kty: 'EC', crv: 'P-256', x: jwk['x'], y: jwk['y'] };
+    canonicalJwk = JSON.stringify({ crv: 'P-256', kty: 'EC', x: jwk['x'], y: jwk['y'] });
+    algorithm = 'ES256';
+  } else return null;
+  if (signature.byteLength !== 64) return null;
   const thumbprint = encodeBase64Url(await sha256(utf8.encode(canonicalJwk)));
   if (!equal(thumbprint, expectedThumbprint)) return null;
   if (
@@ -129,18 +137,12 @@ export async function verifyDpopProofForToken(
   const tokenHash = encodeBase64Url(await sha256(utf8.encode(boundToken)));
   if (!equal(String(payload.ath ?? ''), tokenHash)) return null;
   try {
-    const publicKey = await crypto.subtle.importKey(
-      'jwk',
-      { kty: 'OKP', crv: 'Ed25519', x },
-      { name: 'Ed25519' },
-      false,
-      ['verify'],
-    );
+    const publicKey = algorithm === 'EdDSA'
+      ? await crypto.subtle.importKey('jwk', publicJwk, { name: 'Ed25519' }, false, ['verify'])
+      : await crypto.subtle.importKey('jwk', publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
     const valid = await crypto.subtle.verify(
-      'Ed25519',
-      publicKey,
-      new Uint8Array(signature),
-      utf8.encode(`${parts[0]}.${parts[1]}`),
+      algorithm === 'EdDSA' ? 'Ed25519' : { name: 'ECDSA', hash: 'SHA-256' },
+      publicKey, new Uint8Array(signature), utf8.encode(`${parts[0]}.${parts[1]}`),
     );
     if (!valid) return null;
   } catch {

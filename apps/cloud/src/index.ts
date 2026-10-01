@@ -91,7 +91,7 @@ export interface Env {
 }
 
 const app = new Hono<{ Bindings: Env }>();
-const MAX_AUTH_BODY_BYTES = 512 * 1024;
+const MAX_AUTH_BODY_BYTES = 48 * 1024;
 
 function webAuthnConfig(env: Env): WebAuthnConfig | undefined {
   if (!env.AUTH_ORIGIN || !env.AUTH_RP_ID || !env.AUTH_RP_NAME) return undefined;

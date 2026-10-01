@@ -43,7 +43,7 @@ const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64u
 async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
   let pair = deviceKeyPairs.get(deviceId);
   if (!pair) {
-    pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     deviceKeyPairs.set(deviceId, pair);
   }
   return pair;
@@ -51,7 +51,7 @@ async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
 
 async function thumbprint(deviceId: string): Promise<string> {
   const jwk = await crypto.subtle.exportKey('jwk', (await deviceKey(deviceId)).publicKey);
-  const canonical = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk.x });
+  const canonical = JSON.stringify({ crv: 'P-256', kty: 'EC', x: jwk.x, y: jwk.y });
   return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))));
 }
 
@@ -61,7 +61,7 @@ const hlc = (ms: number, counter = 0) =>
 async function mint(sub: string, over: Record<string, unknown> = {}, key = privateKey): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const deviceId = typeof over['device_id'] === 'string' ? over['device_id'] : DEVICE_A;
-  const head = b64(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' }));
+  const head = b64(JSON.stringify({ alg: 'ES256', typ: 'JWT' }));
   const body = b64(
     JSON.stringify({
       sub,
@@ -80,7 +80,7 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
     }),
   );
   const sig = new Uint8Array(
-    await crypto.subtle.sign('Ed25519', key, new TextEncoder().encode(`${head}.${body}`)),
+    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(`${head}.${body}`)),
   );
   return `${head}.${body}.${b64(sig)}`;
 }
@@ -101,7 +101,7 @@ async function dpop(token: string, method: string, route: string): Promise<strin
   url.search = '';
   url.hash = '';
   const header = b64(
-    JSON.stringify({ typ: 'dpop+jwt', alg: 'EdDSA', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x } }),
+    JSON.stringify({ typ: 'dpop+jwt', alg: 'ES256', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } }),
   );
   const ath = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
   const body = b64(
@@ -114,7 +114,7 @@ async function dpop(token: string, method: string, route: string): Promise<strin
     }),
   );
   const signature = new Uint8Array(
-    await crypto.subtle.sign('Ed25519', pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
+    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
   );
   return `${header}.${body}.${b64(signature)}`;
 }
@@ -255,7 +255,7 @@ beforeAll(async () => {
     shell: true,
     stdio: 'pipe',
   });
-  const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   privateKey = pair.privateKey;
   const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', pair.publicKey));
   mf = new Miniflare(
@@ -408,7 +408,7 @@ describe('auth on the real Worker', () => {
       expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
     }
     expect(
-      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(600_000) }),
+      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(60_000) }),
     ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
   });
   it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
@@ -426,7 +426,7 @@ describe('auth on the real Worker', () => {
   it('fails closed without or with bad credentials', async () => {
     expect((await call('GET', '/v1/sync/pull', null)).status).toBe(401);
     expect((await call('GET', '/v1/sync/pull', 'a.b.c')).status).toBe(401);
-    const other = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    const other = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     const forged = await mint(U1, {}, other.privateKey);
     expect(await call('GET', '/v1/sync/pull', forged)).toMatchObject({
       status: 401,
@@ -818,7 +818,9 @@ describe('development Worker configuration without R2', () => {
     expect(devConfig).toContain('No-R2 development deployment is supported');
 
     const original = mf;
-    const signingJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', privateKey));
+    const exportedSigningJwk = await crypto.subtle.exportKey('jwk', privateKey);
+    const signingJwk = JSON.stringify({ kty: exportedSigningJwk.kty, crv: exportedSigningJwk.crv,
+      x: exportedSigningJwk.x, y: exportedSigningJwk.y });
     const noR2 = new Miniflare(
       convertV4MiniflareOptions({
         modules: true,

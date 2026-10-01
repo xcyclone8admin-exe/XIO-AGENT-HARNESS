@@ -46,6 +46,31 @@ describe('device-bound access token issuance', () => {
     expect((payload.exp - payload.iat) * 1000).toBe(900_000);
   });
 
+  it('issues an ES256 JWT with a 64-byte JOSE signature and verifies the matching P-256 public JWK', async () => {
+    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+    const publicJwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+    const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+    const token = await issueAccessToken({
+      principalId: USER, kind: 'user', tenantId: TENANT, workspaceIds: [WORKSPACE],
+      activeWorkspaceId: WORKSPACE, autonomy: 0, deviceId: DEVICE,
+      sessionFamilyId: '55555555-5555-4555-8555-555555555555', deviceThumbprint: thumbprint,
+    }, { privateJwk: JSON.stringify({ ...privateJwk, kid: 'cloud-signing-p256', alg: 'ES256', use: 'sig' }),
+      audience: 'xyra-cloud', issuer: 'xyra-auth' });
+    const [header, , signature] = token.split('.');
+    expect(JSON.parse(Buffer.from(header ?? '', 'base64url').toString('utf8'))).toMatchObject({ alg: 'ES256', kid: 'cloud-signing-p256' });
+    expect(Buffer.from(signature ?? '', 'base64url')).toHaveLength(64);
+    const result = await verifyAccessToken(new Request('https://cloud.test/', {
+      headers: { authorization: `Bearer ${token}` },
+    }), { verificationJwk: JSON.stringify({ ...publicJwk, kid: 'cloud-signing-p256', alg: 'ES256', use: 'sig' }),
+      audience: 'xyra-cloud', issuer: 'xyra-auth' });
+    expect(result.ok).toBe(true);
+    const mismatched = await verifyAccessToken(new Request('https://cloud.test/', {
+      headers: { authorization: `Bearer ${token}` },
+    }), { verificationJwk: JSON.stringify({ ...publicJwk, kid: 'different-key', alg: 'ES256', use: 'sig' }),
+      audience: 'xyra-cloud', issuer: 'xyra-auth' });
+    expect(mismatched).toEqual({ ok: false, code: 'AUTH_NOT_CONFIGURED' });
+  });
+
   it('refuses malformed scopes and incomplete agent delegation before signing', async () => {
     const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
     const config = {
