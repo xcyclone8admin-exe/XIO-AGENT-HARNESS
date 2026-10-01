@@ -912,6 +912,15 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       .toMatchObject({ status: 400, json: { code: 'INVALID_ERASURE_REQUEST' } });
     expect(await call('POST', '/v1/erasures', token, request))
       .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, token))
+      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    expect(await call('POST', `/v1/erasures/${uuid(9101)}/claim-local-purge`, token,
+      { protocolVersion: 'cloud-erasure-v1', attemptId: uuid(9102), reservationId: uuid(9105) }))
+      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    await seed(U2, { role: 'viewer' });
+    const viewer = await mint(U2);
+    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, viewer))
+      .toMatchObject({ status: 403, json: { code: 'PERMISSION_DENIED' } });
   });
 
   it('CLD-R-001 rejects a lease body that tries to replace verified claims', async () => {

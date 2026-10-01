@@ -1,6 +1,6 @@
 import { SERVER_STAMPED_FIELDS, type ColumnSpec, type ModuleManifest } from '@xyra/contracts';
 import coreManifest from '@xyra/mod-core/manifest';
-import brainManifest from '../../../modules/brain/manifest';
+import brainManifest from '@xyra/mod-brain/manifest';
 import opsManifest from '@xyra/mod-ops/manifest';
 import swarmManifest from '@xyra/mod-swarm/manifest';
 
