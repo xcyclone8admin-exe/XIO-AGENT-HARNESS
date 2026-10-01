@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { afterAll, beforeAll, expect, test, vi } from 'vitest';
 import type { PGlite } from '@electric-sql/pglite';
 import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole, type GrantedTable } from '@xyra/db';
@@ -12,6 +13,9 @@ const tenantId = '019a0000-0000-7000-8000-000000000501';
 const workspaceId = '019a0000-0000-7000-8000-000000000502';
 const userId = '019a0000-0000-7000-8000-000000000503';
 const secondUserId = '019a0000-0000-7000-8000-000000000504';
+const hashStatement = (value: {portfolioId:string;sourceName:string;sourceRef:string;statementDate:string;cashUnits:string;positions:Array<{symbol:string;units:string}>}) =>
+  createHash('sha256').update(JSON.stringify({portfolioId:value.portfolioId,source:value.sourceName,ref:value.sourceRef,statementDate:value.statementDate,cashUnits:value.cashUnits,
+    positions:value.positions.map((position)=>({symbol:position.symbol.trim().toUpperCase(),units:position.units})).sort((a,b)=>a.symbol.localeCompare(b.symbol))})).digest('hex');
 
 function load(directory: URL, moduleId: string) {
   return readdirSync(directory).filter((name) => name.endsWith('.sql')).sort()
@@ -131,6 +135,19 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
        ON e.tenant_id=l.tenant_id AND e.workspace_id=l.workspace_id AND e.lot_id=l.id
        WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 GROUP BY l.id`, [tenantId, workspaceId, portfolio.id]);
   expect(lots.rows[0]).toEqual({ remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' });
+  const matchedInput = { portfolioId:portfolio.id,sourceName:'Fixture custodian',sourceRef:'fixture://statement/matched',statementDate:'2026-09-30',cashUnits:'100000',positions:[] as Array<{symbol:string;units:string}> };
+  await expect(service.reconcileStatement(scope, userCall(userId), { ...matchedInput, statementHash:'0'.repeat(64) })).rejects.toThrow(/content hash/);
+  const matched = await service.reconcileStatement(scope, userCall(userId), { ...matchedInput, statementHash:hashStatement(matchedInput) });
+  expect(matched).toMatchObject({status:'matched',discrepancyCount:0,idempotent:false});
+  const agentInput={...matchedInput,sourceRef:'fixture://statement/agent'};
+  await expect(service.reconcileStatement(scope, agentCall, { ...agentInput,statementHash:hashStatement(agentInput) })).rejects.toThrow(/direct owner or admin/);
+  await expect(service.reconcileStatement(scope, userCall(userId), { ...matchedInput,statementHash:hashStatement(matchedInput) }))
+    .resolves.toMatchObject({runId:matched.runId,status:'matched',idempotent:true});
+  const mismatchInput={portfolioId:portfolio.id,sourceName:'Fixture custodian',sourceRef:'fixture://statement/mismatch',statementDate:'2026-09-30',cashUnits:'99000',positions:[{symbol:'UNKNOWN',units:'20'}]};
+  const mismatched = await service.reconcileStatement(scope, userCall(userId), { ...mismatchInput,statementHash:hashStatement(mismatchInput) });
+  expect(mismatched).toMatchObject({status:'needs_review',discrepancyCount:2});
+  const diffs = await db.query<{kind:string;expected_units:string;observed_units:string;owner_id:string}>(`SELECT kind,expected_units::text,observed_units::text,owner_id FROM invest_reconciliation_discrepancies WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 ORDER BY kind`, [tenantId,workspaceId,mismatched.runId]);
+  expect(diffs.rows).toEqual([{kind:'cash_mismatch',expected_units:'100000',observed_units:'99000',owner_id:userId},{kind:'unknown_position',expected_units:'0',observed_units:'20',owner_id:userId}]);
 });
 
 test('a failing fill-event insert rolls back fill and ledger posting together', async () => {
