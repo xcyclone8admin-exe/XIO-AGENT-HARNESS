@@ -97,4 +97,21 @@ describe('command service', () => {
     ).rejects.toThrow();
     await expect(db.query('DELETE FROM command_chat_messages WHERE id=$1', [message.id])).rejects.toThrow();
   });
+
+  test('doctor_checks is append-only — update and delete are rejected', async () => {
+    const workspace = await makeWorkspace('F');
+    const [check] = await db.query<{ id: string }>(
+      `INSERT INTO command_doctor_checks(id,tenant_id,workspace_id,check_id,status,detail,created_by)
+       VALUES ($1,$2,$3,'db.connect','healthy','ok',$4) RETURNING id`,
+      [uuidv7(), workspace.tenantId, workspace.workspaceId, workspace.userId],
+    ).then((r) => r.rows);
+    if (!check) throw new Error('doctor check insert failed');
+
+    await expect(
+      db.query('UPDATE command_doctor_checks SET status=$1 WHERE id=$2', ['degraded', check.id]),
+    ).rejects.toThrow();
+    await expect(
+      db.query('DELETE FROM command_doctor_checks WHERE id=$1', [check.id]),
+    ).rejects.toThrow();
+  });
 });

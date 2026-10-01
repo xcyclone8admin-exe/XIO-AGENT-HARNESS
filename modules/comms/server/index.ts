@@ -35,10 +35,11 @@ export function makeCommsServer(store: LocalScopedStore): ModuleServer {
         const { threadId } = c.messages.input.parse(i);
         return svc.messages(scope(call), threadId);
       });
-      // sendMessage is consequential; approval verification is handled by the bus before this runs.
+      // sendMessage is consequential; bus verifies the approval before this handler runs.
+      // call.approvalId is the bus-verified token — bind it to the message record, not caller input.
       bus.register(manifest, c.sendMessage, async (i, call) => {
         const { threadId, body } = c.sendMessage.input.parse(i);
-        const msg = await svc.appendOutboundMessage(scope(call), call.principal.id, threadId, body);
+        const msg = await svc.appendOutboundMessage(scope(call), call.principal.id, threadId, body, call.approvalId);
         return { queued: true, approvalId: msg.send_approval_id ?? null };
       });
       bus.register(manifest, c.events, (i, call) => {

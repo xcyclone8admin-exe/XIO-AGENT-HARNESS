@@ -80,6 +80,18 @@ describe('comms service', () => {
     ).rejects.toThrow();
   });
 
+  test('bus-verified approvalId is persisted in the message record', async () => {
+    const ws = await makeWorkspace('C-G');
+    const thread = await service.createThread(ws, ws.userId, 'Approval binding test', 'email');
+    const approvalId = uuidv7();
+
+    const msg = await service.appendOutboundMessage(ws, ws.userId, thread.id, 'Approved body', approvalId);
+    expect(msg.send_approval_id).toBe(approvalId);
+
+    const msgs = await service.messages(ws, thread.id);
+    expect(msgs[0]?.send_approval_id).toBe(approvalId);
+  });
+
   test('events are scoped to workspace', async () => {
     const a = await makeWorkspace('C-E');
     const b = await makeWorkspace('C-F');
