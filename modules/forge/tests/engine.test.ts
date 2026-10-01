@@ -122,9 +122,9 @@ describe('review, gates, promotion and hard execution boundary', () => {
 
   it('refuses missing gates and production approval and requires rollback evidence', () => {
     const promotion = { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'proposed', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time };
-    expect(() => requestPromotion({ promotion, gates: [{ ...goodGate, status: 'pending' }], productionApproval: null })).toThrow('PROMOTION_GATES_MISSING');
-    expect(() => requestPromotion({ promotion: { ...promotion, to: 'main' }, gates: [goodGate], productionApproval: null })).toThrow('PRODUCTION_APPROVAL_REQUIRED');
-    const proposed = requestPromotion({ promotion, gates: [goodGate], productionApproval: null });
+    expect(() => requestPromotion(promotion, [{ ...goodGate, status: 'pending' }])).toThrow('PROMOTION_GATES_MISSING');
+    expect(() => requestPromotion({ ...promotion, to: 'main' }, [goodGate])).toThrow('PRODUCTION_APPROVAL_REQUIRED');
+    const proposed = requestPromotion(promotion, [goodGate]);
     expect(proposed.state).toBe('proposed');
     expect(() => rollbackPromotion({ ...promotion, state: 'proposed' }, evidence)).toThrow('ROLLBACK_REQUIRES_PROMOTED_RECORD');
     expect(rollbackPromotion({ ...promotion, state: 'promoted' }, evidence).state).toBe('rolled-back');
