@@ -9,6 +9,7 @@ mod guardian;
 mod identity;
 mod job;
 mod logging;
+mod runner;
 mod sidecar;
 mod spawn_scoped;
 mod tray;
