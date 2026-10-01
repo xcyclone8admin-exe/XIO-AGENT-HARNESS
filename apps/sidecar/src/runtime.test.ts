@@ -53,6 +53,7 @@ test('local runtime serves an authenticated, scoped workspace session', async ()
       ['command.dashboard.summary', {}],
       ['comms.threads.list', {}],
       ['growth.contacts.list', {}],
+      ['invest.portfolios.list', {}],
     ] as const;
     const results = await Promise.all(moduleCalls.map(([capabilityId, input]) =>
       fetch(`http://127.0.0.1:${port}/api/v1/call/${capabilityId}`, {
@@ -66,10 +67,12 @@ test('local runtime serves an authenticated, scoped workspace session', async ()
         body: JSON.stringify({ workspaceId, input }),
       }),
     ));
-    expect(results.map((result) => result.status), 'BIZ module registrars must be callable in the integrated runtime')
-      .toEqual([200, 200, 200]);
+    expect(results.map((result) => result.status), 'integrated module registrars must be callable in the runtime')
+      .toEqual([200, 200, 200, 200]);
     const dashboard = await results[0]!.json() as { data: { pending_approvals: number | null } };
     expect(dashboard.data.pending_approvals).toBeNull();
+    const portfolios = await results[3]!.json() as { data: unknown[] };
+    expect(portfolios.data).toEqual([]);
   } finally {
     await session.close();
   }

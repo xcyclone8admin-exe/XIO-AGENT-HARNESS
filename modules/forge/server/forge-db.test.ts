@@ -87,6 +87,14 @@ describe('Forge schema and workspace isolation', () => {
     const secondSpecs = await forge.saveSpecs(actorA, project.id, corpus.documents);
     expect(firstSpecs).toHaveLength(12);
     expect(secondSpecs.every((spec) => spec.version === 2)).toBe(true);
+    await expect(forge.transitionSpec(actorA, { projectId: project.id, specId: firstSpecs[0]!.id, version: 1, approvalId: '019a0000-0000-7000-8000-000000000099', action: 'approve', detail: 'No approved project approval' })).rejects.toThrow('FORGE_SPEC_APPROVED_PROJECT_SCOPE_REQUIRED');
+    await forge.transitionSpec(actorA, { projectId: project.id, specId: firstSpecs[0]!.id, version: 2, approvalId: approvedRequest.id, action: 'approve', detail: 'Reviewed against approved epic scope' });
+    await forge.transitionSpec(actorA, { projectId: project.id, specId: firstSpecs[0]!.id, version: 1, approvalId: approvedRequest.id, action: 'approve', detail: 'Approved predecessor for lifecycle test' });
+    await forge.transitionSpec(actorA, { projectId: project.id, specId: firstSpecs[0]!.id, version: 1, approvalId: approvedRequest.id, action: 'supersede', supersededBySpecId: firstSpecs[0]!.id, supersededByVersion: 2, detail: 'Replaced by approved version 2' });
+    const lifecycleSpecs = await forge.specs(actorA, project.id);
+    expect(lifecycleSpecs.find((spec) => spec.id === firstSpecs[0]!.id && spec.version === 1)?.status).toBe('superseded');
+    expect(lifecycleSpecs.find((spec) => spec.id === firstSpecs[0]!.id && spec.version === 2)?.status).toBe('approved');
+    await expect(scoped.query(scopeA, "UPDATE forge_spec_events SET detail='rewrite' WHERE spec_id=$1", [firstSpecs[0]!.id])).rejects.toThrow();
     expect((await forge.specs(actorA, project.id)).filter((spec) => spec.template === 'release-plan')).toHaveLength(2);
     expect(await forge.projects({ id: actor, tenantId: tenantB, workspaceId: workspaceB })).toEqual([]);
     await expect(scoped.query(scopeA, "UPDATE forge_sources SET status='rejected' WHERE id=$1", [source.id])).rejects.toThrow();
@@ -94,6 +102,10 @@ describe('Forge schema and workspace isolation', () => {
     const dependent = await forge.createNode(actorA, project.id, { parentId: epic.id, kind: 'ticket', title: 'Dependent work', description: '', state: 'ready', priority: 'normal', dependencies: [task.id], requirements: [], acceptanceCriteria: ['wait'], ownerId: null });
     const evidenceRecord = await forge.createEvidence(actorA, { requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest fixture', deterministic: true, result: 'pass', payload: { test: 'green' }, ticketId: task.id });
     expect((await forge.nodes(actorA, project.id)).find((node) => node.id === task.id)?.evidenceIds).toContain(evidenceRecord.id);
+    const context = await forge.compileTicketContext(actorA, { ticketId: task.id, budgetTokens: 8000, sourceIds: [ingested.id] });
+    expect(context.items.map((item) => item.type)).toEqual(expect.arrayContaining(['objective','requirement','architecture','decision','dependency','source','constraint','acceptance','prior-evidence']));
+    expect(context.items.find((item) => item.type === 'source')?.text).toContain('approved local source contents');
+    expect(context.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
     expect((await forge.gateMatrix(actorA, { requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] })).overall).toBe('pass');
     const proposal = await forge.requestPromotionRecord(actorA, { commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', evidenceIds: [evidenceRecord.id], requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] });
     expect(proposal).toMatchObject({ state: 'proposed', evidenceIds: [evidenceRecord.id], missingGateIds: [] });
@@ -134,6 +146,16 @@ describe('Forge schema and workspace isolation', () => {
     expect((await forge.escalations(actorA)).find((item) => item.id === escalation.discovery.id)?.status).toBe('open');
     expect((await forge.resolveEscalation(actorA, { escalationId: escalation.discovery.id, status: 'resolved', detail: 'Owner reviewed impact' }))?.status).toBe('resolved');
     await expect(forge.resolveEscalation(actorA, { escalationId: escalation.discovery.id, status: 'resolved', detail: 'Duplicate resolution' })).rejects.toThrow('FORGE_ESCALATION_ALREADY_RESOLVED');
+    const archiveProject = await forge.createProject(actorA, { name: 'Archive lifecycle', requirements: [] });
+    const archiveEpic = await forge.createNode(actorA, archiveProject.id, { parentId: null, kind: 'epic', title: 'Archived parent', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    const archiveTicket = await forge.createNode(actorA, archiveProject.id, { parentId: archiveEpic.id, kind: 'ticket', title: 'Archived child', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    await expect(forge.archiveNode(actorA, { nodeId: archiveEpic.id, reason: 'Parent still has active child' })).rejects.toThrow('FORGE_NODE_HAS_ACTIVE_DESCENDANTS');
+    const archivedTicket = await forge.archiveNode(actorA, { nodeId: archiveTicket.id, reason: 'No longer required' });
+    expect(archivedTicket.archivedAt).toBeTruthy();
+    await expect(forge.updateNode(actorA, { nodeId: archiveTicket.id, title: 'Should remain archived' })).rejects.toThrow('FORGE_NODE_ARCHIVED');
+    const archivedEpic = await forge.archiveNode(actorA, { nodeId: archiveEpic.id, reason: 'All descendants archived' });
+    expect((await forge.nodes(actorA, archiveProject.id)).filter((node) => node.archivedAt)).toHaveLength(2);
+    expect(archivedEpic.archivedAt).toBeTruthy();
   });
 
   it('derives tenant and workspace from trusted capability call context', async () => {

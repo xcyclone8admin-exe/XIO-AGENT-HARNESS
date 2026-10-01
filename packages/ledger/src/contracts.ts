@@ -506,7 +506,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     name: 'ledger_books',
     serverWriteCapabilities: ['money_ledger'],
-    serverReadCapabilities: ['invest_paper_execution'],
+    serverReadCapabilities: ['invest_paper', 'invest_paper_execution'],
     class: 'lww',
     authority: 'synced',
     guardedColumns: ['environment', 'owner_module', 'base_asset'],
@@ -533,7 +533,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     name: 'ledger_accounts',
     serverWriteCapabilities: ['money_ledger'],
-    serverReadCapabilities: ['invest_paper_execution'],
+    serverReadCapabilities: ['invest_paper', 'invest_paper_execution'],
     class: 'lww',
     authority: 'synced',
     guardedColumns: ['book_id', 'environment', 'type'],
@@ -629,6 +629,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
     class: 'local',
     authority: 'local',
     serverWriteCapabilities: ['money_ledger', 'invest_paper_execution'],
+    serverReadCapabilities: ['invest_paper'],
     readPermission: 'money:ledger:read',
   },
   {
