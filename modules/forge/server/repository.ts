@@ -40,9 +40,13 @@ export class ForgeRepository {
   }
   async createNode(actor: ForgeActor, projectId: string, raw: unknown) {
     const node = ForgeNodeCreate.parse(raw); const id = uuidv7();
+    const allowedParents: Record<string, string[]> = { epic: [], spec: ['epic'], plan: ['epic'], wave: ['plan'], ticket: ['epic', 'plan', 'wave'], subtask: ['ticket'] };
+    if (node.kind === 'epic' ? node.parentId !== null : node.parentId === null) throw new Error('FORGE_NODE_PARENT_KIND_INVALID');
     if (node.parentId) {
-      const parent = await this.store.query(this.scope(actor), 'SELECT id FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND project_id=$4 AND archived_at IS NULL', [actor.tenantId, actor.workspaceId, node.parentId, projectId]);
-      if (!parent.rows.length) throw new Error('FORGE_NODE_PARENT_NOT_ACTIVE_IN_PROJECT');
+      const parent = await this.store.query<Record<string, unknown> & { id: string; kind: string }>(this.scope(actor), 'SELECT id,kind FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND project_id=$4 AND archived_at IS NULL', [actor.tenantId, actor.workspaceId, node.parentId, projectId]);
+      const parentNode = parent.rows[0];
+      if (!parentNode) throw new Error('FORGE_NODE_PARENT_NOT_ACTIVE_IN_PROJECT');
+      if (!allowedParents[node.kind]?.includes(parentNode.kind)) throw new Error('FORGE_NODE_PARENT_KIND_INVALID');
     }
     if (node.kind === 'epic' || node.kind === 'spec' || node.kind === 'plan' || node.kind === 'wave') EpicState.parse(node.state);
     else TicketState.parse(node.state);
