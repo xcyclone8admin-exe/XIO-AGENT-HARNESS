@@ -25,7 +25,7 @@ beforeAll(async () => {
   bus = new CapabilityBus(
     new DurableBusAudit(scoped),
     new DurableBusIdempotency(scoped),
-    { verify: async () => false },
+    { verify: async () => null },
     () => false,
     async () => new Set(),
   );
