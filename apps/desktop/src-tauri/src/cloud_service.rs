@@ -1583,6 +1583,45 @@ mod tests {
     }
 
     #[test]
+    fn desktop_never_refreshes_legacy_software_key_sessions_even_before_expiry() {
+        for expires_at_ms in [u64::MAX, 1] {
+            let store = Arc::new(MemoryStore::default());
+            DeviceKey::new(store.clone())
+                .store_session(&SessionTokens {
+                    access_token: "legacy-access".into(),
+                    refresh_token: "legacy-refresh".into(),
+                    expires_at_ms,
+                    sid: Some("legacy-family".into()),
+                })
+                .unwrap();
+            store
+                .set("dpop-device-key-pkcs8", "legacy-private")
+                .unwrap();
+
+            let device_key = DeviceKey::production(store.clone()).unwrap();
+            let fake = Arc::new(FakeTransport::default());
+            let client = CloudAuthService::build_with_device_key(
+                Some("https://cloud.test".into()),
+                fake.clone(),
+                Arc::new(FakeSidecarTransport::default()),
+                device_key,
+            )
+            .unwrap();
+
+            assert_eq!(
+                client.ensure_session().unwrap_err(),
+                "CLOUD_REAUTH_REQUIRED"
+            );
+            assert!(fake.take_requests().is_empty());
+            assert_eq!(
+                client.device_key.stored_session_status().unwrap(),
+                StoredSessionStatus::ReauthRequired
+            );
+            assert_eq!(store.get("dpop-device-key-pkcs8").unwrap(), None);
+        }
+    }
+
+    #[test]
     fn protected_request_refreshes_then_uses_access_token_dpop_and_route_policy() {
         let store = Arc::new(MemoryStore::default());
         let fake = Arc::new(FakeTransport::with_responses(vec![

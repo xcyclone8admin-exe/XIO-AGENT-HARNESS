@@ -151,25 +151,52 @@ impl DeviceKey {
     }
 
     pub fn production(store: Arc<dyn CredentialStore>) -> Result<Self, String> {
-        let algorithm = if let Some(pending) = store.get(PENDING_AUTH_ID)? {
+        let mut pending_algorithm = None;
+        if let Some(pending) = store.get(PENDING_AUTH_ID)? {
             let pending: serde_json::Value =
                 serde_json::from_str(&pending).map_err(|_| "CLOUD_AUTH_STATE_CORRUPT")?;
             match pending
                 .get("key_algorithm")
                 .and_then(|value| value.as_str())
             {
-                Some("ES256") => DpopAlgorithm::Es256,
-                Some("EdDSA") | None => DpopAlgorithm::EdDsa,
+                Some("ES256") => pending_algorithm = Some(DpopAlgorithm::Es256),
+                // In-flight software-key authentication cannot be completed as a Desktop
+                // identity after the TPM requirement takes effect. Start a fresh ES256 flow.
+                Some("EdDSA") | None => {
+                    store.delete(PENDING_AUTH_ID)?;
+                    store.delete(DEVICE_KEY_ID)?;
+                }
                 _ => return Err("CLOUD_AUTH_STATE_CORRUPT".into()),
             }
-        } else if let Some(value) = store.get(SESSION_ID)? {
+        }
+
+        let mut session_algorithm = None;
+        if let Some(value) = store.get(SESSION_ID)? {
             let stored: StoredSession =
                 serde_json::from_str(&value).map_err(|_| "CLOUD_SESSION_CORRUPT")?;
-            // Sessions written before key_algorithm was introduced were EdDSA-bound.
-            stored.key_algorithm.unwrap_or(DpopAlgorithm::EdDsa)
-        } else {
-            DpopAlgorithm::Es256
-        };
+            // Sessions written before key_algorithm was introduced were EdDSA-bound. Desktop
+            // must not refresh them, even when the access token is still within its lifetime.
+            let existing_algorithm = stored.key_algorithm.unwrap_or(DpopAlgorithm::EdDsa);
+            if existing_algorithm == DpopAlgorithm::EdDsa {
+                if !stored.reauth_required {
+                    let reauth = serde_json::to_string(&StoredSession {
+                        access_token: None,
+                        refresh_token: None,
+                        expires_at_ms: None,
+                        sid: None,
+                        key_algorithm: Some(DpopAlgorithm::Es256),
+                        reauth_required: true,
+                    })
+                    .map_err(|_| "CLOUD_SESSION_STORE_FAILED")?;
+                    store.set(SESSION_ID, &reauth)?;
+                }
+                store.delete(DEVICE_KEY_ID)?;
+            }
+            session_algorithm = Some(DpopAlgorithm::Es256);
+        }
+        let algorithm = pending_algorithm
+            .or(session_algorithm)
+            .unwrap_or(DpopAlgorithm::Es256);
         Ok(Self {
             store,
             algorithm: Arc::new(Mutex::new(algorithm)),
@@ -825,24 +852,40 @@ mod tests {
     }
 
     #[test]
-    fn production_key_selection_uses_es256_for_new_and_preserves_existing_algorithm() {
+    fn production_key_selection_migrates_legacy_sessions_and_uses_es256_for_new() {
         let empty = Arc::new(MemoryStore::default());
         assert_eq!(
             DeviceKey::production(empty).unwrap().current_algorithm(),
             DpopAlgorithm::Es256
         );
 
-        let legacy = Arc::new(MemoryStore::default());
-        legacy
-            .set(
-                SESSION_ID,
-                r#"{"access_token":"a","refresh_token":"r","expires_at_ms":100,"sid":null}"#,
-            )
-            .unwrap();
-        assert_eq!(
-            DeviceKey::production(legacy).unwrap().current_algorithm(),
-            DpopAlgorithm::EdDsa
-        );
+        for expires_at_ms in [u64::MAX, 1] {
+            let legacy = Arc::new(MemoryStore::default());
+            let legacy_key = DeviceKey::new(legacy.clone());
+            legacy_key
+                .store_session(&SessionTokens {
+                    access_token: "legacy-access".into(),
+                    refresh_token: "legacy-refresh".into(),
+                    expires_at_ms,
+                    sid: Some("legacy-family".into()),
+                })
+                .unwrap();
+            legacy
+                .set(DEVICE_KEY_ID, "legacy-software-private-key")
+                .unwrap();
+
+            let migrated = DeviceKey::production(legacy.clone()).unwrap();
+            assert_eq!(migrated.current_algorithm(), DpopAlgorithm::Es256);
+            assert_eq!(
+                migrated.stored_session_status().unwrap(),
+                StoredSessionStatus::ReauthRequired
+            );
+            assert_eq!(
+                migrated.load_session().unwrap_err(),
+                "CLOUD_REAUTH_REQUIRED"
+            );
+            assert_eq!(legacy.get(DEVICE_KEY_ID).unwrap(), None);
+        }
 
         let pending = Arc::new(MemoryStore::default());
         pending
@@ -852,6 +895,18 @@ mod tests {
             DeviceKey::production(pending).unwrap().current_algorithm(),
             DpopAlgorithm::Es256
         );
+
+        let legacy_pending = Arc::new(MemoryStore::default());
+        legacy_pending
+            .set(PENDING_AUTH_ID, r#"{"key_algorithm":"EdDSA"}"#)
+            .unwrap();
+        legacy_pending
+            .set(DEVICE_KEY_ID, "legacy-software-private-key")
+            .unwrap();
+        let migrated = DeviceKey::production(legacy_pending.clone()).unwrap();
+        assert_eq!(migrated.current_algorithm(), DpopAlgorithm::Es256);
+        assert_eq!(legacy_pending.get(PENDING_AUTH_ID).unwrap(), None);
+        assert_eq!(legacy_pending.get(DEVICE_KEY_ID).unwrap(), None);
     }
 
     #[test]
