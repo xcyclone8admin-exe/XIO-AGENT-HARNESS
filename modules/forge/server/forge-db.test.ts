@@ -66,6 +66,8 @@ describe('Forge schema and workspace isolation', () => {
     const epic = await forge.createNode(actorA, project.id, { parentId: null, kind: 'epic', title: 'Bounded epic', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
     expect((await forge.nodes(actorA, project.id)).map((node) => node.id)).toContain(epic.id);
     expect((await forge.updateNode(actorA, { nodeId: epic.id, title: 'Updated epic' })).title).toBe('Updated epic');
+    const detailedEpic = await forge.updateNode(actorA, { nodeId: epic.id, description: 'Scope and outcome', requirements: [{ id: 'FRG-CRUD', statement: 'Edit planning details' }], acceptanceCriteria: ['Reviewable result'], dependencies: [] });
+    expect(detailedEpic).toMatchObject({ description: 'Scope and outcome', requirements: [{ id: 'FRG-CRUD', statement: 'Edit planning details' }], acceptanceCriteria: ['Reviewable result'], dependencies: [] });
     await expect(forge.requestApproval(actorA, { epicId: epic.id })).rejects.toThrow('FORGE_EPIC_MUST_BE_PROPOSED');
     await forge.updateNode(actorA, { nodeId: epic.id, state: 'proposed' });
     const request = await forge.requestApproval(actorA, { epicId: epic.id });
