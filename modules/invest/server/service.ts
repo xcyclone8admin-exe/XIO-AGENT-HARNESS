@@ -11,6 +11,7 @@ import { backtestStrategyIdentity, runMomentumStopTargetBacktest, type OhlcBar, 
 import { calculateTimeWeightedStatement, type PerformanceMark, type PerformanceStatement } from './performance';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
+import { INVEST_SIGNAL_PROTOCOL, type VerifiedInvestSignalEnvelope } from './invest-signals';
 import { validateScheduledCustodyContext, type PersistedCustodyStatementInbox, type PersistedCustodyStatement, type TrustedFlowStepContext } from './scheduled-reconciliation';
 
 type Call = { readonly principal: Principal; readonly workspaceId: string };
@@ -91,6 +92,41 @@ export class InvestService {
       throw new Error('IC votes and mandate approval require a direct owner or admin action');
     }
     return call.principal.id;
+  }
+
+  /** Persist a validated Cloud claim as an immutable advisory decision; this never creates or executes an order. */
+  async consumeCloudInvestSignal(scope:Scope,envelope:VerifiedInvestSignalEnvelope,claim:{leaseId:string;fence:number;expiresAt:string},actorId:string):Promise<{decisionId:string}>{
+    const trustedScope:InvestScope={...scope,hlc:this.clock.now()};
+    validateVerifiedInvestSignal(trustedScope,envelope,claim);
+    if(decimalQuantityToUnits(envelope.quantity,12)<=0n) throw new Error('INVEST_SIGNAL_QUANTITY_INVALID');
+    if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actorId)) throw new Error('INVEST_SIGNAL_ACTOR_INVALID');
+    const existing=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string}>(
+      `SELECT id,payload_digest FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
+      [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
+    if(existing){
+      if(existing.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+      return {decisionId:existing.id};
+    }
+    const instruments=(await this.scoped.withServerScope(trustedScope,'invest_paper_execution',trustedScope.hlc,(tx)=>tx.query<{id:string;asset_class:string;quantity_scale:number}>(
+      `SELECT id,asset_class,quantity_scale FROM invest_instruments WHERE tenant_id=$1 AND workspace_id=$2 AND symbol=$3 AND active=true`,
+      [trustedScope.tenantId,trustedScope.workspaceId,envelope.symbol]))).rows;
+    const units=instruments.length===1?decimalQuantityToUnits(envelope.quantity,instruments[0]!.quantity_scale):null;
+    const candidateInstrument=instruments.length===1?instruments[0]!:null;
+    const decisionId=uuidv7();
+    const detail={kind:'advisory_only',sourceId:envelope.sourceId,algorithmId:envelope.algorithmId,signalId:envelope.signalId,
+      instrumentMatches:instruments.length,quantityUnits:units?.toString()??null,decision:'Requires normal Invest risk/mandate evaluation and human PAPER approval; this signal does not authorize an order.'};
+    await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query(
+      `INSERT INTO invest_signal_decisions(id,tenant_id,workspace_id,source_id,event_id,signal_id,payload_digest,algorithm_id,symbol,side,signal_quantity,
+        decision_status,claim_lease_id,claim_fence,lease_expires_at,instrument_id,detail,decided_by)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'advisory',$12,$13,$14,$15,$16::jsonb,$17)
+       ON CONFLICT(tenant_id,workspace_id,source_id,event_id) DO NOTHING`,
+      [decisionId,trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId,envelope.signalId,envelope.payloadDigest,envelope.algorithmId,
+       envelope.symbol,envelope.side,envelope.quantity,claim.leaseId,claim.fence,claim.expiresAt,candidateInstrument?.id??null,JSON.stringify(detail),actorId]));
+    const persisted=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string}>(
+      `SELECT id,payload_digest FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
+      [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
+    if(!persisted||persisted.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+    return {decisionId:persisted.id};
   }
 
   async portfolios(scope: InvestScope): Promise<PortfolioRow[]> {
@@ -1041,4 +1077,33 @@ export class InvestService {
     await tx.query(`INSERT INTO invest_order_events(id,tenant_id,workspace_id,order_id,event_type,from_status,to_status,detail,created_by)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, orderId, event, from, to, JSON.stringify(detail), actorId]);
   }
+}
+
+function validateVerifiedInvestSignal(scope:InvestScope,signal:VerifiedInvestSignalEnvelope,lease:{leaseId:string;fence:number;expiresAt:string}):VerifiedInvestSignalEnvelope{
+  if(!signal||typeof signal!=='object'||!signal.verification||typeof signal.verification!=='object'||!lease||typeof lease!=='object')
+    throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
+  const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const event=/^[A-Za-z0-9_.:-]{1,128}$/;
+  const digest=/^[0-9a-f]{64}$/;
+  const timestamp=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+  const now=Date.now();
+  const received=Date.parse(signal.receivedAt); const occurred=Date.parse(signal.occurredAt); const expires=Date.parse(signal.expiresAt); const leaseExpires=Date.parse(lease.expiresAt);
+  if(signal.protocol!==INVEST_SIGNAL_PROTOCOL||!uuid.test(signal.sourceId)||!uuid.test(signal.signalId)||!uuid.test(signal.verification.keyId)||
+     signal.tenantId!==scope.tenantId||signal.workspaceId!==scope.workspaceId||!event.test(signal.eventId)||!digest.test(signal.payloadDigest)||
+     signal.verification.signature!=='verified'||(signal.verification.algorithm!==undefined&&!['ES256','EdDSA'].includes(signal.verification.algorithm))||
+     !/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(signal.algorithmId)||!/^[A-Z0-9][A-Z0-9._/-]{0,31}$/.test(signal.symbol)||
+     !['buy','sell'].includes(signal.side)||!/^(?:0|[1-9]\d{0,17})(?:\.\d{1,12})?$/.test(signal.quantity)||
+     !timestamp.test(signal.receivedAt)||!timestamp.test(signal.occurredAt)||!timestamp.test(signal.expiresAt)||!timestamp.test(lease.expiresAt)||
+     !Number.isFinite(received)||!Number.isFinite(occurred)||!Number.isFinite(expires)||!Number.isFinite(leaseExpires)||
+     received>now+60_000||received<now-24*60*60_000||occurred>now+60_000||occurred<now-24*60*60_000||expires<=now||expires<=occurred||expires>now+24*60*60_000||
+     !uuid.test(lease.leaseId)||!Number.isSafeInteger(lease.fence)||lease.fence<1||leaseExpires<=now||leaseExpires>now+35_000)
+    throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
+  return signal;
+}
+
+function decimalQuantityToUnits(quantity:string,scale:number):bigint{
+  if(!Number.isInteger(scale)||scale<0||scale>18||!/^(?:0|[1-9]\d{0,17})(?:\.\d{1,12})?$/.test(quantity)) throw new Error('INVEST_SIGNAL_QUANTITY_INVALID');
+  const [whole,fraction='']=quantity.split('.');
+  if(fraction.length>scale) throw new Error('INVEST_SIGNAL_QUANTITY_INVALID');
+  return BigInt(whole+fraction.padEnd(scale,'0'));
 }

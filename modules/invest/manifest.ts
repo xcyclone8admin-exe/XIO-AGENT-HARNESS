@@ -76,6 +76,7 @@ export default defineModule({
     { name: 'invest_reconciliation_discrepancies', class: 'append', authority: 'server', readPermission: 'invest:breach:manage', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_reconciliation_events', class: 'append', authority: 'server', readPermission: 'invest:breach:manage', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_custody_dispatches', class: 'local', authority: 'server', readPermission: 'invest:breach:manage', serverReadCapabilities: ['invest_paper'], serverWriteCapabilities: ['invest_paper'] },
+    { name: 'invest_signal_decisions', class: 'append', authority: 'server', readPermission: 'invest:order:read', serverReadCapabilities: ['invest_paper'], serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_portfolio_risk_state', class: 'local', authority: 'server', readPermission: 'invest:breach:manage', serverWriteCapabilities: ['invest_paper', 'invest_paper_execution'] },
     { name: 'invest_limit_changes', class: 'append', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_ic_memos', class: 'local', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },
