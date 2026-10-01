@@ -10,7 +10,7 @@ CREATE TABLE invest_signal_decisions (
   symbol text NOT NULL CHECK (length(symbol) BETWEEN 1 AND 32),
   side text NOT NULL CHECK (side IN ('buy','sell')),
   signal_quantity text NOT NULL CHECK (length(signal_quantity) BETWEEN 1 AND 32),
-  decision_status text NOT NULL CHECK (decision_status='advisory'),
+  decision_status text NOT NULL CHECK (decision_status IN ('advisory','rejected')),
   claim_lease_id uuid NOT NULL,
   claim_fence bigint NOT NULL CHECK (claim_fence > 0),
   lease_expires_at timestamptz NOT NULL,

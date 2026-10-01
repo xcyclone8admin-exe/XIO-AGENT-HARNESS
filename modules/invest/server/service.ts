@@ -105,30 +105,53 @@ export class InvestService {
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
     if(existing){
       if(existing.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
-      if(existing.claim_lease_id!==claim.leaseId||existing.claim_fence!==claim.fence) throw new Error('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+      await this.persistSignalClaim(trustedScope,existing.id,envelope,claim);
       return {decisionId:existing.id};
     }
     const instruments=(await this.scoped.withServerScope(trustedScope,'invest_paper_execution',trustedScope.hlc,(tx)=>tx.query<{id:string;asset_class:string;quantity_scale:number}>(
       `SELECT id,asset_class,quantity_scale FROM invest_instruments WHERE tenant_id=$1 AND workspace_id=$2 AND symbol=$3 AND active=true`,
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.symbol]))).rows;
-    const units=instruments.length===1?decimalQuantityToUnits(envelope.quantity,instruments[0]!.quantity_scale):null;
+    let units:bigint|null=null;
+    let precisionRejected=false;
+    if(instruments.length===1){
+      try{units=decimalQuantityToUnits(envelope.quantity,instruments[0]!.quantity_scale);}
+      catch{precisionRejected=true;}
+    }
     const candidateInstrument=instruments.length===1?instruments[0]!:null;
     const decisionId=uuidv7();
+    const decisionStatus=precisionRejected?'rejected':'advisory';
     const detail={kind:'advisory_only',sourceId:envelope.sourceId,algorithmId:envelope.algorithmId,signalId:envelope.signalId,
-      instrumentMatches:instruments.length,quantityUnits:units?.toString()??null,decision:'Requires normal Invest risk/mandate evaluation and human PAPER approval; this signal does not authorize an order.'};
+      instrumentMatches:instruments.length,quantityUnits:units?.toString()??null,
+      decision:precisionRejected?'Rejected: quantity exceeds the matched instrument precision.':'Requires normal Invest risk/mandate evaluation and human PAPER approval; this signal does not authorize an order.'};
     await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query(
       `INSERT INTO invest_signal_decisions(id,tenant_id,workspace_id,source_id,event_id,signal_id,payload_digest,algorithm_id,symbol,side,signal_quantity,
         decision_status,claim_lease_id,claim_fence,lease_expires_at,instrument_id,detail,decided_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'advisory',$12,$13,$14,$15,$16::jsonb,$17)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$18,$12,$13,$14,$15,$16::jsonb,$17)
        ON CONFLICT(tenant_id,workspace_id,source_id,event_id) DO NOTHING`,
       [decisionId,trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId,envelope.signalId,envelope.payloadDigest,envelope.algorithmId,
-       envelope.symbol,envelope.side,envelope.quantity,claim.leaseId,claim.fence,claim.expiresAt,candidateInstrument?.id??null,JSON.stringify(detail),actorId]));
+       envelope.symbol,envelope.side,envelope.quantity,claim.leaseId,claim.fence,claim.expiresAt,candidateInstrument?.id??null,JSON.stringify(detail),actorId,decisionStatus]));
     const persisted=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;claim_lease_id:string;claim_fence:number}>(
       `SELECT id,payload_digest,claim_lease_id,claim_fence FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
     if(!persisted||persisted.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
-    if(persisted.claim_lease_id!==claim.leaseId||persisted.claim_fence!==claim.fence) throw new Error('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+    await this.persistSignalClaim(trustedScope,persisted.id,envelope,claim);
     return {decisionId:persisted.id};
+  }
+
+  private async persistSignalClaim(scope:InvestScope,decisionId:string,envelope:VerifiedInvestSignalEnvelope,claim:{leaseId:string;fence:number;expiresAt:string}):Promise<void>{
+    await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,async(tx)=>{
+      const inserted=await tx.query<{lease_id:string}>(
+      `INSERT INTO invest_signal_claims(id,tenant_id,workspace_id,decision_id,source_id,event_id,payload_digest,lease_id,fence,lease_expires_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING RETURNING lease_id::text`,
+      [uuidv7(),scope.tenantId,scope.workspaceId,decisionId,envelope.sourceId,envelope.eventId,envelope.payloadDigest,claim.leaseId,claim.fence,claim.expiresAt]);
+      if(inserted.rowCount>0)return;
+      const previous=(await tx.query<{source_id:string;event_id:string;payload_digest:string;fence:number;lease_expires_at:string}>(
+        `SELECT source_id::text,event_id,payload_digest,fence,lease_expires_at::text FROM invest_signal_claims
+          WHERE tenant_id=$1 AND workspace_id=$2 AND decision_id=$3 AND lease_id=$4`,[scope.tenantId,scope.workspaceId,decisionId,claim.leaseId])).rows[0];
+      if(!previous||previous.source_id!==envelope.sourceId||previous.event_id!==envelope.eventId||previous.payload_digest!==envelope.payloadDigest||
+         previous.fence!==claim.fence||new Date(previous.lease_expires_at).getTime()!==new Date(claim.expiresAt).getTime())
+        throw new Error('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+    });
   }
 
   async portfolios(scope: InvestScope): Promise<PortfolioRow[]> {
@@ -1092,7 +1115,7 @@ function validateVerifiedInvestSignal(scope:InvestScope,signal:VerifiedInvestSig
   const received=Date.parse(signal.receivedAt); const occurred=Date.parse(signal.occurredAt); const expires=Date.parse(signal.expiresAt); const leaseExpires=Date.parse(lease.expiresAt);
   if(signal.protocol!==INVEST_SIGNAL_PROTOCOL||!uuid.test(signal.sourceId)||!uuid.test(signal.signalId)||!uuid.test(signal.verification.keyId)||
      signal.tenantId!==scope.tenantId||signal.workspaceId!==scope.workspaceId||!event.test(signal.eventId)||!digest.test(signal.payloadDigest)||
-     signal.verification.signature!=='verified'||(signal.verification.algorithm!==undefined&&!['ES256','EdDSA'].includes(signal.verification.algorithm))||
+     signal.verification.signature!=='verified'||
      !/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(signal.algorithmId)||!/^[A-Z0-9][A-Z0-9._/-]{0,31}$/.test(signal.symbol)||
      !['buy','sell'].includes(signal.side)||!/^(?:0|[1-9]\d{0,17})(?:\.\d{1,12})?$/.test(signal.quantity)||
      !timestamp.test(signal.receivedAt)||!timestamp.test(signal.occurredAt)||!timestamp.test(signal.expiresAt)||!timestamp.test(lease.expiresAt)||

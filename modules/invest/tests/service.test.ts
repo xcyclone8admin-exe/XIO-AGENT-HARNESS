@@ -264,8 +264,11 @@ test('Cloud signal claim becomes one immutable advisory decision before host ack
   const first=await service.consumeCloudInvestSignal(scope,envelope,claim,userId);
   const duplicate=await service.consumeCloudInvestSignal(scope,envelope,claim,userId);
   expect(duplicate).toEqual(first);
-  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,leaseId:'019a0000-0000-7000-8000-000000000805'},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
-  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,fence:2},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,fence:9},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+  const reclaimed=await service.consumeCloudInvestSignal(scope,envelope,{...claim,leaseId:'019a0000-0000-7000-8000-000000000805',fence:2},userId);
+  expect(reclaimed).toEqual(first);
+  const claimHistory=await db.query<{lease_id:string;fence:number}>(`SELECT lease_id,fence FROM invest_signal_claims WHERE decision_id=$1 ORDER BY fence`,[first.decisionId]);
+  expect(claimHistory.rows).toEqual([{lease_id:claim.leaseId,fence:1},{lease_id:'019a0000-0000-7000-8000-000000000805',fence:2}]);
   expect((await service.orders(scope,{}))).toHaveLength(before);
   const row=await db.query<{decision_status:string;instrument_id:string;claim_fence:number;detail:Record<string,unknown>}>(
     `SELECT decision_status,instrument_id,claim_fence,detail FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,[tenantId,workspaceId,first.decisionId]);
@@ -279,6 +282,12 @@ test('Cloud signal claim becomes one immutable advisory decision before host ack
   await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,expiresAt:new Date(now-1).toISOString()},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
   await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,fence:0},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
   await expect(db.query(`UPDATE invest_signal_decisions SET symbol='OTHER' WHERE id=$1`,[first.decisionId])).rejects.toThrow(/append-only/);
+  await service.createInstrument(scope,userId,{symbol:'WHOLE',assetClass:'equity',quantityScale:0,exchangeCode:null});
+  const fractional={...envelope,eventId:'evt-invest-advisory-precision',signalId:'019a0000-0000-7000-8000-000000000806',symbol:'WHOLE',quantity:'0.5',payloadDigest:'e'.repeat(64)};
+  const rejected=await service.consumeCloudInvestSignal(scope,fractional,{...claim,leaseId:'019a0000-0000-7000-8000-000000000807'},userId);
+  const rejectedRow=await db.query<{decision_status:string;detail:Record<string,unknown>}>(`SELECT decision_status,detail FROM invest_signal_decisions WHERE id=$1`,[rejected.decisionId]);
+  expect(rejectedRow.rows[0]).toMatchObject({decision_status:'rejected',detail:{quantityUnits:null}});
+  expect(rejectedRow.rows[0]?.detail['decision']).toMatch(/exceeds the matched instrument precision/);
 });
 
 test('cancel and fill serialize on the locked order row', async () => {

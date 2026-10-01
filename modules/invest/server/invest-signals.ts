@@ -20,8 +20,6 @@ export interface VerifiedInvestSignalV1 {
   readonly verification: {
     readonly signature: 'verified';
     readonly keyId: string;
-    /** Required by the agreed wire contract; Cloud's current commit omits this field. */
-    readonly algorithm?: 'ES256' | 'EdDSA';
   };
 }
 
