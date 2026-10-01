@@ -13,6 +13,7 @@ export * from './providers';
 export * from './permissions';
 export * from './review';
 export * from './runner';
+export * from './prepared-run';
 export * from './providers/transport';
 export * from './providers/adapters';
 export * from './mcp/stdio';
