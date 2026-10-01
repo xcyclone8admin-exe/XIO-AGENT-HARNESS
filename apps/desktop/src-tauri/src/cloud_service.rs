@@ -2,8 +2,11 @@
 //! `HttpTransport` is injectable so authentication and refresh behavior can be tested without a
 //! live Worker or any environment-configurable host.
 
+use std::collections::HashMap;
 use std::io::Read;
+use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -205,6 +208,7 @@ pub struct CloudAuthService {
     transport: Arc<dyn HttpTransport>,
     sidecar_transport: Arc<dyn SidecarTransport>,
     device_key: DeviceKey,
+    callback_listeners: Mutex<HashMap<String, TcpListener>>,
 }
 
 impl CloudAuthService {
@@ -223,6 +227,7 @@ impl CloudAuthService {
             transport,
             sidecar_transport,
             device_key: DeviceKey::new(store),
+            callback_listeners: Mutex::new(HashMap::new()),
         })
     }
 
@@ -300,15 +305,43 @@ impl CloudAuthService {
         Ok(URL_SAFE_NO_PAD.encode(random))
     }
 
-    fn callback_uri() -> Result<String, String> {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|_| "CLOUD_LOOPBACK_UNAVAILABLE")?;
+    fn callback_listener() -> Result<(TcpListener, String), String> {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).map_err(|_| "CLOUD_LOOPBACK_UNAVAILABLE")?;
         let port = listener
             .local_addr()
             .map_err(|_| "CLOUD_LOOPBACK_UNAVAILABLE")?
             .port();
-        drop(listener);
-        Ok(format!("http://127.0.0.1:{port}"))
+        Ok((listener, format!("http://127.0.0.1:{port}")))
+    }
+
+    fn callback_reservation(&self, pending: &PendingAuth) -> Result<TcpListener, String> {
+        let listeners = self
+            .callback_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listener = listeners
+            .get(&pending.transaction_id)
+            .ok_or("CLOUD_AUTH_CALLBACK_LISTENER_MISSING")?
+            .try_clone()
+            .map_err(|_| "CLOUD_LOOPBACK_UNAVAILABLE")?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| "CLOUD_LOOPBACK_UNAVAILABLE")?;
+        let expected =
+            tauri::Url::parse(&pending.redirect_uri).map_err(|_| "CLOUD_CALLBACK_INVALID")?;
+        if !address.ip().is_loopback()
+            || expected.scheme() != "http"
+            || expected.host_str() != Some("127.0.0.1")
+            || expected.port() != Some(address.port())
+            || expected.username() != ""
+            || expected.password().is_some()
+            || expected.query().is_some()
+            || expected.fragment().is_some()
+        {
+            return Err("CLOUD_CALLBACK_INVALID".into());
+        }
+        Ok(listener)
     }
 
     fn json_body(response: &HttpResponse, expected_status: u16) -> Result<Value, String> {
@@ -334,7 +367,7 @@ impl CloudAuthService {
         let identity = self.device_key.public_identity()?;
         let verifier = Self::random_token(32)?;
         let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()).as_ref());
-        let redirect_uri = Self::callback_uri()?;
+        let (callback_listener, redirect_uri) = Self::callback_listener()?;
         let body = serde_json::json!({
             "pkceChallenge": challenge,
             "redirectUri": redirect_uri,
@@ -363,6 +396,12 @@ impl CloudAuthService {
             redirect_uri,
             created_at_ms: now_ms,
         })?;
+        let mut listeners = self
+            .callback_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        listeners.clear();
+        listeners.insert(begin.transaction_id.clone(), callback_listener);
         Ok(AuthBeginResponse {
             transaction_id: begin.transaction_id,
             options: begin.options,
@@ -386,8 +425,14 @@ impl CloudAuthService {
             || Self::now_ms()?.saturating_sub(pending.created_at_ms) > AUTH_TTL_MS
         {
             self.device_key.clear_pending_auth()?;
+            self.callback_listeners
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&pending.transaction_id);
             return Err("CLOUD_AUTH_TRANSACTION_INVALID".into());
         }
+        // Clone and retain the OS-bound listener until callback URL and state validation finish.
+        let _callback_reservation = self.callback_reservation(&pending)?;
 
         let complete_body = serde_json::json!({
             "transactionId": pending.transaction_id,
@@ -424,6 +469,10 @@ impl CloudAuthService {
         let session = parse_token_response(&response)?;
         self.device_key.store_session(&session)?;
         self.device_key.clear_pending_auth()?;
+        self.callback_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&pending.transaction_id);
         Ok(SessionStatusResponse {
             status: SessionStatus::Authenticated,
             expires_at: Some(session.expires_at_ms),
@@ -499,6 +548,10 @@ impl CloudAuthService {
         }
         self.device_key.clear_session()?;
         self.device_key.clear_pending_auth()?;
+        self.callback_listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         Ok(SessionStatusResponse {
             status: SessionStatus::SignedOut,
             expires_at: None,
@@ -1274,13 +1327,12 @@ mod tests {
         assert_eq!(request_body["workspaceId"], "workspace-1");
         assert_eq!(request_body["deviceJwk"]["kty"], "OKP");
         assert!(request_body["deviceJwk"]["d"].is_null());
-        assert_eq!(
-            request_body["redirectUri"]
-                .as_str()
-                .unwrap()
-                .starts_with("http://127.0.0.1:"),
-            true
-        );
+        let redirect_uri = request_body["redirectUri"].as_str().unwrap();
+        assert!(redirect_uri.starts_with("http://127.0.0.1:"));
+        let redirect = tauri::Url::parse(redirect_uri).unwrap();
+        let port = redirect.port().unwrap();
+        // The loopback port stays reserved while passkey UI is in progress.
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
         let pending: PendingAuth = client.device_key.load_pending_auth().unwrap().unwrap();
         assert_eq!(pending.transaction_id, "tx-1");
         assert_eq!(pending.state, "server-state");
@@ -1388,6 +1440,9 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let fake = Arc::new(FakeTransport::default());
         let client = service(fake.clone(), store);
+        let callback_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let callback_port = callback_listener.local_addr().unwrap().port();
+        let redirect_uri = format!("http://127.0.0.1:{callback_port}");
         client
             .device_key
             .save_pending_auth(&PendingAuth {
@@ -1395,16 +1450,21 @@ mod tests {
                 state: "expected-state".into(),
                 nonce: "server-nonce".into(),
                 verifier: "a-fake-pkce-verifier".into(),
-                redirect_uri: "http://127.0.0.1:42123".into(),
+                redirect_uri: redirect_uri.clone(),
                 created_at_ms: CloudAuthService::now_ms().unwrap(),
             })
             .unwrap();
+        client
+            .callback_listeners
+            .lock()
+            .unwrap()
+            .insert("tx-9".into(), callback_listener);
         *fake.responses.lock().unwrap() = vec![
             HttpResponse {
                 status: 303,
                 headers: vec![(
                     "Location".into(),
-                    "http://127.0.0.1:42123/?code=single-use&state=expected-state".into(),
+                    format!("{redirect_uri}/?code=single-use&state=expected-state"),
                 )],
                 body: Vec::new(),
             },

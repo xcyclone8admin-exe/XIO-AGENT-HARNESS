@@ -25,15 +25,13 @@ pub const INHERITED_ENV: &[&str] = &[
     "TZ",
 ];
 
-/// Settings the shell itself sets for the sidecar. These are non-secret configuration, except the
-/// per-launch session token the sidecar's HTTP boundary requires today (see docs/packaging-spikes.md
-/// for the proposal to move it to a stdin handoff).
+/// Non-secret settings the shell itself sets for the sidecar. Per-launch launch and native-sync
+/// tokens are delivered over the one-line stdin bootstrap and must never be child environment.
 pub const SHELL_OWNED_ENV: &[&str] = &[
     "XYRA_SIDECAR_PORT",
     "XYRA_DATA_DIR",
     "XYRA_OS_SUBJECT",
     "XYRA_DISPLAY_NAME",
-    "XYRA_LAUNCH_TOKEN",
     "XYRA_ALLOWED_ORIGINS",
 ];
 
@@ -137,6 +135,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ScopedSpawnError::UndeclaredVariable(_)));
+
+        for name in ["XYRA_LAUNCH_TOKEN", "XYRA_NATIVE_SYNC_TOKEN"] {
+            let err = scoped_command(Path::new("node"), &[], &[(name, "secret".into())], &never)
+                .unwrap_err();
+            assert_eq!(err, ScopedSpawnError::UndeclaredVariable(name.into()));
+        }
     }
 
     #[test]
