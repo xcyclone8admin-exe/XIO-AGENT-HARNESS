@@ -11,7 +11,7 @@ These instructions describe source checkpoint `148c6a2e150e0ffd5441c76611c48e914
 - Tauri CLI v2 for installer packaging.
 - Internet access to restore dependencies and download the pinned Node runtime.
 
-Use a short writable path such as `C:\dev\XIO-AGENT-HARNESS`. A GitHub account with access to this private repository is required to clone it.
+Use a short writable path such as `C:\dev\XIO-AGENT-HARNESS`. This repository is public; an authenticated account is only needed for authorized writes or GitHub features that require login.
 
 ## Clone and verify
 

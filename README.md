@@ -4,7 +4,7 @@
 
 XIO is a Windows-first agent operating system that brings project work, knowledge, business operations, and governed automation into one application. Its direction is a chat-first workspace: tell an agent what you need, inspect the proposed work, steer it while it runs, and keep the resulting evidence with the project.
 
-**Private development repository · Windows x64 · Not release-certified**
+**Public development repository · Windows x64 · Not release-certified**
 
 Created and directed by Aaron. Developed with AI-assisted engineering tools. XIO is the product name; **XYRA** is its underlying development and intended operating process.
 
@@ -110,7 +110,7 @@ The renderer is not the authority for credentials, trusted claims, workspace ide
 
 ## Quick start for development
 
-Clone this private repository with an authorized GitHub account:
+Clone the public repository:
 
 ```powershell
 git clone https://github.com/xcyclone8admin-exe/XIO-AGENT-HARNESS.git
@@ -168,4 +168,4 @@ The next delivery must finish and verify the new XIO experience before the final
 
 XIO adapts code from [FounderOS-DEMO](https://github.com/Bennettxai/FounderOS-DEMO) and [starnet](https://github.com/androoAGI/starnet), and draws requirements from [XIO-AGENT-OS](https://github.com/ocean824/XIO-AGENT-OS) and [XYRASYSTEMS—OMEGA-AI](https://github.com/ocean824/XYRASYSTEMS---OMEGA-AI). Original source repositories are preserved.
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for code provenance and licenses. The starnet branding, station artwork and sprites are excluded. This private repository does not introduce a blanket open-source license for new XIO work; third-party components retain their own terms.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for code provenance and licenses. The starnet branding, station artwork and sprites are excluded. Public source visibility does not introduce a blanket open-source license for new XIO work; third-party components retain their own terms.

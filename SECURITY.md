@@ -1,6 +1,6 @@
 # Security and verification boundaries
 
-This is a private development project, not a certified production release. Report suspected vulnerabilities privately to the repository owner. Do not put credentials, personal data, exploit payloads containing live tokens, or session files in issues or screenshots.
+This is a public development repository, not a certified production release. Report suspected vulnerabilities privately to the repository owner. Do not put credentials, personal data, exploit payloads containing live tokens, or session files in issues or screenshots.
 
 ## Core boundaries
 
@@ -17,4 +17,4 @@ This is a private development project, not a certified production release. Repor
 
 See [product status](docs/product-status.md). Live passkey/device flows, physical TPM behavior, R2 erasure, execution substrate, provider adapters and full release gates retain outstanding verification. No live trading is enabled. Never disable these checks to make a demo appear complete.
 
-Secret values, broker stores, local databases and generated caches are excluded from Git. Before sharing new branches, inspect staged files and run the repository checks. Public distribution and licensing are separate decisions from creating this private repository.
+Secret values, broker stores, local databases and generated caches are excluded from Git. Before sharing new branches, inspect staged files and run the repository checks. Public source visibility does not certify binary releases or change third-party license terms.
