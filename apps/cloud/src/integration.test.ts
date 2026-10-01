@@ -1,9 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- untyped JSON responses from the Worker under test */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { IdempotencyKeyReusedError, SyncAuthorityEngine, parseSyncPush } from './sync';
+import { MemorySyncStore } from './store';
+import { signBlobAccess } from './blobs';
+import type { AccessContext } from './access';
 
 /**
  * Drives the REAL bundled Worker and its SQLite-backed WorkspaceHub Durable Object on workerd
@@ -28,13 +33,34 @@ const URL_BASE = 'http://cloud.test';
 
 let mf: Miniflare;
 let privateKey: CryptoKey;
+const fixtureMemberships = new Map<string, Record<string, any>>();
+const fixtureDpopReplays = new Set<string>();
+const deviceKeyPairs = new Map<string, CryptoKeyPair>();
+const fixtureSyncStores = new Map<string, MemorySyncStore>();
+const fixtureErasureFences = new Set<string>();
 
 const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64url');
+async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
+  let pair = deviceKeyPairs.get(deviceId);
+  if (!pair) {
+    pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    deviceKeyPairs.set(deviceId, pair);
+  }
+  return pair;
+}
+
+async function thumbprint(deviceId: string): Promise<string> {
+  const jwk = await crypto.subtle.exportKey('jwk', (await deviceKey(deviceId)).publicKey);
+  const canonical = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk.x });
+  return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))));
+}
+
 const hlc = (ms: number, counter = 0) =>
   `${String(ms).padStart(13, '0')}-${counter.toString(16).padStart(4, '0')}-nodea`;
 
 async function mint(sub: string, over: Record<string, unknown> = {}, key = privateKey): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
+  const deviceId = typeof over['device_id'] === 'string' ? over['device_id'] : DEVICE_A;
   const head = b64(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' }));
   const body = b64(
     JSON.stringify({
@@ -46,6 +72,8 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
       autonomy_level: 1,
       iat: now,
       exp: now + 900,
+      device_id: deviceId,
+      cnf: { jkt: await thumbprint(deviceId) },
       aud: 'xyra-cloud',
       iss: 'xyra-auth',
       ...over,
@@ -55,6 +83,51 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
     await crypto.subtle.sign('Ed25519', key, new TextEncoder().encode(`${head}.${body}`)),
   );
   return `${head}.${body}.${b64(sig)}`;
+}
+
+async function dpop(token: string, method: string, route: string): Promise<string> {
+  let payload: { device_id: string };
+  try {
+    payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as {
+      device_id: string;
+    };
+  } catch {
+    return '';
+  }
+  if (typeof payload.device_id !== 'string') return '';
+  const pair = await deviceKey(payload.device_id);
+  const jwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+  const url = new URL(route, URL_BASE);
+  url.search = '';
+  url.hash = '';
+  const header = b64(
+    JSON.stringify({ typ: 'dpop+jwt', alg: 'EdDSA', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x } }),
+  );
+  const ath = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
+  const body = b64(
+    JSON.stringify({
+      htu: url.toString(),
+      htm: method.toUpperCase(),
+      iat: Math.floor(Date.now() / 1000),
+      jti: crypto.randomUUID(),
+      ath,
+    }),
+  );
+  const signature = new Uint8Array(
+    await crypto.subtle.sign('Ed25519', pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
+  );
+  return `${header}.${body}.${b64(signature)}`;
+}
+
+async function protectedHeaders(
+  method: string,
+  route: string,
+  token: string,
+): Promise<Record<string, string>> {
+  return {
+    authorization: `Bearer ${token}`,
+    dpop: await dpop(token, method, route),
+  };
 }
 
 async function hub(
@@ -68,17 +141,18 @@ async function hub(
     .fetch(`http://hub${path}`, { method: 'POST', body: JSON.stringify(body), headers });
 }
 
-const seed = (principalId: string, over: Record<string, unknown> = {}) =>
-  hub('/internal/membership/upsert', {
-    membership: {
-      principalId,
-      tenantId: T1,
-      workspaceId: W1,
-      role: 'owner',
-      permissions: [],
-      ...over,
-    },
-  });
+const seed = (principalId: string, over: Record<string, unknown> = {}) => {
+  const membership = {
+    principalId,
+    tenantId: T1,
+    workspaceId: W1,
+    role: 'owner',
+    permissions: [],
+    ...over,
+  };
+  fixtureMemberships.set(principalId, membership);
+  return hub('/internal/membership/upsert', { membership });
+};
 
 const setKill = (engaged: boolean) =>
   hub('/internal/kill-switch/set', {
@@ -101,7 +175,11 @@ async function call(
   if (route.startsWith('/v1/sync/pull') && !route.includes('protocolVersion='))
     route += `${route.includes('?') ? '&' : '?'}protocolVersion=1&schemaVersion=cloud-sync-v1`;
   const headers: Record<string, string> = { ...extra };
-  if (token) headers['authorization'] = `Bearer ${token}`;
+  if (token) {
+    headers['authorization'] = `Bearer ${token}`;
+    const proof = await dpop(token, method, route);
+    if (proof) headers['dpop'] = proof;
+  }
   if (body !== undefined) headers['content-type'] = 'application/json';
   const res = await mf.dispatchFetch(`${URL_BASE}${route}`, {
     method,
@@ -191,6 +269,102 @@ beforeAll(async () => {
       r2Buckets: ['BLOBS'],
       kvNamespaces: ['CACHE'],
       queueProducers: { JOBS: 'jobs' },
+      serviceBindings: {
+        CLOUD_TEST_ERASURE: async (request: Request) => {
+          const body = (await request.json()) as {
+            tenantId: string;
+            workspaceId: string;
+            changes: readonly { table: string; id: string }[];
+          };
+          const fenced = body.changes.some((change) =>
+            fixtureErasureFences.has(`${body.tenantId}:${body.workspaceId}:${change.table}:${change.id}`),
+          );
+          return Response.json({ fenced });
+        },
+        CLOUD_TEST_SYNC: async (request: Request) => {
+          const route = new URL(request.url).pathname;
+          const body = (await request.json()) as Record<string, any>;
+          const access = body['access'] as AccessContext;
+          const workspace = access.claims.activeWorkspaceId;
+          let store = fixtureSyncStores.get(workspace);
+          if (!store) {
+            store = new MemorySyncStore();
+            fixtureSyncStores.set(workspace, store);
+          }
+          const engine = new SyncAuthorityEngine(store);
+          try {
+            if (route === '/push') {
+              const parsed = parseSyncPush(body['request']);
+              if (!parsed) return Response.json({ code: 'INVALID_SYNC_REQUEST' }, { status: 400 });
+              return Response.json(await engine.push(access, parsed, body['nowMs'], body['requestHash']));
+            }
+            if (route === '/pull') {
+              const result = await engine.pull(access, body['cursor'], body['limit']);
+              return result.ok
+                ? Response.json(result.response)
+                : Response.json(
+                    { code: result.code },
+                    { status: result.code === 'INVALID_CURSOR' ? 400 : 409 },
+                  );
+            }
+            if (route === '/conflicts') {
+              const result = await engine.conflictPage(access, body['after'], body['limit']);
+              return result
+                ? Response.json(result)
+                : Response.json({ code: 'INVALID_PAGE' }, { status: 400 });
+            }
+            return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+          } catch (cause) {
+            if (cause instanceof IdempotencyKeyReusedError)
+              return Response.json({ code: 'IDEMPOTENCY_KEY_REUSED' }, { status: 409 });
+            return Response.json({ code: 'SYNC_FAILURE' }, { status: 500 });
+          }
+        },
+        CLOUD_TEST_AUTHORITY: async (request: Request) => {
+          let input: any;
+          try {
+            input = await request.json();
+          } catch {
+            return Response.json({ code: 'INVALID_REQUEST' }, { status: 400 });
+          }
+          const path = new URL(request.url).pathname;
+          if (path === '/dpop') {
+            const key = `${input?.tenantId}:${input?.deviceId}:${input?.jtiHashHex}`;
+            if (!input?.jtiHashHex || fixtureDpopReplays.has(key))
+              return Response.json({ code: 'DPOP_REPLAYED' }, { status: 409 });
+            fixtureDpopReplays.add(key);
+            return Response.json({ ok: true });
+          }
+          if (path !== '/resolve') return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+          const claims = input?.claims;
+          if (!claims || typeof claims.principalId !== 'string')
+            return Response.json({ code: 'INVALID_CLAIMS' }, { status: 400 });
+          const membership = fixtureMemberships.get(claims.principalId);
+          if (
+            !membership ||
+            (typeof membership.revokedAtMs === 'number' && membership.revokedAtMs <= Date.now()) ||
+            membership.tenantId !== claims.tenantId ||
+            membership.workspaceId !== claims.activeWorkspaceId ||
+            (membership.kind ?? 'user') !== claims.kind
+          ) {
+            return Response.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, { status: 404 });
+          }
+          const delegator =
+            typeof membership.delegatedBy === 'string'
+              ? fixtureMemberships.get(membership.delegatedBy)
+              : undefined;
+          if (
+            membership.kind === 'agent' &&
+            (!delegator ||
+              (typeof delegator.revokedAtMs === 'number' && delegator.revokedAtMs <= Date.now()) ||
+              delegator.tenantId !== membership.tenantId ||
+              delegator.workspaceId !== membership.workspaceId)
+          ) {
+            return Response.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, { status: 404 });
+          }
+          return Response.json({ membership, ...(delegator ? { delegator } : {}) });
+        },
+      },
       bindings: {
         AUTH_JWT_JWK: jwk,
         AUTH_JWT_AUDIENCE: 'xyra-cloud',
@@ -221,6 +395,34 @@ afterAll(async () => {
 });
 
 describe('auth on the real Worker', () => {
+  it('keeps PKCE/passkey and refresh issuance disabled without provisioned Neon and RP configuration', async () => {
+    for (const route of [
+      '/v1/auth/passkey/begin',
+      '/v1/auth/passkey/complete',
+      '/v1/auth/passkey/register/begin',
+      '/v1/auth/passkey/register/complete',
+      '/v1/auth/token',
+      '/v1/auth/refresh',
+    ]) {
+      const result = await call('POST', route, null, {});
+      expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
+    }
+    expect(
+      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(600_000) }),
+    ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
+  });
+  it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
+    await seed(U1, { role: 'owner' });
+    expect((await call('POST', '/v1/auth/logout', null)).status).toBe(401);
+    const noSession = await mint(U1);
+    expect(await call('POST', '/v1/auth/logout', noSession)).toMatchObject({
+      status: 409, json: { code: 'SESSION_NOT_FOUND' },
+    });
+    const withSession = await mint(U1, { sid: uuid(8850) });
+    expect(await call('POST', '/v1/auth/logout', withSession)).toMatchObject({
+      status: 503, json: { code: 'AUTH_NOT_CONFIGURED' },
+    });
+  });
   it('fails closed without or with bad credentials', async () => {
     expect((await call('GET', '/v1/sync/pull', null)).status).toBe(401);
     expect((await call('GET', '/v1/sync/pull', 'a.b.c')).status).toBe(401);
@@ -235,23 +437,81 @@ describe('auth on the real Worker', () => {
     const res = await call('GET', '/v1/sync/pull', await mint('99999999-9999-4999-8999-999999999999'));
     expect(res.status).toBe(403);
   });
+  it('rejects reuse of the same valid device proof at the HTTP boundary', async () => {
+    await seed(U1);
+    const token = await mint(U1);
+    const route = '/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1';
+    const headers = await protectedHeaders('GET', route, token);
+    const first = await mf.dispatchFetch(`${URL_BASE}${route}`, { headers });
+    expect(first.status).toBe(200);
+    const replay = await mf.dispatchFetch(`${URL_BASE}${route}`, { headers });
+    expect(replay.status).toBe(401);
+    expect(await replay.json()).toMatchObject({ code: 'DPOP_REPLAYED' });
+  });
   it('protects internal Hub routes with the internal token', async () => {
     expect((await hub('/internal/membership/upsert', {}, { 'x-hub-internal-token': 'wrong' })).status).toBe(
       403,
     );
     expect((await hub('/internal/kill-switch/set', {}, {})).status).toBe(403);
   });
+
+  it('F003 keeps the original revocation timestamp across duplicate Queue deliveries', async () => {
+    await seed(U2);
+    const first = await hub('/internal/membership/revoke', { principalId: U2 });
+    const firstBody = (await first.json()) as Record<string, any>;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const duplicate = await hub('/internal/membership/revoke', { principalId: U2 });
+    const duplicateBody = (await duplicate.json()) as Record<string, any>;
+    expect(firstBody).toMatchObject({ ok: true });
+    expect(duplicateBody).toEqual(firstBody);
+    expect(typeof firstBody['revokedAtMs']).toBe('number');
+  });
+
+  it('keeps the Hub sync cache watermark monotonic under duplicate and stale outbox delivery', async () => {
+    const first = await hub('/internal/sync/cache/advance', { serverSeq: '9' });
+    const duplicate = await hub('/internal/sync/cache/advance', { serverSeq: '9' });
+    const stale = await hub('/internal/sync/cache/advance', { serverSeq: '8' });
+    const invalid = await hub('/internal/sync/cache/advance', { serverSeq: '-1' });
+    expect(await first.json()).toMatchObject({ ok: true, applied: true });
+    expect(await duplicate.json()).toMatchObject({ ok: true, applied: false });
+    expect(await stale.json()).toMatchObject({ ok: true, applied: false });
+    expect(invalid.status).toBe(400);
+  });
 });
 
 describe('sync on workerd', () => {
+  it('rejects a stale row replay after Cloud erasure fencing', async () => {
+    const id = uuid(891);
+    const token = await mint(U1);
+    const initial = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'erasure-seed-0001'));
+    expect(initial.status).toBe(200);
+    expect(initial.json?.['accepted']).toBe(1);
+    fixtureErasureFences.add(`${T1}:${W1}:ops_tasks:${id}`);
+
+    const replay = await call(
+      'POST',
+      '/v1/sync/push',
+      token,
+      pushBody([task(id, { fields: { title: { value: 'stale-resurrection', hlc: hlc(Date.now() + 1), baseHlc: null } } })], 'erasure-stale-0001'),
+    );
+    expect(replay.status).toBe(409);
+    expect(replay.json?.['code']).toBe('ERASURE_SOURCE_FENCED');
+    fixtureErasureFences.delete(`${T1}:${W1}:ops_tasks:${id}`);
+  });
+
   it('round-trips push/pull, replays idempotently and rejects payload mismatch', async () => {
     await seed(U1);
     const token = await mint(U1);
     const body = pushBody([task(uuid(1))], 'idem-roundtrip-0001');
     const first = await call('POST', '/v1/sync/push', token, body);
     expect(first.json).toMatchObject({ accepted: 1, replayed: false });
+    expect(first.json?.['changeOutcomes']).toEqual([{
+      index: 0, changeId: uuid(1), table: 'ops_tasks', rowId: uuid(1), outcome: 'committed',
+      appliedFields: ['project_id', 'title'], unchangedFields: [], conflictedFields: [],
+    }]);
     const replay = await call('POST', '/v1/sync/push', token, body);
     expect(replay.json).toMatchObject({ accepted: 1, replayed: true });
+    expect(replay.json?.['changeOutcomes']).toEqual(first.json?.['changeOutcomes']);
     const mismatch = await call(
       'POST',
       '/v1/sync/push',
@@ -263,6 +523,26 @@ describe('sync on workerd', () => {
     expect(pulled.json?.['changes'].map((c: any) => c.change.id)).toContain(uuid(1));
     const after = await call('GET', `/v1/sync/pull?cursor=${pulled.json?.['cursor']}`, token);
     expect(after.json?.['changes']).toEqual([]);
+  });
+
+  it('returns a complete field disposition for unchanged values and rejected rows', async () => {
+    await seed(U1);
+    const token = await mint(U1);
+    const id = uuid(22);
+    const initial = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'outcome-seed-0001'));
+    expect(initial.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed' });
+    const duplicate = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'outcome-repeat-0001'));
+    expect(duplicate.json).toMatchObject({ accepted: 0, changeOutcomes: [{
+      index: 0, changeId: id, table: 'ops_tasks', rowId: id, outcome: 'unchanged',
+      appliedFields: [], unchangedFields: ['project_id', 'title'], conflictedFields: [],
+    }] });
+    const rejected = await call('POST', '/v1/sync/push', token, pushBody([
+      task(uuid(23), { fields: { status: { value: 'forged', hlc: hlc(Date.now()), baseHlc: null } } }),
+    ], 'outcome-rejected-0001'));
+    expect(rejected.json?.['changeOutcomes']).toEqual([{
+      index: 0, changeId: uuid(23), table: 'ops_tasks', rowId: uuid(23), outcome: 'rejected',
+      appliedFields: [], unchangedFields: [], conflictedFields: [], rejectionCode: 'GUARDED_FIELD',
+    }]);
   });
   it('rejects cross-tenant rows and guarded fields per row', async () => {
     await seed(U1);
@@ -415,8 +695,9 @@ describe('leases and kill switch on workerd', () => {
       headers: { upgrade: 'websocket' },
     });
     expect(denied.status).toBe(401);
+    const token = await mint(id);
     const res = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
-      headers: { upgrade: 'websocket', authorization: `Bearer ${await mint(id)}` },
+      headers: { upgrade: 'websocket', ...(await protectedHeaders('GET', '/v1/workspace/events', token)) },
     });
     expect(res.status).toBe(101);
     const socket = res.webSocket;
@@ -443,8 +724,12 @@ describe('leases and kill switch on workerd', () => {
     await setKill(true);
     await new Promise((r) => setTimeout(r, 500));
     expect(messages.length).toBe(before);
+    const retryToken = await mint(id);
     const retry = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
-      headers: { upgrade: 'websocket', authorization: `Bearer ${await mint(id)}` },
+      headers: {
+        upgrade: 'websocket',
+        ...(await protectedHeaders('GET', '/v1/workspace/events', retryToken)),
+      },
     });
     expect(retry.status).toBe(403);
     await setKill(false);
@@ -453,13 +738,39 @@ describe('leases and kill switch on workerd', () => {
 
 describe('blob references on workerd', () => {
   const ref = (token: string, body: Record<string, unknown>) => call('POST', '/v1/blobs/ref', token, body);
+  it('fails closed on reference-set registration without durable Neon authority', async () => {
+    await seed(U1, { role: 'owner' });
+    const token = await mint(U1);
+    const response = await call('POST', '/v2/brain/ingestions', token, {
+      protocolVersion: 'cloud-ingest-v2', sourceId: uuid(8801), mode: 'text_only',
+    });
+    expect(response).toMatchObject({
+      status: 503,
+      json: { code: 'INGESTION_STORAGE_UNAVAILABLE' },
+    });
+    const obsolete = await call('POST', '/v1/blob-reference-sets', token, {
+      protocolVersion: 'cloud-erasure-v1', sourceId: uuid(8801), objectRefIds: [],
+    });
+    expect(obsolete).toMatchObject({ status: 426, json: { code: 'UPDATE_REQUIRED', protocolVersion: 'cloud-ingest-v2' } });
+  });
+
   it('enforces TTL cap, length, membership and kill-switch at redemption', async () => {
     await setKill(false);
     await seed(U1);
     const token = await mint(U1);
     expect((await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 301 })).status).toBe(403);
+    const untrackedIngestion = await ref(token, {
+      mode: 'PUT', name: 'ingestion.txt', expiresInSec: 120, ingestionId: uuid(7701),
+    });
+    expect(untrackedIngestion).toMatchObject({
+      status: 503,
+      json: { code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' },
+    });
     const put = await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 120 });
     expect(put.status).toBe(200);
+    expect(put.json).not.toHaveProperty('key');
+    expect(put.json).toMatchObject({ mode: 'PUT', referenceStatus: 'references_unknown' });
+    expect(put.json?.['url']).toMatch(/^\/v1\/blobs\/access\/[A-Za-z0-9_.-]+$/);
     const url = `${URL_BASE}${put.json?.['url']}`;
     const stream = new ReadableStream({
       start(controller) {
@@ -486,6 +797,8 @@ describe('blob references on workerd', () => {
       ).status,
     ).toBe(204);
     const get = await ref(token, { mode: 'GET', name: 'a.txt', expiresInSec: 120 });
+    expect(get.json).not.toHaveProperty('key');
+    expect(get.json?.['url']).toMatch(/^\/v1\/blobs\/access\/[A-Za-z0-9_.-]+$/);
     const read = await mf.dispatchFetch(`${URL_BASE}${get.json?.['url']}`);
     expect(await read.text()).toBe('hello blob');
     await setKill(true);
@@ -497,7 +810,119 @@ describe('blob references on workerd', () => {
   });
 });
 
+describe('development Worker configuration without R2', () => {
+  it('fails blob GET/PUT closed while authorized non-blob sync remains available', async () => {
+    const devConfig = readFileSync(path.join(appDir, 'wrangler.dev.jsonc'), 'utf8');
+    expect(devConfig).toContain('"name": "institutional-agent-os-dev-cloud"');
+    expect(devConfig).not.toMatch(/^\s*"r2_buckets"\s*:/m);
+    expect(devConfig).toContain('No-R2 development deployment is supported');
+
+    const original = mf;
+    const signingJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', privateKey));
+    const noR2 = new Miniflare(
+      convertV4MiniflareOptions({
+        modules: true,
+        modulesRoot: outDir,
+        scriptPath: path.join(outDir, 'index.js'),
+        compatibilityDate: '2026-09-30',
+        compatibilityFlags: ['nodejs_compat'],
+        durableObjects: { HUB: { className: 'WorkspaceHub', useSQLite: true } },
+        bindings: {
+          AUTH_JWT_JWK: signingJwk,
+          AUTH_JWT_AUDIENCE: 'xyra-cloud',
+          AUTH_JWT_ISSUER: 'xyra-auth',
+          HUB_INTERNAL_TOKEN: INTERNAL,
+          BLOB_ACCESS_SECRET: 'blob-secret-for-no-r2-test',
+        },
+        serviceBindings: {
+          CLOUD_TEST_AUTHORITY: async (request: Request) => {
+            const path = new URL(request.url).pathname;
+            if (path === '/dpop') return Response.json({ ok: true });
+            if (path !== '/resolve') return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+            const body = (await request.json()) as { claims?: { principalId?: string } };
+            const membership = fixtureMemberships.get(body.claims?.principalId ?? '');
+            return membership
+              ? Response.json({ membership })
+              : Response.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, { status: 404 });
+          },
+          CLOUD_TEST_SYNC: async (request: Request) => {
+            const body = (await request.json()) as Record<string, any>;
+            const result = await new SyncAuthorityEngine(new MemorySyncStore()).pull(
+              body['access'] as AccessContext,
+              body['cursor'],
+              body['limit'],
+            );
+            return result.ok ? Response.json(result.response) : Response.json({ code: result.code }, { status: 400 });
+          },
+        },
+      }),
+    );
+    mf = noR2;
+    try {
+      const health = await noR2.dispatchFetch(`${URL_BASE}/v1/health`);
+      expect(health.status).toBe(200);
+      expect(await health.json()).toMatchObject({ status: 'ok', r2: 'unconfigured' });
+
+      for (const mode of ['GET', 'PUT'] as const) {
+        const token = await signBlobAccess(
+          {
+            key: `${T1}/${W1}/no-r2-${mode.toLowerCase()}`,
+            principalId: U2,
+            mode,
+            expiresAtMs: Date.now() + 60_000,
+          },
+          'blob-secret-for-no-r2-test',
+        );
+        const response = await noR2.dispatchFetch(`${URL_BASE}/v1/blobs/access/${token}`, {
+          method: mode,
+          ...(mode === 'PUT' ? { body: 'test blob', headers: { 'content-length': '9' } } : {}),
+        });
+        expect(response.status).toBe(503);
+        expect(await response.json()).toEqual({ code: 'BLOB_STORAGE_UNAVAILABLE' });
+      }
+
+      await seed(U2);
+      const token = await mint(U2);
+      const ref = await call('POST', '/v1/blobs/ref', token, {
+        mode: 'GET',
+        name: 'no-r2-reference',
+        expiresInSec: 60,
+      });
+      expect(ref.status).toBe(503);
+      expect(ref.json).toEqual({ code: 'BLOB_STORAGE_UNAVAILABLE' });
+      const pull = await call('GET', '/v1/sync/pull', token);
+      expect(pull.status).toBe(200);
+      expect(pull.json).toMatchObject({ changes: [], serverSeq: '0' });
+    } finally {
+      mf = original;
+      await noR2.dispose();
+    }
+  });
+});
+
 describe('cycle-1 review regressions on real workerd HTTP', () => {
+  it('keeps erasure initiation authenticated and fails closed without durable approval storage', async () => {
+    await seed(U1, { role: 'owner' });
+    const token = await mint(U1);
+    const request = {
+      protocolVersion: 'cloud-erasure-v1', erasureId: uuid(9101), attemptId: uuid(9102), approvalId: uuid(9103),
+      source: { kind: 'brain_source', id: uuid(9104) }, sourceVersion: `cloud-ingest-v2:sha256:${'a'.repeat(64)}`,
+    };
+    expect(await call('POST', '/v1/erasures', token, { ...request, tenantId: T2 }))
+      .toMatchObject({ status: 400, json: { code: 'INVALID_ERASURE_REQUEST' } });
+    expect(await call('POST', '/v1/erasures', token, request))
+      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, token))
+      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    expect(await call('POST', `/v1/erasures/${uuid(9101)}/claim-local-purge`, token,
+      { protocolVersion: 'cloud-erasure-v1', attemptId: uuid(9102), reservationId: uuid(9105) }))
+      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    await seed(U2, { role: 'viewer' });
+    const viewer = await mint(U2);
+    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, viewer))
+      .toMatchObject({ status: 403, json: { code: 'PERMISSION_DENIED' } });
+  });
+
   it('CLD-R-001 rejects a lease body that tries to replace verified claims', async () => {
     await setKill(false);
     await seed(U1);
@@ -682,6 +1107,8 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       (await call('POST', '/v1/sync/push', token, pushBody([initial(a, 'old', older)]))).json?.['accepted'],
     ).toBe(1);
     const win = await call('POST', '/v1/sync/push', token, pushBody([update(a, 'new', newer, null)]));
+    expect(win.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed',
+      appliedFields: ['title'], unchangedFields: [], conflictedFields: [] });
     expect(win.json?.['conflictHistory']).toContainEqual(
       expect.objectContaining({ rowId: a, losingValue: 'old' }),
     );
@@ -692,11 +1119,15 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       pushBody([update(a, 'next', hlc(base, 3), newer)]),
     );
     expect(sequential.json?.['conflicts']).toBe(0);
+    expect(sequential.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed',
+      appliedFields: ['title'], unchangedFields: [], conflictedFields: [] });
     const b = uuid(406);
     expect(
       (await call('POST', '/v1/sync/push', token, pushBody([initial(b, 'new', newer)]))).json?.['accepted'],
     ).toBe(1);
     const lose = await call('POST', '/v1/sync/push', token, pushBody([update(b, 'old', older, null)]));
+    expect(lose.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'conflict',
+      appliedFields: [], unchangedFields: [], conflictedFields: ['title'] });
     expect(lose.json?.['conflictHistory']).toContainEqual(
       expect.objectContaining({ rowId: b, losingValue: 'old' }),
     );
@@ -738,7 +1169,10 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     });
     const rejected = await mf.dispatchFetch(`${URL_BASE}/v1/sync/push`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers: {
+        ...(await protectedHeaders('POST', '/v1/sync/push', token)),
+        'content-type': 'application/json',
+      },
       body: stream,
       duplex: 'half',
     } as never);
@@ -763,7 +1197,11 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const page = await mf.dispatchFetch(
       `${URL_BASE}/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1`,
       {
-        headers: { authorization: `Bearer ${readerToken}` },
+        headers: await protectedHeaders(
+          'GET',
+          '/v1/sync/pull?protocolVersion=1&schemaVersion=cloud-sync-v1',
+          readerToken,
+        ),
       },
     );
     const raw = await page.text();
@@ -785,12 +1223,12 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const incompatible = await mf.dispatchFetch(
       `${URL_BASE}/v1/sync/pull?protocolVersion=99&schemaVersion=old`,
       {
-        headers: { authorization: `Bearer ${token}` },
+        headers: await protectedHeaders('GET', '/v1/sync/pull?protocolVersion=99&schemaVersion=old', token),
       },
     );
     expect(incompatible.status).toBe(426);
     const missing = await mf.dispatchFetch(`${URL_BASE}/v1/sync/pull`, {
-      headers: { authorization: `Bearer ${token}` },
+      headers: await protectedHeaders('GET', '/v1/sync/pull', token),
     });
     expect(missing.status).toBe(426);
     const supported = await call('GET', '/v1/sync/pull', token);
@@ -812,7 +1250,7 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const expires = Math.floor(Date.now() / 1000) + 2;
     const token = await mint(id, { exp: expires });
     const response = await mf.dispatchFetch(`${URL_BASE}/v1/workspace/events`, {
-      headers: { upgrade: 'websocket', authorization: `Bearer ${token}` },
+      headers: { upgrade: 'websocket', ...(await protectedHeaders('GET', '/v1/workspace/events', token)) },
     });
     expect(response.status).toBe(101);
     const socket = response.webSocket;
@@ -947,11 +1385,16 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const key = 'review:lease-cleanup';
     const first = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(first.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 5_100));
-    const maintained = await hub('/internal/maintenance', {});
-    const body = (await maintained.json()) as Record<string, any>;
-    expect(body['expiredLeases']).toBeGreaterThanOrEqual(1);
+    const expiryDeadline = Date.now() + 8_000;
+    let expiredLeases = 0;
+    while (expiredLeases < 1 && Date.now() < expiryDeadline) {
+      const maintained = await hub('/internal/maintenance', {});
+      const body = (await maintained.json()) as Record<string, any>;
+      expiredLeases = typeof body['expiredLeases'] === 'number' ? body['expiredLeases'] : 0;
+      if (expiredLeases < 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(expiredLeases, 'lease did not expire within the 8 second poll deadline').toBeGreaterThanOrEqual(1);
     const next = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(next.json?.['lease'].fence).toBeGreaterThan(first.json?.['lease'].fence);
-  }, 12_000);
+  }, 20_000);
 });

@@ -4,6 +4,7 @@ export interface BlobAccess {
   readonly principalId: string;
   readonly mode: 'GET' | 'PUT';
   readonly expiresAtMs: number;
+  readonly ingestionId?: string;
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -75,7 +76,8 @@ export async function verifyBlobAccess(
       !/^[0-9a-f-]{36}$/i.test(parsed.principalId) ||
       typeof parsed.expiresAtMs !== 'number' ||
       !Number.isSafeInteger(parsed.expiresAtMs) ||
-      parsed.expiresAtMs <= nowMs
+      parsed.expiresAtMs <= nowMs ||
+      (parsed.ingestionId !== undefined && (typeof parsed.ingestionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(parsed.ingestionId)))
     ) {
       return null;
     }
@@ -84,6 +86,7 @@ export async function verifyBlobAccess(
       principalId: parsed.principalId,
       mode: parsed.mode,
       expiresAtMs: parsed.expiresAtMs,
+      ...(typeof parsed.ingestionId === 'string' ? { ingestionId: parsed.ingestionId } : {}),
     };
   } catch {
     return null;

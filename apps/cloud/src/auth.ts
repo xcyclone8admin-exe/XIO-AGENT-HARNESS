@@ -37,6 +37,8 @@ interface JwtPayload {
   readonly run_id?: unknown;
   readonly aud?: unknown;
   readonly iss?: unknown;
+  readonly cnf?: unknown;
+  readonly sid?: unknown;
 }
 
 function decodeBase64Url(value: string): Uint8Array<ArrayBuffer> | null {
@@ -86,6 +88,12 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
   const deviceId = optionalUuid(payload.device_id);
   const delegatedBy = optionalUuid(payload.delegated_by);
   const runId = optionalUuid(payload.run_id);
+  const sessionFamilyId = optionalUuid(payload.sid);
+  const confirmation = payload.cnf;
+  const deviceThumbprint =
+    confirmation && typeof confirmation === 'object'
+      ? (confirmation as Record<string, unknown>)['jkt']
+      : undefined;
   if (
     typeof payload.sub !== 'string' ||
     typeof payload.tenant_id !== 'string' ||
@@ -107,8 +115,12 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
     (payload.nbf !== undefined &&
       (!isNumericDate(payload.nbf) || payload.nbf > nowSeconds + CLOCK_LEEWAY_SEC)) ||
     deviceId === null ||
+    !deviceId ||
+    typeof deviceThumbprint !== 'string' ||
+    !/^[A-Za-z0-9_-]{43}$/.test(deviceThumbprint) ||
     delegatedBy === null ||
     runId === null ||
+    sessionFamilyId === null ||
     // An agent token must name its delegating user; a user token must not claim one.
     (payload.kind === 'agent') !== (delegatedBy !== undefined) ||
     !validAudience(payload.aud, config.audience) ||
@@ -124,10 +136,99 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
     activeWorkspaceId: payload.active_workspace,
     autonomy: payload.autonomy_level as CandidateClaims['autonomy'],
     expiresAtMs: payload.exp * 1000,
+    deviceThumbprint,
     ...(deviceId ? { deviceId } : {}),
     ...(delegatedBy ? { delegatedBy } : {}),
     ...(runId ? { runId } : {}),
+    ...(sessionFamilyId ? { sessionFamilyId } : {}),
   };
+}
+
+export interface AccessTokenInput {
+  readonly principalId: string;
+  readonly kind: 'user' | 'agent';
+  readonly tenantId: string;
+  readonly workspaceIds: readonly string[];
+  readonly activeWorkspaceId: string;
+  readonly autonomy: 0 | 1 | 2 | 3 | 4;
+  readonly deviceId: string;
+  readonly delegatedBy?: string;
+  readonly runId?: string;
+  readonly sessionFamilyId?: string;
+  readonly deviceThumbprint: string;
+}
+
+/** Issue only short-lived, device-bound Worker access tokens (15 minutes maximum). */
+export async function issueAccessToken(
+  input: AccessTokenInput,
+  config: { privateJwk: string; audience: string; issuer: string; nowMs?: number },
+): Promise<string> {
+  const workspaceIds = [...new Set(input.workspaceIds)];
+  const agentIdentityValid =
+    input.kind === 'agent'
+      ? !!input.delegatedBy && !!input.runId && UUID.test(input.delegatedBy) && UUID.test(input.runId)
+      : !input.delegatedBy && !input.runId;
+  if (
+    !UUID.test(input.principalId) ||
+    !UUID.test(input.tenantId) ||
+    !UUID.test(input.deviceId) ||
+    !workspaceIds.length ||
+    workspaceIds.length !== input.workspaceIds.length ||
+    !workspaceIds.every((id) => UUID.test(id)) ||
+    !workspaceIds.includes(input.activeWorkspaceId) ||
+    ![0, 1, 2, 3, 4].includes(input.autonomy) ||
+    !agentIdentityValid ||
+    (input.sessionFamilyId !== undefined && !UUID.test(input.sessionFamilyId)) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(input.deviceThumbprint) ||
+    !config.audience ||
+    !config.issuer
+  )
+    throw new Error('Invalid access-token claims');
+  const now = Math.floor((config.nowMs ?? Date.now()) / 1000);
+  const header = encodeBase64Url(new TextEncoder().encode(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' })));
+  const payload = encodeBase64Url(
+    new TextEncoder().encode(
+      JSON.stringify({
+        sub: input.principalId,
+        kind: input.kind,
+        tenant_id: input.tenantId,
+        workspace_ids: workspaceIds,
+        active_workspace: input.activeWorkspaceId,
+        autonomy_level: input.autonomy,
+        device_id: input.deviceId,
+        ...(input.delegatedBy ? { delegated_by: input.delegatedBy } : {}),
+        ...(input.runId ? { run_id: input.runId } : {}),
+        ...(input.sessionFamilyId ? { sid: input.sessionFamilyId } : {}),
+        cnf: { jkt: input.deviceThumbprint },
+        iat: now,
+        exp: now + 15 * 60,
+        aud: config.audience,
+        iss: config.issuer,
+      }),
+    ),
+  );
+  const privateJwk = JSON.parse(config.privateJwk) as JsonWebKey;
+  if (
+    privateJwk.kty !== 'OKP' ||
+    privateJwk.crv !== 'Ed25519' ||
+    typeof privateJwk.x !== 'string' ||
+    typeof privateJwk.d !== 'string' ||
+    !/^[A-Za-z0-9_-]{43}$/.test(privateJwk.x) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(privateJwk.d)
+  )
+    throw new Error('Invalid access signing key');
+  const key = await crypto.subtle.importKey('jwk', privateJwk, { name: 'Ed25519' }, false, ['sign']);
+  const signingInput = `${header}.${payload}`;
+  const signature = new Uint8Array(
+    await crypto.subtle.sign('Ed25519', key, new TextEncoder().encode(signingInput)),
+  );
+  return `${signingInput}.${encodeBase64Url(signature)}`;
+}
+
+function encodeBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const value of bytes) binary += String.fromCharCode(value);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
 /** Verifies an Ed25519 access JWT. Claim data is intentionally not authorization. */

@@ -37,29 +37,32 @@ export interface Page<T> {
 
 export const byteLength = (text: string): number => new TextEncoder().encode(text).byteLength;
 
+/** Local and Neon stores may complete synchronously or asynchronously behind the same engine. */
+export type MaybePromise<T> = T | Promise<T>;
+
 /**
- * Storage port for the pure sync engine. The Durable Object implements it over SQLite inside one
- * transactionSync; tests use the in-memory implementation. Both compact the log the same way.
+ * Storage port for the pure sync engine. The Worker supplies a transaction-scoped Neon adapter;
+ * local engine tests use the in-memory implementation. Both compact the log the same way.
  */
 export interface SyncStorePort {
-  getRow(key: string): StoredRow | undefined;
-  putRow(key: string, row: StoredRow): void;
-  serverSeq(): bigint;
+  getRow(key: string): MaybePromise<StoredRow | undefined>;
+  putRow(key: string, row: StoredRow): MaybePromise<void>;
+  serverSeq(): MaybePromise<bigint>;
   /**
    * Appends to the ordered log and returns the new server sequence. Superseded field writes are
    * removed from earlier entries (and emptied entries dropped): replaying the compacted log from any
    * cursor still converges to the same rows, so compaction never invalidates a cursor.
    */
-  appendLog(change: RowChange): bigint;
-  readLogPage(request: PageRequest): Page<SequencedChange>;
-  getIdempotency(key: string): IdempotencyEntry | undefined;
-  putIdempotency(key: string, entry: IdempotencyEntry): void;
-  pruneIdempotency(beforeMs: number): void;
-  addConflict(record: ConflictRecord): void;
-  readConflictPage(request: PageRequest): Page<StoredConflict>;
+  appendLog(change: RowChange): MaybePromise<bigint>;
+  readLogPage(request: PageRequest): MaybePromise<Page<SequencedChange>>;
+  getIdempotency(key: string): MaybePromise<IdempotencyEntry | undefined>;
+  putIdempotency(key: string, entry: IdempotencyEntry): MaybePromise<void>;
+  pruneIdempotency(beforeMs: number): MaybePromise<void>;
+  addConflict(record: ConflictRecord): MaybePromise<void>;
+  readConflictPage(request: PageRequest): MaybePromise<Page<StoredConflict>>;
   /** Parent keys a live child row references; replaced wholesale on every child write. */
-  setRefs(childKey: string, parentKeys: readonly string[]): void;
-  hasLiveChildren(parentKey: string): boolean;
+  setRefs(childKey: string, parentKeys: readonly string[]): MaybePromise<void>;
+  hasLiveChildren(parentKey: string): MaybePromise<boolean>;
 }
 
 const rowKey = (change: RowChange): string => `${change.table}:${change.id}`;

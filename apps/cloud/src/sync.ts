@@ -6,10 +6,12 @@ import {
   PushRequest as PushRequestSchema,
   SYNC_PROTOCOL_VERSION,
   SYNC_SCHEMA_VERSION,
+  assertPushResponseBoundToRequest,
   type ConflictRecord,
   type PullResponse,
   type PushRequest,
   type PushResponse,
+  type PushChangeOutcome,
   type RowChange,
   type SyncRejection,
   type SyncRejectionCode,
@@ -208,9 +210,8 @@ function parentKeys(rule: TableRule, fields: Readonly<Record<string, FieldWrite>
 }
 
 /**
- * Pure field-LWW authority engine over a storage port. The caller (WorkspaceHub) must run push()
- * inside a single storage transaction so rows, log, seq, conflicts and the idempotency record
- * commit or roll back together.
+ * Pure field-LWW authority engine over a storage port. The Worker runs push() inside a single
+ * Neon transaction so rows, log, sequence, conflicts and idempotency commit or roll back together.
  */
 export class SyncAuthorityEngine {
   constructor(readonly store: SyncStorePort = new MemorySyncStore()) {}
@@ -221,21 +222,21 @@ export class SyncAuthorityEngine {
     return this.store.snapshot();
   }
 
-  private liveParent(key: string): boolean {
-    const parent = this.store.getRow(key);
+  private async liveParent(key: string): Promise<boolean> {
+    const parent = await this.store.getRow(key);
     return parent !== undefined && parent.deletedHlc === undefined;
   }
 
-  push(
+  async push(
     access: AccessContext,
     request: PushRequest,
     nowMs = Date.now(),
     requestHash = fallbackHash(request),
-  ): PushResponse {
+  ): Promise<PushResponse> {
     const store = this.store;
     const replayKey = idempotencyKey(access, request);
-    store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
-    const previous = store.getIdempotency(replayKey);
+    await store.pruneIdempotency(nowMs - IDEMPOTENCY_RETENTION_MS);
+    const previous = await store.getIdempotency(replayKey);
     if (previous) {
       if (previous.hash !== requestHash) throw new IdempotencyKeyReusedError();
       return { ...previous.response, replayed: true };
@@ -243,6 +244,7 @@ export class SyncAuthorityEngine {
 
     const rejected: SyncRejection[] = [];
     const conflicts: ConflictRecord[] = [];
+    const changeOutcomes: PushChangeOutcome[] = [];
     let accepted = 0;
     const reject = (index: number, change: RowChange, code: SyncRejectionCode, reason?: string): void => {
       rejected.push({ index, changeId: change.id, code, ...(reason ? { reason } : {}) });
@@ -252,30 +254,58 @@ export class SyncAuthorityEngine {
       const validated = validateChange(access, change, nowMs);
       if ('code' in validated) {
         reject(index, change, validated.code, validated.reason);
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: validated.code });
         continue;
       }
       const { rule } = validated;
       const rowKey = keyFor(change.table, change.id);
-      const current = store.getRow(rowKey);
+      const current = await store.getRow(rowKey);
 
       if (change.op === 'delete') {
-        if (current?.deletedHlc && compareHlc(change.hlc, current.deletedHlc) <= 0) continue;
-        // Parents referenced by live rows cannot be removed (the migration's ON DELETE RESTRICT).
-        if (store.hasLiveChildren(rowKey)) {
-          reject(index, change, 'ORPHAN_REFERENCE', 'LIVE_CHILDREN');
+        if (current?.deletedHlc && compareHlc(change.hlc, current.deletedHlc) <= 0) {
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'unchanged', appliedFields: [], unchangedFields: [], conflictedFields: [] });
           continue;
         }
-        store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
-        store.setRefs(rowKey, []);
-        store.appendLog({ ...change, fields: {} });
+        // Parents referenced by live rows cannot be removed (the migration's ON DELETE RESTRICT).
+        if (await store.hasLiveChildren(rowKey)) {
+          reject(index, change, 'ORPHAN_REFERENCE', 'LIVE_CHILDREN');
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+            rejectionCode: 'ORPHAN_REFERENCE' });
+          continue;
+        }
+        await store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
+        await store.setRefs(rowKey, []);
+        await store.appendLog({ ...change, fields: {} });
         accepted += 1;
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'committed', appliedFields: [], unchangedFields: [], conflictedFields: [] });
         continue;
       }
       if (current?.deletedHlc) {
         reject(index, change, 'TOMBSTONED');
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [], rejectionCode: 'TOMBSTONED' });
         continue;
       }
-      if (rule.authority === 'append' && current) continue; // insert-only; redelivery is a no-op
+      if (rule.authority === 'append' && current) { // insert-only; only identical submitted values are a no-op
+        const unchangedFields = Object.keys(change.fields).filter((field) =>
+          canonical(current.fields[field]?.value) === canonical(change.fields[field]?.value)).sort();
+        const differs = unchangedFields.length !== Object.keys(change.fields).length;
+        if (differs) {
+          reject(index, change, 'IMMUTABLE_FIELD');
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+            rejectionCode: 'IMMUTABLE_FIELD' });
+        } else {
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'unchanged', appliedFields: [], unchangedFields, conflictedFields: [] });
+        }
+        continue;
+      }
 
       const insert = current === undefined;
       const incoming: Record<string, FieldWrite> = insert
@@ -285,21 +315,29 @@ export class SyncAuthorityEngine {
       const next: Record<string, FieldWrite> = { ...existing };
       const applied: Record<string, FieldWrite> = {};
       const rowConflicts: ConflictRecord[] = [];
+      const appliedFields: string[] = [];
+      const unchangedFields: string[] = [];
+      const conflictedFields: string[] = [];
       for (const [field, write] of Object.entries(incoming)) {
         const stored = existing[field];
         if (!stored) {
           next[field] = write;
           applied[field] = write;
+          if (Object.hasOwn(change.fields, field)) appliedFields.push(field);
+          continue;
+        }
+        if (canonical(write.value) === canonical(stored.value)) {
+          unchangedFields.push(field);
           continue;
         }
         const order = compareHlc(write.hlc, stored.hlc);
-        if (order === 0 && canonical(write.value) === canonical(stored.value)) continue; // redelivery
         // Sequential: the writer saw the stored value. Otherwise the writes were concurrent and the
         // loser is retained whichever arrived first (CLD-R-006).
         const sequential = write.baseHlc !== null && compareHlc(write.baseHlc, stored.hlc) === 0;
         if (order > 0) {
           next[field] = write;
           applied[field] = write;
+          if (Object.hasOwn(change.fields, field)) appliedFields.push(field);
           if (!sequential) {
             rowConflicts.push({
               table: change.table,
@@ -311,6 +349,7 @@ export class SyncAuthorityEngine {
             });
           }
         } else {
+          conflictedFields.push(field);
           rowConflicts.push({
             table: change.table,
             rowId: change.id,
@@ -326,27 +365,42 @@ export class SyncAuthorityEngine {
       const problem = checkRow(rule.columns, incoming, false) ?? checkRow(rule.columns, next, insert);
       if (problem) {
         reject(index, change, 'SCHEMA_VIOLATION', `${problem.kind}:${problem.field}`.slice(0, 64));
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: 'SCHEMA_VIOLATION' });
         continue;
       }
       const parents = parentKeys(rule, next);
-      if (parents.some((parent) => !this.liveParent(parent))) {
+      if (!(await Promise.all(parents.map((parent) => this.liveParent(parent)))).every(Boolean)) {
         reject(index, change, 'ORPHAN_REFERENCE');
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: 'ORPHAN_REFERENCE' });
         continue;
       }
       if (byteLength(JSON.stringify(next)) > MAX_ROW_BYTES) {
         reject(index, change, 'ROW_TOO_LARGE');
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: 'ROW_TOO_LARGE' });
         continue;
       }
       for (const conflict of rowConflicts) {
         conflicts.push(conflict);
-        store.addConflict(conflict);
+        await store.addConflict(conflict);
       }
       if (Object.keys(applied).length > 0) {
-        store.putRow(rowKey, { fields: next });
-        store.setRefs(rowKey, parents);
-        store.appendLog({ ...change, fields: applied });
+        await store.putRow(rowKey, { fields: next });
+        await store.setRefs(rowKey, parents);
+        await store.appendLog({ ...change, fields: applied });
         accepted += 1;
       }
+      const sortedApplied = appliedFields.sort();
+      const sortedUnchanged = unchangedFields.sort();
+      const sortedConflicted = conflictedFields.sort();
+      changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+        outcome: sortedApplied.length ? 'committed' : sortedConflicted.length ? 'conflict' : 'unchanged',
+        appliedFields: sortedApplied, unchangedFields: sortedUnchanged, conflictedFields: sortedConflicted });
     }
 
     // Inline history is bounded; the full record is always paged from /v1/sync/conflicts.
@@ -360,12 +414,14 @@ export class SyncAuthorityEngine {
     const response: PushResponse = {
       accepted,
       conflicts: conflicts.length,
-      serverSeq: store.serverSeq().toString(10),
+      serverSeq: (await store.serverSeq()).toString(10),
       rejected,
       conflictHistory: inline,
+      changeOutcomes,
       replayed: false,
     };
-    store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
+    assertPushResponseBoundToRequest(request, response);
+    await store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
     return response;
   }
 
@@ -383,12 +439,12 @@ export class SyncAuthorityEngine {
    * The cursor advances past unreadable entries and carries the read scope, so a grant change
    * forces a resync (and local purge) instead of silently skipping or leaking rows (CLD-R-003).
    */
-  pull(
+  async pull(
     access: AccessContext,
     cursor: string | undefined,
     limit = MAX_PULL_ROWS,
     maxBytes = MAX_PULL_BYTES,
-  ): PullOutcome {
+  ): Promise<PullOutcome> {
     const decoded = decodeCursor(cursor);
     if (!decoded || !Number.isInteger(limit) || limit < 1 || limit > MAX_PULL_ROWS)
       return { ok: false, code: 'INVALID_CURSOR' };
@@ -396,8 +452,8 @@ export class SyncAuthorityEngine {
     const scope = scopeFingerprint(readable);
     if (decoded.scope !== null && decoded.scope !== scope) return { ok: false, code: 'RESYNC_REQUIRED' };
     const allowed = new Set(readable);
-    const serverSeq = this.store.serverSeq();
-    const page = this.store.readLogPage({
+    const serverSeq = await this.store.serverSeq();
+    const page = await this.store.readLogPage({
       after: decoded.seq,
       maxRows: limit,
       maxBytes,
@@ -419,16 +475,16 @@ export class SyncAuthorityEngine {
   }
 
   /** Conflict history is retained (REQ-DATA-008), read-filtered and paged by rows and bytes. */
-  conflictPage(
+  async conflictPage(
     access: AccessContext,
     afterId: number,
     limit: number,
     maxBytes = MAX_PULL_BYTES,
-  ): { items: StoredConflict[]; more: boolean; next: number } | null {
+  ): Promise<{ items: StoredConflict[]; more: boolean; next: number } | null> {
     if (!Number.isSafeInteger(afterId) || afterId < 0 || !Number.isInteger(limit) || limit < 1 || limit > 200)
       return null;
     const allowed = new Set(this.readableTables(access));
-    const page = this.store.readConflictPage({
+    const page = await this.store.readConflictPage({
       after: BigInt(afterId),
       maxRows: limit,
       maxBytes,
