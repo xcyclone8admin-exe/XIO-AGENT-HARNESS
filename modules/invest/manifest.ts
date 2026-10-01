@@ -66,6 +66,7 @@ export default defineModule({
     { name: 'invest_market_sessions', class: 'append', authority: 'server', readPermission: 'invest:market:read', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_tax_lots', class: 'local', authority: 'server', readPermission: 'invest:order:read', serverWriteCapabilities: ['invest_paper_execution'] },
     { name: 'invest_tax_lot_events', class: 'append', authority: 'server', readPermission: 'invest:order:read', serverWriteCapabilities: ['invest_paper_execution'] },
+    { name: 'invest_breach_events', class: 'append', authority: 'server', readPermission: 'invest:breach:manage', serverWriteCapabilities: ['invest_paper', 'invest_paper_execution'] },
     { name: 'invest_portfolio_risk_state', class: 'local', authority: 'server', readPermission: 'invest:breach:manage', serverWriteCapabilities: ['invest_paper', 'invest_paper_execution'] },
     { name: 'invest_limit_changes', class: 'append', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_ic_memos', class: 'local', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },

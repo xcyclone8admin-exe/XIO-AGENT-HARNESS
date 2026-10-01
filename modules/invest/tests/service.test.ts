@@ -193,6 +193,16 @@ test('price marks revalue ledger positions, record breaches, auto-halt and cance
   expect(cancelled.find((order) => order.id === pending.id)?.status).toBe('cancelled');
   const breach = await db.query<{kind:string}>(`SELECT kind FROM invest_breaches WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status='open'`, [tenantId, workspaceId, portfolio.id]);
   expect(breach.rows.map((row) => row.kind)).toContain('daily_loss');
+  const alert = (await service.breaches(scope)).find((item) => item.portfolio_id === portfolio.id && item.kind === 'daily_loss');
+  expect(alert).toBeDefined();
+  if (!alert) throw new Error('Expected persisted daily-loss alert');
+  const owner = human(userId);
+  await expect(service.manageBreach(scope, human(secondUserId), { breachId: alert.id, action: 'acknowledge', reason: 'unassigned user cannot acknowledge' })).rejects.toThrow(/assigned owner/);
+  await service.manageBreach(scope, owner, { breachId: alert.id, action: 'assign', reason: 'I own the follow-up' });
+  await service.manageBreach(scope, owner, { breachId: alert.id, action: 'acknowledge', reason: 'Reviewed daily loss alert' });
+  await expect(service.manageBreach(scope, owner, { breachId: alert.id, action: 'resolve', reason: 'Resolved after documenting paper valuation issue' })).resolves.toMatchObject({ status: 'resolved', ownerId: userId });
+  const alertEvents = await db.query<{event_type:string}>(`SELECT event_type FROM invest_breach_events WHERE tenant_id=$1 AND workspace_id=$2 AND breach_id=$3 ORDER BY received_at`, [tenantId, workspaceId, alert.id]);
+  expect(alertEvents.rows.map((event) => event.event_type)).toEqual(['alerted','assigned','acknowledged','resolved']);
 });
 
 test('the paper execution capability cannot update a same-workspace SWARM setting', async () => {

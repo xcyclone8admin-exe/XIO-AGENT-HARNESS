@@ -58,6 +58,24 @@ CREATE TABLE invest_tax_lot_events (
   FOREIGN KEY (tenant_id,workspace_id,fill_id) REFERENCES invest_fills(tenant_id,workspace_id,id) ON DELETE RESTRICT
 );
 
+ALTER TABLE invest_breaches ADD COLUMN owner_id uuid;
+ALTER TABLE invest_breaches ADD COLUMN resolution_reason text;
+ALTER TABLE invest_breaches ADD CONSTRAINT invest_breaches_owner_fk FOREIGN KEY (tenant_id,owner_id) REFERENCES users(tenant_id,id) ON DELETE RESTRICT;
+CREATE TABLE invest_breach_events (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  breach_id uuid NOT NULL,
+  event_type text NOT NULL CHECK (event_type IN ('alerted','assigned','acknowledged','resolved')),
+  detail jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(detail)='object'),
+  actor_id uuid NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id,workspace_id,id),
+  FOREIGN KEY (tenant_id,workspace_id,breach_id) REFERENCES invest_breaches(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,actor_id) REFERENCES users(tenant_id,id) ON DELETE RESTRICT
+);
+
 CREATE TABLE invest_portfolio_risk_state (
   tenant_id uuid NOT NULL,
   workspace_id uuid NOT NULL,
@@ -153,7 +171,7 @@ CREATE FUNCTION invest_controls_scope(tenant_id uuid, workspace_id uuid) RETURNS
     AND workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
 $$;
 DO $$ DECLARE name text; BEGIN
-  FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_tax_lots','invest_tax_lot_events','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP
+  FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_tax_lots','invest_tax_lot_events','invest_breach_events','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
     EXECUTE format('CREATE POLICY %I ON %I USING (invest_controls_scope(tenant_id,workspace_id)) WITH CHECK (invest_controls_scope(tenant_id,workspace_id))', name || '_scope', name);
@@ -161,6 +179,7 @@ DO $$ DECLARE name text; BEGIN
 END $$;
 CREATE TRIGGER invest_market_sessions_immutable BEFORE UPDATE OR DELETE ON invest_market_sessions FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_tax_lot_events_immutable BEFORE UPDATE OR DELETE ON invest_tax_lot_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
+CREATE TRIGGER invest_breach_events_immutable BEFORE UPDATE OR DELETE ON invest_breach_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_limit_changes_immutable BEFORE UPDATE OR DELETE ON invest_limit_changes FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_ic_memo_events_immutable BEFORE UPDATE OR DELETE ON invest_ic_memo_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_ic_votes_immutable BEFORE UPDATE OR DELETE ON invest_ic_votes FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
