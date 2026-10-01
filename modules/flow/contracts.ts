@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 export const UUID = z.uuid();
 
-export const RunState = z.enum(['running', 'succeeded', 'failed', 'dead_letter', 'canceled']);
+export const RunState = z.enum(['running', 'awaiting_approval', 'succeeded', 'failed', 'dead_letter', 'canceled']);
 export type RunState = z.infer<typeof RunState>;
 
 export const RunTrigger = z.enum(['manual', 'schedule']);
@@ -12,11 +12,20 @@ export type RunTrigger = z.infer<typeof RunTrigger>;
 export const CheckpointStatus = z.enum(['succeeded', 'failed']);
 export type CheckpointStatus = z.infer<typeof CheckpointStatus>;
 
-/** A single step in a workflow definition: a named reference to a step handler the host registers. */
+export const MissedJobPolicy = z.enum(['skip', 'run-once']);
+export type MissedJobPolicy = z.infer<typeof MissedJobPolicy>;
+
+/**
+ * A single node in a workflow's step DAG: a named reference to a step handler the host registers,
+ * plus the ids of steps that must succeed first. `requiresApproval` gates execution on an explicit
+ * decision (flow.run.decideApproval) recorded before the handler is ever invoked.
+ */
 export const WorkflowStep = z.object({
   id: z.string().min(1).max(200),
   handler: z.string().min(1).max(200),
   input: z.record(z.string(), z.unknown()).default({}),
+  dependsOn: z.array(z.string().min(1).max(200)).default([]),
+  requiresApproval: z.boolean().default(false),
 });
 export type WorkflowStep = z.infer<typeof WorkflowStep>;
 
@@ -26,6 +35,7 @@ export const WorkflowDefinition = z.object({
   steps: z.array(WorkflowStep).min(1).max(200),
   maxAttempts: z.number().int().min(1).max(20).default(3),
   maxConcurrentRuns: z.number().int().min(1).max(100).default(1),
+  missedJobPolicy: MissedJobPolicy.default('skip'),
   enabled: z.boolean().default(true),
   createdBy: UUID,
   createdAt: z.iso.datetime({ offset: true }),
@@ -38,8 +48,14 @@ export const WorkflowCreate = z.object({
   steps: z.array(WorkflowStep).min(1).max(200),
   maxAttempts: z.number().int().min(1).max(20).default(3),
   maxConcurrentRuns: z.number().int().min(1).max(100).default(1),
+  missedJobPolicy: MissedJobPolicy.default('skip'),
 });
 export type WorkflowCreate = z.infer<typeof WorkflowCreate>;
+
+export const ApprovalDecision = z.enum(['approve', 'reject']);
+export type ApprovalDecision = z.infer<typeof ApprovalDecision>;
+export const DecideApprovalRequest = z.object({ runId: UUID, decision: ApprovalDecision, reason: z.string().max(2000).default('') });
+export type DecideApprovalRequest = z.infer<typeof DecideApprovalRequest>;
 
 export const RunStatus = z.object({
   runId: UUID,
@@ -116,6 +132,15 @@ export const flowCapabilities = {
     kind: 'consequential',
     permission: 'flow:run:cancel',
     input: CancelRunRequest,
+    output: RunStatus,
+  }),
+  decideApproval: defineCapability({
+    id: 'flow.run.decideApproval',
+    title: 'Approve or reject a gated step',
+    description: 'Record a decision on a run awaiting approval. Approving lets the next advance execute the gated step; rejecting dead-letters the run.',
+    kind: 'consequential',
+    permission: 'flow:run:approve',
+    input: DecideApprovalRequest,
     output: RunStatus,
   }),
   listRuns: defineCapability({

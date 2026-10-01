@@ -1,7 +1,9 @@
 import type { LocalScopedStore, Scope } from '@xyra/db';
 import { randomUUID } from 'node:crypto';
-import type { RunStatus, RunTrigger, WorkflowCreate, WorkflowDefinition, WorkflowStep } from '../contracts';
+import type { z } from 'zod';
+import { WorkflowCreate, type ApprovalDecision, type MissedJobPolicy, type RunStatus, type RunTrigger, type WorkflowDefinition, type WorkflowStep } from '../contracts';
 import type { StepHandlerRegistry } from './handlers';
+import { topologicalOrder } from './dag';
 
 export interface FlowActor {
   readonly id: string;
@@ -15,10 +17,18 @@ interface WorkflowRow extends Record<string, unknown> {
   steps: unknown;
   max_attempts: number;
   max_concurrent_runs: number;
+  missed_job_policy: string;
   enabled: boolean;
   created_by: string;
   created_at: string;
   updated_at: string;
+}
+
+interface ApprovalRow extends Record<string, unknown> {
+  run_id: string;
+  step_index: number;
+  attempt: number;
+  decision: string;
 }
 
 interface RunRow extends Record<string, unknown> {
@@ -54,6 +64,7 @@ function toWorkflow(row: WorkflowRow): WorkflowDefinition {
     steps: row.steps as WorkflowStep[],
     maxAttempts: row.max_attempts,
     maxConcurrentRuns: row.max_concurrent_runs,
+    missedJobPolicy: row.missed_job_policy as MissedJobPolicy,
     enabled: row.enabled,
     createdBy: row.created_by,
     createdAt: row.created_at,
@@ -93,19 +104,22 @@ export class FlowRepository {
     const scope = scopeOf(actor);
     const result = await this.store.query<WorkflowRow>(
       scope,
-      'SELECT id, name, steps, max_attempts, max_concurrent_runs, enabled, created_by, created_at, updated_at FROM flow_workflows ORDER BY name',
+      'SELECT id, name, steps, max_attempts, max_concurrent_runs, missed_job_policy, enabled, created_by, created_at, updated_at FROM flow_workflows ORDER BY name',
     );
     return result.rows.map(toWorkflow);
   }
 
-  async createWorkflow(actor: FlowActor, request: WorkflowCreate): Promise<WorkflowDefinition> {
+  /** Validates the step DAG as acyclic and persists steps in their resolved topological order. */
+  async createWorkflow(actor: FlowActor, input: z.input<typeof WorkflowCreate>): Promise<WorkflowDefinition> {
+    const request = WorkflowCreate.parse(input);
     const scope = scopeOf(actor);
     const id = randomUUID();
+    const orderedSteps = topologicalOrder(request.steps);
     await this.store.query(
       scope,
-      `INSERT INTO flow_workflows (id, tenant_id, workspace_id, name, steps, max_attempts, max_concurrent_runs, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [id, actor.tenantId, actor.workspaceId, request.name, JSON.stringify(request.steps), request.maxAttempts, request.maxConcurrentRuns, actor.id],
+      `INSERT INTO flow_workflows (id, tenant_id, workspace_id, name, steps, max_attempts, max_concurrent_runs, missed_job_policy, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [id, actor.tenantId, actor.workspaceId, request.name, JSON.stringify(orderedSteps), request.maxAttempts, request.maxConcurrentRuns, request.missedJobPolicy, actor.id],
     );
     return this.requireWorkflow(actor, id);
   }
@@ -114,7 +128,7 @@ export class FlowRepository {
     const scope = scopeOf(actor);
     const result = await this.store.query<WorkflowRow>(
       scope,
-      'SELECT id, name, steps, max_attempts, max_concurrent_runs, enabled, created_by, created_at, updated_at FROM flow_workflows WHERE id = $1',
+      'SELECT id, name, steps, max_attempts, max_concurrent_runs, missed_job_policy, enabled, created_by, created_at, updated_at FROM flow_workflows WHERE id = $1',
       [workflowId],
     );
     const row = result.rows[0];
@@ -176,12 +190,23 @@ export class FlowRepository {
    * reuses that checkpoint's outcome without re-invoking the handler.
    */
   async advanceRun(actor: FlowActor, runId: string): Promise<RunStatus> {
-    const scope = scopeOf(actor);
     const current = await this.currentRun(actor, runId);
     if (current.state !== 'running') throw new Error('FLOW_RUN_NOT_RUNNING');
     const workflow = await this.requireWorkflow(actor, current.workflowId);
     const step = workflow.steps[current.stepIndex];
     if (!step) throw new Error('FLOW_RUN_STEP_OUT_OF_RANGE');
+
+    if (step.requiresApproval) {
+      const approval = await this.findApproval(actor, runId, current.stepIndex, current.attempt);
+      if (!approval) {
+        await this.appendRunEvent(actor, current, { state: 'awaiting_approval', stepIndex: current.stepIndex, attempt: current.attempt, ended: false });
+        return this.currentRun(actor, runId);
+      }
+      if (approval.decision === 'reject') {
+        await this.appendRunEvent(actor, current, { state: 'dead_letter', stepIndex: current.stepIndex, attempt: current.attempt, ended: true, detail: { rejected: true } });
+        return this.currentRun(actor, runId);
+      }
+    }
 
     let checkpoint = await this.findCheckpoint(actor, runId, current.stepIndex, current.attempt);
     if (!checkpoint) {
@@ -214,9 +239,38 @@ export class FlowRepository {
 
   async cancelRun(actor: FlowActor, runId: string): Promise<RunStatus> {
     const current = await this.currentRun(actor, runId);
-    if (current.state !== 'running') throw new Error('FLOW_RUN_NOT_RUNNING');
+    if (current.state !== 'running' && current.state !== 'awaiting_approval') throw new Error('FLOW_RUN_NOT_RUNNING');
     await this.appendRunEvent(actor, current, { state: 'canceled', stepIndex: current.stepIndex, attempt: current.attempt, ended: true });
     return this.currentRun(actor, runId);
+  }
+
+  /**
+   * Records a decision on the step a run is currently awaiting approval for, then returns the run
+   * to 'running' so the next advanceRun call re-evaluates the gate: an 'approve' decision lets it
+   * proceed to execute the step's handler; 'reject' is resolved as dead_letter on that next call.
+   */
+  async decideApproval(actor: FlowActor, runId: string, decision: ApprovalDecision, reason: string): Promise<RunStatus> {
+    const current = await this.currentRun(actor, runId);
+    if (current.state !== 'awaiting_approval') throw new Error('FLOW_RUN_NOT_AWAITING_APPROVAL');
+    const scope = scopeOf(actor);
+    await this.store.query(
+      scope,
+      `INSERT INTO flow_approvals (id, tenant_id, workspace_id, run_id, step_index, attempt, decision, reason, decided_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [randomUUID(), actor.tenantId, actor.workspaceId, runId, current.stepIndex, current.attempt, decision, reason, actor.id],
+    );
+    await this.appendRunEvent(actor, current, { state: 'running', stepIndex: current.stepIndex, attempt: current.attempt, ended: false });
+    return this.currentRun(actor, runId);
+  }
+
+  private async findApproval(actor: FlowActor, runId: string, stepIndex: number, attempt: number): Promise<ApprovalRow | undefined> {
+    const scope = scopeOf(actor);
+    const result = await this.store.query<ApprovalRow>(
+      scope,
+      'SELECT run_id, step_index, attempt, decision FROM flow_approvals WHERE run_id = $1 AND step_index = $2 AND attempt = $3',
+      [runId, stepIndex, attempt],
+    );
+    return result.rows[0];
   }
 
   private async findCheckpoint(actor: FlowActor, runId: string, stepIndex: number, attempt: number) {
