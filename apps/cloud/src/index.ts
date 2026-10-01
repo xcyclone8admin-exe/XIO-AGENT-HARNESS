@@ -5,11 +5,14 @@ import {
   acknowledgeInvestSignal,
   acceptInvestSignal,
   claimInvestSignal,
-  findInvestSignalSource,
+  findInvestSignalPolicy,
+  findInvestSignalVerificationKey,
   parseSignalAckRequest,
   parseSignalClaimRequest,
   readInvestWebhook,
   verifyInvestSignal,
+  verifyInvestSignalSignature,
+  validateInvestSignalPolicy,
   type InvestSignalSourceKey,
   type SignalConsumerIdentity,
 } from './invest-signals';
@@ -814,8 +817,8 @@ app.post('/v2/brain/ingestions/:ingestionId/finalize', async (c) => {
         const objectRefIds = issued.rows.map(({ object_id }) => object_id);
         if (
           (ingestion.mode === 'text_only' && objectRefIds.length !== 0) ||
-            (ingestion.mode === 'with_objects' && objectRefIds.length === 0) ||
-            issued.rows.some((row) => !row.uploaded_at || row.storage_state !== 'available') ||
+          (ingestion.mode === 'with_objects' && objectRefIds.length === 0) ||
+          issued.rows.some((row) => !row.uploaded_at || row.storage_state !== 'available') ||
           [...syncedObjectIds].sort().join(',') !== [...objectRefIds].sort().join(',')
         )
           return { error: 'SOURCE_REFERENCES_UNAVAILABLE' as const };
@@ -913,7 +916,7 @@ app.post('/v2/brain/ingestions/:ingestionId/finalize', async (c) => {
         );
         for (const operation of invalidated.rows)
           await client.query(
-          `INSERT INTO cloud_erasure_events(tenant_id,workspace_id,operation_id,event_id,status,detail)
+            `INSERT INTO cloud_erasure_events(tenant_id,workspace_id,operation_id,event_id,status,detail)
            VALUES ($1,$2,$3,$4,'eligibility_invalidated','{"reason":"reference_finalized"}'::jsonb)`,
             [current.claims.tenantId, current.claims.activeWorkspaceId, operation.id, crypto.randomUUID()],
           );
@@ -1114,8 +1117,8 @@ app.get('/v1/erasures/:operationId', async (c) => {
         row.status === 'eligible'
           ? {
               reservationId: row.reservation_id,
-        referenceStateVersion: detail.referenceStateVersion ?? row.reference_state_version,
-        holdStateVersion: detail.holdStateVersion ?? row.hold_state_version,
+              referenceStateVersion: detail.referenceStateVersion ?? row.reference_state_version,
+              holdStateVersion: detail.holdStateVersion ?? row.hold_state_version,
               expiresAt: row.reservation_expires_at
                 ? new Date(String(row.reservation_expires_at)).toISOString()
                 : null,
@@ -1429,7 +1432,7 @@ app.post('/v1/erasures', async (c) => {
       tenantId: current.claims.tenantId,
       workspaceId: current.claims.activeWorkspaceId,
       role: current.membership.role,
-    permissions: current.membership.permissions,
+      permissions: current.membership.permissions,
     }).has('brain:source:erase')
   )
     return c.json({ code: 'PERMISSION_DENIED' }, 403);
@@ -1838,7 +1841,7 @@ app.post('/v1/blobs/ref', async (c) => {
               );
               for (const operation of operations.rows)
                 await client.query(
-                `INSERT INTO cloud_erasure_events(tenant_id,workspace_id,operation_id,event_id,status,detail)
+                  `INSERT INTO cloud_erasure_events(tenant_id,workspace_id,operation_id,event_id,status,detail)
                   VALUES ($1,$2,$3,$4,'eligibility_invalidated','{"reason":"object_reissued"}'::jsonb)`,
                   [
                     current.claims.tenantId,
@@ -1846,7 +1849,7 @@ app.post('/v1/blobs/ref', async (c) => {
                     operation.id,
                     crypto.randomUUID(),
                   ],
-              );
+                );
             }
             if (ingestionId) {
               const ingest = await client.query(
@@ -1993,20 +1996,20 @@ app.all('/v1/blobs/access/:token', async (c) => {
         const [tenantId, workspaceId] = access.key.split('/');
         if (!tenantId || !workspaceId) throw new Error('INVALID_SIGNED_BLOB_SCOPE');
         await withNeonTransaction(connectionString, { tenantId, workspaceId }, async (client) => {
-            await lockWorkspaceSequence(client, tenantId, workspaceId);
+          await lockWorkspaceSequence(client, tenantId, workspaceId);
           const updated = await client.query(
             `UPDATE cloud_erasure_objects SET storage_state='available',size_bytes=$4
               WHERE tenant_id=$1 AND workspace_id=$2 AND storage_key=$3 RETURNING id`,
             [tenantId, workspaceId, access.key, declaredBytes],
           );
-            if (updated.rows.length !== 1) throw new Error('BLOB_REGISTRY_ROW_MISSING');
+          if (updated.rows.length !== 1) throw new Error('BLOB_REGISTRY_ROW_MISSING');
           if (access.ingestionId)
             await client.query(
               `UPDATE cloud_source_ingestion_objects SET uploaded_at=COALESCE(uploaded_at,now())
               WHERE tenant_id=$1 AND workspace_id=$2 AND ingestion_id=$3 AND object_id=(
                 SELECT id FROM cloud_erasure_objects WHERE tenant_id=$1 AND workspace_id=$2 AND storage_key=$4)`,
               [tenantId, workspaceId, access.ingestionId, access.key],
-        );
+            );
         });
       } catch {
         // R2 has accepted the body but durable registry state did not commit. Force the uploader
@@ -2234,8 +2237,16 @@ app.post('/v1/webhooks/invest/signals', async (c) => {
       | { kind: 'rate_limited' };
     const connectionString = databaseUrl(c.env);
     if (connectionString) {
-      source = await findInvestSignalSource(connectionString, webhook.sourceId, webhook.keyId);
+      const verificationKey = await findInvestSignalVerificationKey(
+        connectionString,
+        webhook.sourceId,
+        webhook.keyId,
+      );
+      if (!verificationKey) return c.json({ code: 'SIGNAL_KEY_UNKNOWN' }, 401);
+      const verified = await verifyInvestSignalSignature(webhook, verificationKey);
+      source = await findInvestSignalPolicy(connectionString, webhook.sourceId, webhook.keyId);
       if (!source) return c.json({ code: 'SIGNAL_KEY_UNKNOWN' }, 401);
+      validateInvestSignalPolicy(verified, source);
       accepted = await acceptInvestSignal(connectionString, webhook, source);
     } else if (c.env.CLOUD_TEST_INVEST_SIGNALS) {
       const keyResult = await c.env.CLOUD_TEST_INVEST_SIGNALS.fetch('https://invest-signal.test/source-key', {
