@@ -43,7 +43,7 @@ function CatalogPage({ workspaceId, api }: ModulePageProps) {
   }, [api, workspaceId]);
 
   useEffect(() => {
-    void load();
+    void Promise.resolve().then(load);
   }, [load]);
 
   const toggleGrant = useCallback(
