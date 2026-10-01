@@ -1,6 +1,6 @@
 # XIO architecture
 
-Standalone guide for integrated source checkpoint `148c6a2e150e0ffd5441c76611c48e91449dd84c`. This replaces the old pointer to documents outside the repository. Future work is labeled explicitly.
+Standalone guide for integrated source through UI milestone `690e18a240078a5c4c266dc5d772e9daf93eadbf`. Earlier native/installer evidence belongs to `148c6a2`. This replaces the old pointer to documents outside the repository. Future work is labeled explicitly.
 
 ## Composition
 
@@ -115,4 +115,4 @@ Privileged process execution stays closed until actual isolation, verifier and w
 
 Next.js exports static pages. Packaging stages a checksum-pinned Node executable, bundled sidecar, runtime dependencies and notices into NSIS. Source, installer and checksums must refer to the same handoff candidate.
 
-The next shell consolidates navigation into Chat, Projects, World and Library while retaining module access. Menus, themes, voice, portable XYRA, preview policies and local/cloud computers are in [product direction](product-direction.md). Update their status from implementation and runtime evidence, not this diagram.
+The shell now consolidates navigation into Chat, Projects, World and Library while retaining module access. Conversations persist through Command capabilities; project and Library views read scoped services. Themes persist on the device. World renders module dependencies. General chat-to-agent execution is still unconnected. Menus, voice, portable XYRA enforcement, durable preview policies and local/cloud computers remain in [product direction](product-direction.md). Update status from implementation and runtime evidence, not this diagram.

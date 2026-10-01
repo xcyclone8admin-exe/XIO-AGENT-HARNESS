@@ -1,8 +1,16 @@
 # Product status and remaining work
 
-Updated: 2026-10-01. Verified integrated source baseline: **`148c6a2e150e0ffd5441c76611c48e91449dd84c`**. This is not a release certificate.
+Updated: 2026-10-01. Latest published UI milestone: **`690e18a240078a5c4c266dc5d772e9daf93eadbf`**, merging tested feature commit **`cd8a0c1505e7081fadd444af94b8b4959c841e77`** with documentation. Earlier installer baseline: **`148c6a2e150e0ffd5441c76611c48e91449dd84c`**. This is not a release certificate.
 
-## What the baseline establishes
+## Latest UI milestone
+
+Delivered: Chat/Projects/World/Library navigation; real persisted conversations/messages; red-default and persistent theme selection; scoped project/source/memory/procedure reads; explicit project-create preview/confirmation; a World graph of registered modules/dependencies linked to Library; frontend menu event handlers; packaged [XYRA process documentation](xyra-process.md).
+
+Evidence at feature commit `cd8a0c1`: root verification passed 430 tests in 64 files, typecheck/lint and checks (577 files); static export passed 66 pages; Playwright passed 2/2 workflows. The tested Forge screen had no critical Axe violations. Browser tests use the real sidecar/database with an injected test native-session bridge.
+
+Limits: stored chat messages do not launch a general agent run. Profile preferences do not provision credentials. Project preview confirmation is a UI flow, not the planned universal server-bound preview policy. World is a module graph, not the completed agent/pixel-world experience. Native menu integration, robust voice, browser/VM adapters and rebuilt installer remain open.
+
+## What the earlier installer baseline establishes
 
 | Evidence | Recorded result |
 |---|---|
@@ -35,20 +43,20 @@ These are results from the original environment. Page and module counts measure 
 
 Unavailable connectors must fail honestly. PAPER remains PAPER. Drafts and manually entered evidence retain their provenance.
 
-## New XIO experience: under construction
+## New XIO experience: remaining work
 
-Accepted direction, not completed features of this baseline:
+Accepted direction still requiring implementation or broader evidence:
 
 - Universal text/voice chat controlling application capabilities, inline model choice, progress and mid-task steering.
-- Four spaces: Chat, Projects, World and Library; productive launch surfaces and discoverable tools.
-- XIO identity, mainly black/red design, persistent themes and original modern agent-world visualization.
+- Complete productive workflows within the implemented Chat/Projects/World/Library spaces.
+- XIO native/installer identity and original modern agent-world visualization beyond the module graph; black/red and persistent themes are now implemented.
 - Default portable XYRA logic with proportional planning, verification and durable resume/evidence.
 - Preview-and-approve plus explicit scoped, revocable automatic approval controls.
 - Working File, Edit, View, Window and Help menus and keyboard behavior.
 - Task-scoped internal browser automation, inspection and human takeover.
 - Both local and cloud virtual computers with real backends, isolation, budgets and cleanup.
 
-The lead is implementing and testing the shell. When this page was written, that work was uncommitted and is not included in the baseline claim. See [product direction](product-direction.md).
+The shell milestone is committed and published. The user has now requested a continuation handoff of this current build instead of waiting for every addition. Remaining runtime work is captured in [ADDITIONS.md](../ADDITIONS.md), [product direction](product-direction.md) and [XYRA process coverage](xyra-process.md).
 
 ## External participation or infrastructure
 
@@ -64,4 +72,4 @@ Development approval has already been granted. Continue routine implementation w
 
 Update GitHub with coherent verified commits as remaining tasks finish. Refresh affected setup, architecture, status and verification notes. Do not change partial to complete merely because a unit suite passes.
 
-The final installer and full source ZIP are held until the new requested features are implemented and checked. Produce both from the same frozen candidate, include instructions and checksums, and record limitations. The pre-redesign `xyra-desktop_0.1.0_x64-setup.exe` is an earlier build, not that final delivery.
+Latest user direction supersedes the earlier hold: package the implemented milestone now, with an additions Markdown file for the next Traycer. Produce installer and full source from the same frozen candidate, include instructions/checksums, and label the delivery as a continuation build. Completion of the requested features and release certification remain separate future milestones. The pre-redesign installer at `148c6a2` remains an older build and must not be substituted silently.

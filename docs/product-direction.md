@@ -50,4 +50,4 @@ Backend/provider selection and physical isolation evidence remain open engineeri
 
 Demonstrate connected user journeys, not inert controls: chat→tool→preview→approval→verified effect; revision/cancel/resume; voice transcription; configured-model routing; theme persistence; World→chat/project; native menu dispatch; browser takeover/cleanup; supported local/cloud VM lifecycle and failure modes. Verify isolation and approval revocation.
 
-Only then rebuild the installer and create the final ZIP with the matching complete source, install/development instructions, architecture and remaining limitations. The earlier installer is a separate pre-redesign development build.
+These remain the acceptance criteria for the completed feature set. The user's later handoff instruction explicitly changes delivery order: package the current implemented milestone now and record remaining work in [ADDITIONS.md](../ADDITIONS.md) for the next Traycer session. That continuation package is not certification that all criteria above are met. Keep its installer, source and checksums matched.

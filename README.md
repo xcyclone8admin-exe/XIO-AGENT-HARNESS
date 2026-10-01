@@ -8,9 +8,9 @@ XIO is a Windows-first agent operating system that brings project work, knowledg
 
 Created and directed by Aaron. Developed with AI-assisted engineering tools. XIO is the product name; **XYRA** is its underlying development and intended operating process.
 
-[Get started](docs/getting-started.md) · [Architecture](docs/architecture.md) · [Feature status](docs/product-status.md) · [Product direction](docs/product-direction.md) · [Development](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Get started](docs/getting-started.md) · [Architecture](docs/architecture.md) · [Feature status](docs/product-status.md) · [Next Traycer: additions](ADDITIONS.md) · [Product direction](docs/product-direction.md) · [Development](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-> This repository contains the complete integrated source, not a finished implementation of every requested feature. The last verified product checkpoint is `148c6a2e150e0ffd5441c76611c48e91449dd84c`. The new universal chat, voice, themes, World, approval modes, and virtual-computer experience are being built. See the explicit status map below. An old installer must not be mistaken for the redesigned XIO release.
+> This repository contains the integrated source, not a finished implementation of every requested feature. UI milestone `cd8a0c1505e7081fadd444af94b8b4959c841e77`, published with documentation at `690e18a240078a5c4c266dc5d772e9daf93eadbf`, adds persistent conversations, themes, four spaces, project previews and a module-graph World. Universal agent execution, durable approval modes and virtual computers remain unfinished. The earlier installer at `148c6a2` does not contain this redesign.
 
 ## What XIO brings together
 
@@ -59,7 +59,9 @@ Models, connections, themes, and other preferences belong in Settings. Black/red
 | Native signal → durable PAPER decision → restart/replay | Tested with a synthetic local claim; not a live enrolled-device journey. |
 | Development Cloud Worker and Neon migrations | Deployed/applied with scoped live checks; full authenticated product journeys still pending. |
 | Windows installer | Earlier unsigned build passed install, launch, same-version reinstall, and uninstall. New UI installer is pending. |
-| Universal chat, streaming voice, model UI, themes, consolidated spaces | In progress; not all are in the verified baseline. |
+| Conversations, themes, consolidated spaces | Persistent message storage, red-default theme selection, Chat/Projects/World/Library and scoped data views implemented; browser workflows tested. Saving a message does not yet launch an agent. |
+| Project previews and World | Project creation requires explicit preview confirmation in the UI. World shows registered modules/dependencies linked to Library; this is not a running agent-world simulation. |
+| Universal agent chat, voice and model onboarding | Not connected end to end. Browser speech API support and saved profile preferences are partial foundations. |
 | Default product XYRA lifecycle, preview approval, scoped auto-approval | Requested runtime behavior; existing approval infrastructure is the foundation, not evidence of the complete new UX. |
 | Agent browser, local and cloud virtual computers | Requested; backend selection, adapters, isolation and lifecycle verification remain. |
 | Physical TPM, browser accessibility, genuine version upgrade | Not fully evidenced. |
@@ -150,7 +152,16 @@ docs/           Architecture, setup, status, and product direction
 
 ## Development evidence
 
-At source checkpoint `148c6a2`:
+UI milestone `cd8a0c1`, before the documentation-only merge at `690e18a`:
+
+- `npm run verify`: 430 tests across 64 files, typechecks/lint passed; checks covered 577 files.
+- Static export: 16 registered modules, 66 pages.
+- `npm run e2e`: 2 browser journeys passed, covering conversation/theme persistence, explicit project preview before mutation, World/Library navigation and Forge project/epic creation with refresh.
+- The tested Forge accessibility scan reported no critical Axe violations. This is limited screen coverage, not full accessibility certification.
+
+Browser tests use a real local sidecar/database with a test-injected native-session bridge. They do not certify the installed application's native menus or real passkey flow.
+
+Earlier installer/runtime evidence at source checkpoint `148c6a2`:
 
 - `npm run verify`: 430 tests across 64 files, workspace typechecks and lint; repository checks passed.
 - Rust library tests with `cloud-dev`: 88 passed.
@@ -162,7 +173,7 @@ These counts describe a specific candidate, not every future commit or a clean-m
 
 ## Roadmap and handoff
 
-The next delivery must finish and verify the new XIO experience before the final ZIP: universal chat, voice, model selection, task steering, themes, World, native menus, preview/auto-approval, portable XYRA process, and agent browser/virtual-computer support. The handoff will contain a matching installer, full source, architecture and installation/development instructions. [Read the product direction](docs/product-direction.md).
+The user's latest instruction is to hand off the current implemented build now and place unfinished additions in a Markdown file for the next Traycer session. This supersedes the earlier instruction to finish every new feature before packaging. The continuation handoff includes a matching installer, full tracked source/history, architecture and setup instructions; it is not a release-readiness claim. Start with [ADDITIONS.md](ADDITIONS.md), which preserves universal agent chat, voice, task steering, approvals, native menus, World and local/cloud computer requirements.
 
 ## Provenance and rights
 

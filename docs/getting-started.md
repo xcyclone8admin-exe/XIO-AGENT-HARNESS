@@ -1,6 +1,6 @@
 # Install, run, and continue XIO
 
-These instructions describe source checkpoint `148c6a2e150e0ffd5441c76611c48e91449dd84c`. Later feature commits must update them when commands or prerequisites change. This repository preserves Git history; no reinitialization is necessary.
+These instructions include UI milestone `690e18a240078a5c4c266dc5d772e9daf93eadbf`. Installer evidence still belongs to `148c6a2e150e0ffd5441c76611c48e91449dd84c`; the redesign installer has not been rebuilt yet. Later commits must update instructions when commands or prerequisites change. This repository preserves Git history; no reinitialization is necessary.
 
 ## Requirements
 
@@ -38,6 +38,18 @@ npm.cmd run dev:web
 This starts Next.js. Follow the URL it prints. Real local capabilities require the native desktop bridge and authenticated sidecar session. A browser-only page can display an unavailable state; it is not a standalone authenticated backend.
 
 `npm.cmd run dev:sidecar` is a host-launched entry point, not a zero-configuration development server. It expects port, identity, data-directory and allowed-origin configuration, plus the private versioned stdin bootstrap. Use the native launcher or the existing test harness. Never hardcode launch tokens into the renderer or disable authentication to make a demo connect.
+
+## Browser workflow checks
+
+Build the static frontend first, then run the checked-in browser harness:
+
+```powershell
+npm.cmd run build:web
+npx.cmd playwright install chromium
+npm.cmd run e2e
+```
+
+The configuration prefers an installed Edge at its documented Windows path and otherwise uses Playwright Chromium. Tests start their own loopback static server and real local sidecar, and inject a test native-session bridge. These are browser workflow checks, not production native-auth evidence. Traces/screenshots are retained on failure. Current coverage is two workflows, not the full product.
 
 ## Native checks and installer build
 
@@ -77,6 +89,6 @@ The original project has a no-R2 development deployment. Its health check does n
 1. Read [product status](product-status.md) and [product direction](product-direction.md).
 2. Read [architecture](architecture.md), [contributing](../CONTRIBUTING.md) and [security](../SECURITY.md).
 3. Work on an isolated branch, preserve migration history, and record checks against an exact commit.
-4. Update status documentation when evidence changes. Rebuild the installer and final ZIP from the same finished candidate.
+4. Update status documentation when evidence changes. Keep each installer/ZIP tied to its exact source candidate, distinguishing a continuation handoff from a completed release.
 
 The original XYRA factory control plane is outside this Git repository. A clone does not require that machine's directory layout. Do not recreate its secrets or assume external absolute paths exist. The packaged runtime XYRA process is ongoing work, not supplied merely by this documentation.
