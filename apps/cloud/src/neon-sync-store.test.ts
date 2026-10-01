@@ -22,6 +22,7 @@ const migrations = [
   migration('core/0004_cloud_blob_reference_sets', sql('../../../modules/core/migrations/0004_cloud_blob_reference_sets.sql')),
   migration('core/0005_cloud_ingestion_finalization', sql('../../../modules/core/migrations/0005_cloud_ingestion_finalization.sql')),
   migration('core/0006_cloud_ingestion_v2_hashes', sql('../../../modules/core/migrations/0006_cloud_ingestion_v2_hashes.sql')),
+  migration('core/0007_cloud_erasure_v2_fence', sql('../../../modules/core/migrations/0007_cloud_erasure_v2_fence.sql')),
 ];
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
@@ -118,7 +119,7 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
   it('keeps content-free erasure fences scoped and rejects stale row replay', async () => {
     const erasedSource = '99999999-9999-4999-8999-999999999999';
     const operationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-    const digest = `sha256:${'f'.repeat(64)}`;
+    const digest = `cloud-ingest-v2:sha256:${'f'.repeat(64)}`;
     const requestDigest = 'e'.repeat(64);
     const rowId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
     await scoped(TENANT_A, WORKSPACE_A, async (client) => {
@@ -277,7 +278,7 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     `);
     expect(rls.rows[0]).toEqual({ total: 8, forced: 8 });
     const order = await db.query<{ version: string }>(
-      `SELECT id AS version FROM schema_migrations WHERE id IN ('core/0001_cloud_auth','core/0002_cloud_sync','core/0003_cloud_erasure','core/0004_cloud_blob_reference_sets','core/0005_cloud_ingestion_finalization','core/0006_cloud_ingestion_v2_hashes') ORDER BY id`,
+      `SELECT id AS version FROM schema_migrations WHERE id IN ('core/0001_cloud_auth','core/0002_cloud_sync','core/0003_cloud_erasure','core/0004_cloud_blob_reference_sets','core/0005_cloud_ingestion_finalization','core/0006_cloud_ingestion_v2_hashes','core/0007_cloud_erasure_v2_fence') ORDER BY id`,
     );
     expect(order.rows.map((row) => row.version)).toEqual([
       'core/0001_cloud_auth',
@@ -286,6 +287,7 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
       'core/0004_cloud_blob_reference_sets',
       'core/0005_cloud_ingestion_finalization',
       'core/0006_cloud_ingestion_v2_hashes',
+      'core/0007_cloud_erasure_v2_fence',
     ]);
   });
 
