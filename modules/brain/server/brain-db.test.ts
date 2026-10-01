@@ -158,7 +158,8 @@ describe('BRAIN schema and provenance', () => {
       `SELECT status,sync_idempotency_key,sync_server_seq,sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets WHERE source_version_id=$1`, [source.versionId]);
     expect(row.rows[0]).toMatchObject({ status: 'sync_accepted', sync_idempotency_key: request.idempotencyKey, sync_server_seq: response.serverSeq });
     expect(row.rows[0]?.sync_request_digest).toMatch(/^[0-9a-f]{64}$/);
-    expect(row.rows[0]?.sync_outcome_evidence).toMatchObject({ sourceId: source.sourceId, sourceVersionId: source.versionId });
+    expect(row.rows[0]?.sync_outcome_evidence).toMatchObject({ acknowledgement: { sourceId: source.sourceId, sourceVersionId: source.versionId },
+      responseDigest: expect.stringMatching(/^[0-9a-f]{64}$/), outcomes: [{ outcome: 'unchanged' }, { outcome: 'unchanged' }] });
   });
 
   it('measures Recall@10 against the independent labeled golden corpus', async () => {
