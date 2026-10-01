@@ -20,10 +20,12 @@ export function planSchedule(input: unknown): zReturn<typeof ScheduleResult> {
   if (request.spentUsd >= request.config.maxBudgetUsd) return { runId: uuidv7(), state: 'blocked', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'BUDGET_EXHAUSTED', externalExecution: false };
   const nodes = request.tickets.map((ticket) => HierarchyNode.parse(ticket));
   const done = new Set(nodes.filter((ticket) => ticket.state === 'done').map((ticket) => ticket.id));
+  const reservations = new Set(request.reservedTicketIds);
   const blocked = new Set<string>();
   const runnable = nodes.filter((ticket) => {
     if (ticket.kind !== 'ticket' && ticket.kind !== 'subtask') return false;
     if (ticket.state !== 'ready' && ticket.state !== 'queued') return false;
+    if (reservations.has(ticket.id)) { blocked.add(ticket.id); return false; }
     if (ticket.dependencies.some((id) => !done.has(id))) { blocked.add(ticket.id); return false; }
     if (ticket.dependencies.some((id) => !nodes.some((node) => node.id === id) && !done.has(id))) { blocked.add(ticket.id); return false; }
     if (request.config.resourceLocks.some((lock) => lock.startsWith(`${ticket.id}:`))) { blocked.add(ticket.id); return false; }
@@ -89,8 +91,8 @@ export function createEvidence(input: Omit<zReturn<typeof Evidence>, 'id' | 'ver
   return Evidence.parse({ ...metadata, sha256: sourceHash, id: uuidv7(), verifiedAt: now() });
 }
 
-export function requestPromotion(input: unknown) {
-  const { promotion: raw, gates: rawGates, productionApproval: rawApproval } = input as { promotion: unknown; gates: unknown[]; productionApproval: unknown };
+export function requestPromotion(input: unknown, rawGates: readonly unknown[], rawApproval: unknown = null) {
+  const raw = input;
   const promotion = Promotion.parse(raw);
   const gates = rawGates.map((gate) => Gate.parse(gate));
   const missingGateIds = gates.filter((gate) => gate.hard && gate.status !== 'pass').map((gate) => gate.id);

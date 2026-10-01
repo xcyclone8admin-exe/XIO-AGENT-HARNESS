@@ -1,7 +1,8 @@
 import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, SourceRecordCreate, TicketState } from '../contracts';
+import { ApprovalRecord, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, SourceIngestRequest, SourceRecordCreate, SpecDocument, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
 
@@ -68,6 +69,77 @@ export class ForgeRepository {
     const row = rows[0]; if (!row) throw new Error('FORGE_SOURCE_CREATE_FAILED');
     return { id: row.id, label: row.label, locator: row.locator, authority: row.authority, status: row.status, sha256: row.sha256, createdAt: timestamp(row.created_at) };
   }
+  async ingestSource(actor: ForgeActor, raw: unknown) {
+    const input = SourceIngestRequest.parse(raw); const id = uuidv7(); const sha256 = createHash('sha256').update(input.content, 'utf8').digest('hex');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; label: string; locator: string; authority: string; status: string; sha256: string; created_at: string }>(this.scope(actor), 'INSERT INTO forge_sources(id,tenant_id,workspace_id,label,locator,authority,status,sha256,content,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,label,locator,authority,status,sha256,created_at', [id, actor.tenantId, actor.workspaceId, input.label, input.locator, 'user', 'draft', sha256, input.content, actor.id]);
+    const row = rows[0]; if (!row) throw new Error('FORGE_SOURCE_INGEST_FAILED');
+    return { id: row.id, label: row.label, locator: row.locator, authority: row.authority, status: row.status, sha256: row.sha256, createdAt: timestamp(row.created_at) };
+  }
+  async saveSpecs(actor: ForgeActor, projectId: string, rawDocuments: unknown) {
+    const documents = z.array(SpecDocument).min(1).max(12).parse(rawDocuments);
+    const project = await this.store.query(this.scope(actor), 'SELECT id FROM forge_projects WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, projectId]);
+    if (!project.rows.length) throw new Error('FORGE_PROJECT_NOT_FOUND');
+    const output = [];
+    for (const draft of documents) {
+      const prior = await this.store.query<Record<string, unknown> & { version: number }>(this.scope(actor), 'SELECT MAX(version)::int AS version FROM forge_spec_versions WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 AND spec_id=$4', [actor.tenantId, actor.workspaceId, projectId, draft.id]);
+      const version = (prior.rows[0]?.version ?? 0) + 1;
+      const frontmatter = { ...draft.frontmatter, version, status: 'draft' };
+      const contentHash = createHash('sha256').update(JSON.stringify({ template: draft.template, version, title: draft.title, frontmatter, body: draft.body }) ?? 'null').digest('hex');
+      const persisted = SpecDocument.parse({ ...draft, version, status: 'draft', frontmatter, contentHash });
+      const { rows } = await this.store.query(this.scope(actor), 'INSERT INTO forge_spec_versions(tenant_id,workspace_id,project_id,spec_id,version,template,title,status,authority,dependencies,supersedes,requirement_ids,frontmatter,body,content_sha256,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15,$16) RETURNING spec_id,template,version,title,status,authority,dependencies,supersedes,requirement_ids,frontmatter,body,content_sha256', [actor.tenantId, actor.workspaceId, projectId, persisted.id, version, persisted.template, persisted.title, persisted.status, persisted.authority, json(persisted.dependencies), json(persisted.supersedes), json(persisted.requirementIds), json(persisted.frontmatter), persisted.body, persisted.contentHash, actor.id]);
+      output.push(SpecDocument.parse({ id: rows[0]?.spec_id, template: rows[0]?.template, version: rows[0]?.version, title: rows[0]?.title, status: rows[0]?.status, authority: rows[0]?.authority, dependencies: rows[0]?.dependencies, supersedes: rows[0]?.supersedes, requirementIds: rows[0]?.requirement_ids, frontmatter: rows[0]?.frontmatter, body: rows[0]?.body, contentHash: rows[0]?.content_sha256 }));
+    }
+    return output;
+  }
+  async specs(actor: ForgeActor, projectId: string) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; template: string; version: number; title: string; status: string; authority: string; dependencies: unknown; supersedes: unknown; requirement_ids: unknown; frontmatter: unknown; body: string; content_sha256: string }>(this.scope(actor), 'SELECT spec_id AS id,template,version,title,status,authority,dependencies,supersedes,requirement_ids,frontmatter,body,content_sha256 FROM forge_spec_versions WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 ORDER BY spec_id,version DESC', [actor.tenantId, actor.workspaceId, projectId]);
+    return rows.map((row) => SpecDocument.parse({ id: row.id, template: row.template, version: row.version, title: row.title, status: row.status, authority: row.authority, dependencies: row.dependencies, supersedes: row.supersedes, requirementIds: row.requirement_ids, frontmatter: row.frontmatter, body: row.body, contentHash: row.content_sha256 }));
+  }
+  async startCouncil(actor: ForgeActor, raw: unknown) {
+    const request = z.object({ projectId: z.string().uuid(), targetId: z.string().uuid(), targetKind: z.enum(['project','epic','spec','plan','wave','ticket','subtask']) }).parse(raw);
+    if (request.targetKind === 'project') {
+      if (request.targetId !== request.projectId) throw new Error('FORGE_COUNCIL_TARGET_MISMATCH');
+      const project = await this.store.query(this.scope(actor), 'SELECT id FROM forge_projects WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, request.projectId]);
+      if (!project.rows.length) throw new Error('FORGE_COUNCIL_TARGET_NOT_FOUND');
+    } else {
+      const target = await this.store.query<Record<string, unknown> & { project_id: string; kind: string }>(this.scope(actor), 'SELECT project_id,kind FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND project_id=$4', [actor.tenantId, actor.workspaceId, request.targetId, request.projectId]);
+      if (target.rows[0]?.kind !== request.targetKind) throw new Error('FORGE_COUNCIL_TARGET_NOT_FOUND');
+    }
+    const councilId = uuidv7();
+    await this.store.query(this.scope(actor), 'INSERT INTO forge_councils(id,tenant_id,workspace_id,project_id,target_id,target_kind,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [councilId, actor.tenantId, actor.workspaceId, request.projectId, request.targetId, request.targetKind, actor.id]);
+    for (const role of REVIEW_ROLES) await this.store.query(this.scope(actor), 'INSERT INTO forge_council_assignments(id,tenant_id,workspace_id,council_id,role,created_by) VALUES($1,$2,$3,$4,$5,$6)', [uuidv7(), actor.tenantId, actor.workspaceId, councilId, role, actor.id]);
+    return (await this.councils(actor)).find((council) => council.id === councilId);
+  }
+  async councils(actor: ForgeActor) {
+    const { rows: sessions } = await this.store.query<Record<string, unknown> & { id: string; project_id: string; target_id: string; target_kind: string; created_at: string }>(this.scope(actor), 'SELECT id,project_id,target_id,target_kind,created_at FROM forge_councils ORDER BY created_at DESC');
+    const output = [];
+    for (const session of sessions) {
+      const { rows } = await this.store.query<Record<string, unknown> & { role: string; decision: string | null; finding_id: string | null; evidence_ids: unknown; evidence_source: string | null; submitted_by: string | null }>(this.scope(actor), 'SELECT a.role,d.decision,d.finding_id,d.evidence_ids,d.evidence_source,d.submitted_by FROM forge_council_assignments a LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.council_id=$3 ORDER BY a.role', [actor.tenantId, actor.workspaceId, session.id]);
+      const assignments = rows.map((row) => ({ role: row.role, status: row.decision ? 'submitted' : 'pending', decision: row.decision, findingId: row.finding_id, evidenceIds: row.evidence_ids ?? [], evidenceSource: row.evidence_source, submittedBy: row.submitted_by }));
+      const submitted = assignments.filter((assignment) => assignment.status === 'submitted').length;
+      output.push(ReviewCouncil.parse({ id: session.id, projectId: session.project_id, targetId: session.target_id, targetKind: session.target_kind, status: submitted === REVIEW_ROLES.length ? 'complete' : submitted ? 'in-review' : 'open', assignments, createdAt: timestamp(session.created_at) }));
+    }
+    return output;
+  }
+  async submitCouncilDecision(actor: ForgeActor, raw: unknown) {
+    const request = CouncilSubmitRequest.parse(raw);
+    const council = (await this.councils(actor)).find((item) => item.id === request.councilId);
+    if (!council) throw new Error('FORGE_COUNCIL_NOT_FOUND');
+    if (council.assignments.find((item) => item.role === request.role)?.status !== 'pending') throw new Error('FORGE_COUNCIL_ROLE_ALREADY_SUBMITTED');
+    if (request.decision === 'findings' && (!request.findingId || request.evidenceIds.length === 0)) throw new Error('FORGE_COUNCIL_FINDING_EVIDENCE_REQUIRED');
+    if (request.decision === 'no-findings' && request.findingId) throw new Error('FORGE_COUNCIL_NO_FINDINGS_HAS_FINDING');
+    const ids = [...new Set(request.evidenceIds)];
+    const evidence = ids.length ? await this.store.query(this.scope(actor), 'SELECT id FROM forge_evidence WHERE tenant_id=$1 AND workspace_id=$2 AND id=ANY($3::uuid[])', [actor.tenantId, actor.workspaceId, ids]) : { rows: [] };
+    if (evidence.rows.length !== ids.length) throw new Error('FORGE_COUNCIL_EVIDENCE_NOT_FOUND');
+    if (request.findingId) {
+      const finding = await this.store.query(this.scope(actor), 'SELECT id FROM forge_findings WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, request.findingId]);
+      if (!finding.rows.length) throw new Error('FORGE_COUNCIL_FINDING_NOT_FOUND');
+    }
+    await this.store.query(this.scope(actor), 'INSERT INTO forge_council_decisions(id,tenant_id,workspace_id,council_id,role,decision,finding_id,evidence_ids,evidence_source,submitted_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,\'user-submitted\',$9)', [uuidv7(), actor.tenantId, actor.workspaceId, request.councilId, request.role, request.decision, request.findingId, json(ids), actor.id]);
+    const updated = (await this.councils(actor)).find((item) => item.id === request.councilId);
+    if (!updated) throw new Error('FORGE_COUNCIL_NOT_FOUND');
+    return updated;
+  }
   async requestApproval(actor: ForgeActor, raw: { epicId: string }) {
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     const epic = await this.store.query<Record<string, unknown> & { id: string; project_id: string; title: string; state: string; requirements: unknown; acceptance_criteria: unknown }>(this.scope(actor), "SELECT id,project_id,title,state,requirement_refs AS requirements,acceptance_criteria FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND kind='epic'", [actor.tenantId, actor.workspaceId, raw.epicId]);
@@ -88,7 +160,9 @@ export class ForgeRepository {
     if (!row || row.decision !== 'approved' || !row.decided_by || Date.parse(timestamp(row.expires_at)) <= Date.now()) throw new Error('FORGE_APPROVED_DURABLE_APPROVAL_REQUIRED');
     const approval = ApprovalRecord.parse({ id: row.id, epicId: row.epic_id, workspaceId: row.workspace_id, scopeHash: row.scope_hash, status: 'approved', approvedBy: row.decided_by, createdAt: timestamp(row.created_at), expiresAt: timestamp(row.expires_at) });
     const tickets = await this.nodesForProject(actor, row.project_id);
-    return { approval, tickets };
+    const reservations = await this.store.query<Record<string, unknown> & { runnable_ticket_ids: unknown }>(this.scope(actor), "SELECT runnable_ticket_ids FROM forge_schedules WHERE tenant_id=$1 AND workspace_id=$2 AND state='queued' AND epic_id=$3 ORDER BY created_at,id", [actor.tenantId, actor.workspaceId, row.epic_id]);
+    const reservedTicketIds = [...new Set(reservations.rows.flatMap((item) => Array.isArray(item.runnable_ticket_ids) ? item.runnable_ticket_ids.filter((id): id is string => typeof id === 'string') : []))];
+    return { approval, tickets, reservedTicketIds };
   }
 
   async persistSchedule(actor: ForgeActor, request: { epicId: string; approval: { id: string }; config: { maxConcurrency: number; maxBudgetUsd: number; resourceLocks: string[] }; spentUsd: number }, result: { runId: string; state: 'queued' | 'stopped' | 'blocked'; runnableTicketIds: string[]; blockedTicketIds: string[]; reason: string | null }) {
@@ -187,8 +261,20 @@ export class ForgeRepository {
       await this.store.query(this.scope(actor), "UPDATE forge_nodes SET state='blocked',updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3", [actor.tenantId, actor.workspaceId, node.id]);
       blockedTicketIds.push(node.id);
     }
-    await this.store.query(this.scope(actor), "INSERT INTO forge_escalations(id,tenant_id,workspace_id,ticket_id,classification,summary,evidence_ids,affected_ticket_ids,status,created_by) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,'open',$9)", [uuidv7(), actor.tenantId, actor.workspaceId, ticket.id, discovery.classification, discovery.summary, json(discovery.evidenceIds), json(blockedTicketIds), actor.id]);
+    await this.store.query(this.scope(actor), "INSERT INTO forge_escalations(id,tenant_id,workspace_id,ticket_id,classification,summary,evidence_ids,affected_ticket_ids,status,created_by) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,'open',$9)", [discovery.id, actor.tenantId, actor.workspaceId, ticket.id, discovery.classification, discovery.summary, json(discovery.evidenceIds), json(blockedTicketIds), actor.id]);
     return { discovery, blockedTicketIds };
+  }
+  async escalations(actor: ForgeActor) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; ticket_id: string; classification: string; summary: string; evidence_ids: unknown; affected_ticket_ids: unknown; current_status: string | null; created_at: string }>(this.scope(actor), 'SELECT e.id,e.ticket_id,e.classification,e.summary,e.evidence_ids,e.affected_ticket_ids,d.status AS current_status,e.created_at FROM forge_escalations e LEFT JOIN LATERAL (SELECT status FROM forge_escalation_events WHERE tenant_id=e.tenant_id AND workspace_id=e.workspace_id AND escalation_id=e.id ORDER BY created_at DESC,id DESC LIMIT 1) d ON true ORDER BY e.created_at DESC');
+    return rows.map((row) => EscalationRecord.parse({ id: row.id, ticketId: row.ticket_id, classification: row.classification, summary: row.summary, evidenceIds: row.evidence_ids, affectedTicketIds: row.affected_ticket_ids, status: row.current_status ?? 'open', createdAt: timestamp(row.created_at) }));
+  }
+  async resolveEscalation(actor: ForgeActor, raw: unknown) {
+    const request = EscalationResolution.parse(raw);
+    const current = (await this.escalations(actor)).find((item) => item.id === request.escalationId);
+    if (!current) throw new Error('FORGE_ESCALATION_NOT_FOUND');
+    if (current.status !== 'open') throw new Error('FORGE_ESCALATION_ALREADY_RESOLVED');
+    await this.store.query(this.scope(actor), 'INSERT INTO forge_escalation_events(id,tenant_id,workspace_id,escalation_id,status,detail,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uuidv7(), actor.tenantId, actor.workspaceId, request.escalationId, request.status, request.detail, actor.id]);
+    return (await this.escalations(actor)).find((item) => item.id === request.escalationId);
   }
   async recordGateEvaluation(actor: ForgeActor, evaluation: { gates: Array<{ id: string; requirementId: string; kind: 'deterministic' | 'human' | 'ai-judgment'; status: 'pass' | 'fail' | 'pending' | 'blocked'; hard: boolean; evidenceIds: string[] }> }) {
     for (const gate of evaluation.gates) await this.store.query(this.scope(actor), 'INSERT INTO forge_gates(id,tenant_id,workspace_id,requirement_id,kind,status,hard,evidence_ids,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)', [`${uuidv7()}:${gate.id}`, actor.tenantId, actor.workspaceId, gate.requirementId, gate.kind, gate.status, gate.hard, json(gate.evidenceIds), actor.id]);
@@ -198,6 +284,23 @@ export class ForgeRepository {
     if (promotion.workspaceId !== actor.workspaceId) throw new Error('FORGE_PROMOTION_WORKSPACE_MISMATCH');
     await this.store.query(this.scope(actor), 'INSERT INTO forge_promotions(id,tenant_id,workspace_id,commit_sha,from_environment,to_environment,state,evidence_ids,missing_gate_ids,approval_id,rollback_of,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12)', [promotion.id, actor.tenantId, actor.workspaceId, promotion.commitSha, promotion.from, promotion.to, promotion.state, json(promotion.evidenceIds), json(promotion.missingGateIds), promotion.approvalId, promotion.rollbackOf, actor.id]);
     return promotion;
+  }
+  async requestPromotionRecord(actor: ForgeActor, raw: unknown) {
+    const command = PromotionCommand.parse(raw);
+    const ids = [...new Set([...command.evidenceIds, ...command.requirements.flatMap((item) => item.evidenceIds)])];
+    const known = ids.length ? await this.store.query<Record<string, unknown> & { id: string; workspace_id: string; requirement_id: string; kind: string; source: string; sha256: string; verified_at: string; deterministic: boolean; result: string }>(this.scope(actor), 'SELECT id,workspace_id,requirement_id,kind,source,sha256,verified_at,deterministic,result FROM forge_evidence WHERE tenant_id=$1 AND workspace_id=$2 AND id=ANY($3::uuid[])', [actor.tenantId, actor.workspaceId, ids]) : { rows: [] };
+    if (known.rows.length !== ids.length) throw new Error('FORGE_PROMOTION_EVIDENCE_NOT_FOUND');
+    const evidence = known.rows.map((row) => Evidence.parse({ id: row.id, workspaceId: row.workspace_id, requirementId: row.requirement_id, kind: row.kind, source: row.source, sha256: row.sha256, verifiedAt: timestamp(row.verified_at), deterministic: row.deterministic, result: row.result }));
+    const gates = deriveGateMatrix(command.requirements, evidence).gates;
+    const promotion = Promotion.parse({ id: uuidv7(), workspaceId: actor.workspaceId, commitSha: command.commitSha, from: command.from, to: command.to, state: 'proposed', evidenceIds: command.evidenceIds, missingGateIds: [], approvalId: command.approvalId, rollbackOf: null, createdAt: new Date().toISOString() });
+    const { requestPromotion } = await import('./engine');
+    const proposal = requestPromotion(promotion, gates);
+    await this.recordPromotion(actor, proposal);
+    return proposal;
+  }
+  async promotions(actor: ForgeActor) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; workspace_id: string; commit_sha: string; from_environment: string; to_environment: string; state: string; evidence_ids: unknown; missing_gate_ids: unknown; approval_id: string | null; rollback_of: string | null; created_at: string }>(this.scope(actor), 'SELECT id,workspace_id,commit_sha,from_environment,to_environment,state,evidence_ids,missing_gate_ids,approval_id,rollback_of,created_at FROM forge_promotions ORDER BY created_at DESC');
+    return rows.map((row) => Promotion.parse({ id: row.id, workspaceId: row.workspace_id, commitSha: row.commit_sha, from: row.from_environment, to: row.to_environment, state: row.state, evidenceIds: row.evidence_ids, missingGateIds: row.missing_gate_ids, approvalId: row.approval_id, rollbackOf: row.rollback_of, createdAt: timestamp(row.created_at) }));
   }
   private async nodesForProject(actor: ForgeActor, projectId: string) {
     const { rows } = await this.store.query<NodeRow>(this.scope(actor), 'SELECT id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 ORDER BY created_at', [actor.tenantId, actor.workspaceId, projectId]);
