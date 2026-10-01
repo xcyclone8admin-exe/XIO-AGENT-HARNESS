@@ -93,6 +93,8 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   expect(memo.status).toBe('in_review');
   const userCall = (id: string) => ({ principal: { kind: 'user' as const, id, tenantId, workspaces: [{ id: workspaceId, role: 'admin' as const, kind: 'standard' as const }], grants: [] }, workspaceId });
   const agentCall = { principal: { ...userCall(userId).principal, kind: 'agent' as const, delegatedBy: userId, runId: '019a0000-0000-7000-8000-000000000505' }, workspaceId };
+  const firstPerformanceMark=await service.capturePerformanceMark(scope,userCall(userId),{portfolioId,benchmarkIndexUnits:'10000',benchmarkSource:'Fixture benchmark',benchmarkRef:'fixture://benchmark/first'});
+  await expect(service.capturePerformanceMark(scope,agentCall,{portfolioId,benchmarkIndexUnits:'10000',benchmarkSource:'Fixture benchmark',benchmarkRef:'fixture://benchmark/agent'})).rejects.toThrow(/direct owner or admin/);
   await expect(service.voteMemo(scope, agentCall, { memoId: memo.id, vote: 'approve', reason: 'agent cannot vote' })).rejects.toThrow(/direct owner or admin/);
   const firstVote = await service.voteMemo(scope, userCall(userId), { memoId: memo.id, vote: 'approve', reason: 'Reviewed limits and source' });
   expect(firstVote.approvals).toBe(1);
@@ -177,9 +179,46 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
     WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,[tenantId,workspaceId,portfolio.id]);
   await service.fundPortfolio(scope,userId,{portfolioId:portfolio.id,units:'1000',reference:'post-midnight PAPER capital contribution'});
   await expect(service.riskState(scope,{portfolioId:portfolio.id})).resolves.toMatchObject({killSwitch:true,killReason:'prior day halt',dailyLossUnits:'0'});
+  const secondPerformanceMark=await service.capturePerformanceMark(scope,userCall(userId),{portfolioId,benchmarkIndexUnits:'11000',benchmarkSource:'Fixture benchmark',benchmarkRef:'fixture://benchmark/second'});
+  expect(secondPerformanceMark).toMatchObject({external_flow_units:'1000',nav_units:'101000'});
+  const statement=await service.createPerformanceStatement(scope,userCall(userId),{portfolioId,fromMarkId:firstPerformanceMark.id,toMarkId:secondPerformanceMark.id});
+  expect(statement.report).toMatchObject({calculationVersion:'invest-twr-fixed-v1',feesUnits:'0',twrBps:'0',benchmarkReturnBps:'1000',relativeReturnBps:'-1000',netExternalFlowUnits:'1000'});
+  await expect(service.createPerformanceStatement(scope,userCall(userId),{portfolioId,fromMarkId:firstPerformanceMark.id,toMarkId:secondPerformanceMark.id})).resolves.toMatchObject({id:statement.id});
+  expect(await service.performanceStatements(scope,{portfolioId})).toEqual(expect.arrayContaining([expect.objectContaining({id:statement.id})]));
+  await expect(db.query(`UPDATE invest_performance_marks SET nav_units=0 WHERE id=$1`,[secondPerformanceMark.id])).rejects.toThrow(/append-only/);
+  await expect(db.query(`UPDATE invest_performance_reports SET result_hash=$2 WHERE id=$1`,[statement.id,'0'.repeat(64)])).rejects.toThrow(/append-only/);
   await expect(service.propose(scope,userId,{portfolioId:portfolio.id,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'halt-carries-over-utc-day'})).rejects.toThrow(/kill switch is engaged/);
   await service.setKillSwitch(scope,userId,{portfolioId:portfolio.id,engaged:false,reason:'Owner explicitly resumed after UTC rollover'});
   await expect(service.riskState(scope,{portfolioId:portfolio.id})).resolves.toMatchObject({killSwitch:false,killReason:null,dailyLossUnits:'0'});
+
+  const revisedMemo = await service.createMandate(scope,userId,{portfolioId,version:2,title:'Versioned PAPER risk-policy change',thesis:'Lower the order notional cap after review.',
+    sources:[{label:'Policy review fixture',ref:'fixture://invest/limits/v2',sha256:'c'.repeat(64)}],effectiveFrom:new Date(Date.now()-60_000).toISOString(),effectiveUntil:null,
+    allowedAssetClasses:['crypto'],allowedInstrumentIds:[instrumentId],benchmark:'PAPER-CASH',limits:{maxOrderNotionalUnits:'90000',maxPositionNotionalUnits:'100000',maxDailyLossUnits:'100000',
+      maxOrdersPerHour:20,maxPriceDeviationBps:500,quoteFreshnessSeconds:300,duplicateWindowSeconds:1,maxConcentrationBps:5000,maxCorrelatedExposureBps:10000,
+      maxLeverageBps:10000,maxDrawdownBps:2000,targetVolatilityBps:2000,blockedSymbols:[],watchSymbols:[]}});
+  await service.voteMemo(scope,userCall(userId),{memoId:revisedMemo.id,vote:'approve',reason:'Owner reviewed the revised cap'});
+  await service.voteMemo(scope,userCall(secondUserId),{memoId:revisedMemo.id,vote:'approve',reason:'Independent IC approval'});
+  const activatedV2 = await service.activateMandate(scope,userCall(userId),{memoId:revisedMemo.id});
+  const limitAudit = await db.query<{previous:string;proposed:string;reason:string;approved_by:string;created_by:string}>(`SELECT previous_limits::text AS previous,proposed_limits::text AS proposed,reason,approved_by,created_by FROM invest_limit_changes
+    WHERE tenant_id=$1 AND workspace_id=$2 AND mandate_id=$3`,[tenantId,workspaceId,activatedV2.id]);
+  expect(limitAudit.rows).toHaveLength(1);
+  expect(JSON.parse(limitAudit.rows[0]!.previous).maxOrderNotionalUnits).toBe('100000');
+  expect(JSON.parse(limitAudit.rows[0]!.proposed).maxOrderNotionalUnits).toBe('90000');
+  expect(limitAudit.rows[0]).toMatchObject({approved_by:userId,created_by:userId});
+
+  const historicalBars = [
+    {at:'2026-01-01T00:00:00.000Z',openUnits:'10000',highUnits:'10500',lowUnits:'9500',closeUnits:'10000'},
+    {at:'2026-01-02T00:00:00.000Z',openUnits:'10000',highUnits:'11200',lowUnits:'9900',closeUnits:'11000'},
+    {at:'2026-01-03T00:00:00.000Z',openUnits:'12000',highUnits:'14000',lowUnits:'11500',closeUnits:'13000'},
+  ];
+  const strategy={id:'momentum-next-bar',version:1,quantityUnits:'1000000',stopBps:500,targetBps:1000,feeBps:100};
+  const backtestInput={instrumentId,dataVersion:1,sourceName:'Unit fixture',sourceRef:'fixture://invest/backtest/golden',bars:historicalBars,strategy};
+  const backtest=await service.runBacktest(scope,userId,backtestInput);
+  expect(backtest).toMatchObject({engineVersion:'momentum-next-bar-v1',dataVersion:1,strategyVersion:1,netPnlUnits:'948',totalFeesUnits:'252'});
+  await expect(service.runBacktest(scope,userId,backtestInput)).resolves.toMatchObject({runId:backtest.runId});
+  await expect(service.backtestRuns(scope,{instrumentId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:backtest.runId,data_version:1,strategy_key:strategy.id,strategy_version:1,net_pnl_units:'948'})]));
+  await expect(service.runBacktest(scope,userId,{...backtestInput,bars:[...historicalBars.slice(0,2),{...historicalBars[2]!,closeUnits:'12999'}]})).rejects.toThrow(/data version already exists/);
+  await expect(db.query(`UPDATE invest_backtest_runs SET net_pnl_units=0 WHERE id=$1`,[backtest.runId])).rejects.toThrow(/append-only/);
 });
 
 test('a failing fill-event insert rolls back fill and ledger posting together', async () => {

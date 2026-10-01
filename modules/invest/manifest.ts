@@ -25,21 +25,23 @@ export default defineModule({
     'invest:order:cancel',
     'invest:order:kill_switch',
     'invest:breach:manage',
+    'invest:backtest:run',
+    'invest:performance:report',
   ],
   roleGrants: {
     owner: [
       'invest:portfolio:read', 'invest:portfolio:write', 'invest:portfolio:fund', 'invest:mandate:read', 'invest:mandate:manage', 'invest:mandate:vote', 'invest:mandate:approve',
       'invest:market:read', 'invest:market:ingest', 'invest:order:read', 'invest:order:propose',
-      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage',
+      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage', 'invest:backtest:run', 'invest:performance:report',
     ],
     admin: [
       'invest:portfolio:read', 'invest:portfolio:write', 'invest:portfolio:fund', 'invest:mandate:read', 'invest:mandate:manage', 'invest:mandate:vote', 'invest:mandate:approve',
       'invest:market:read', 'invest:market:ingest', 'invest:order:read', 'invest:order:propose',
-      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage',
+      'invest:order:approve', 'invest:order:execute', 'invest:order:cancel', 'invest:order:kill_switch', 'invest:breach:manage', 'invest:backtest:run', 'invest:performance:report',
     ],
     manager: [
       'invest:portfolio:read', 'invest:portfolio:write', 'invest:portfolio:fund', 'invest:mandate:read', 'invest:market:read',
-      'invest:market:ingest',
+      'invest:market:ingest', 'invest:backtest:run',
       'invest:order:read', 'invest:order:propose', 'invest:order:cancel',
     ],
     member: ['invest:portfolio:read', 'invest:mandate:read', 'invest:market:read', 'invest:order:read'],
@@ -50,6 +52,8 @@ export default defineModule({
     { path: '', title: 'Portfolio', keywords: ['positions', 'NAV', 'assets'] },
     { path: 'orders', title: 'Paper orders', keywords: ['trade', 'paper', 'fills'] },
     { path: 'risk', title: 'Risk and mandates', keywords: ['guardrails', 'limits', 'policy'] },
+    { path: 'backtests', title: 'PAPER backtests', keywords: ['simulation', 'OHLC', 'research'] },
+    { path: 'performance', title: 'PAPER performance', keywords: ['TWR', 'benchmark', 'statements'] },
   ],
   dependsOn: ['money'],
   tables: [
@@ -75,6 +79,11 @@ export default defineModule({
     { name: 'invest_ic_memos', class: 'local', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_ic_votes', class: 'append', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },
     { name: 'invest_ic_memo_events', class: 'append', authority: 'server', readPermission: 'invest:mandate:read', serverWriteCapabilities: ['invest_paper'] },
+    { name: 'invest_backtest_datasets', class: 'append', authority: 'server', readPermission: 'invest:market:read', serverWriteCapabilities: ['invest_paper'] },
+    { name: 'invest_backtest_strategies', class: 'append', authority: 'server', readPermission: 'invest:market:read', serverWriteCapabilities: ['invest_paper'] },
+    { name: 'invest_backtest_runs', class: 'append', authority: 'server', readPermission: 'invest:market:read', serverWriteCapabilities: ['invest_paper'] },
+    { name: 'invest_performance_marks', class: 'append', authority: 'server', readPermission: 'invest:portfolio:read', serverWriteCapabilities: ['invest_paper', 'invest_paper_execution'] },
+    { name: 'invest_performance_reports', class: 'append', authority: 'server', readPermission: 'invest:portfolio:read', serverWriteCapabilities: ['invest_paper'] },
   ],
   portedFrom: ['FounderOS trading guardrails and strategy reference (MIT)'],
 });

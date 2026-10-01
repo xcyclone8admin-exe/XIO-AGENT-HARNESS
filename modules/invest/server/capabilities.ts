@@ -4,6 +4,7 @@ import { GuardrailLimits } from './risk';
 
 const Uuid = z.uuid();
 const Units = z.string().regex(/^(0|-?[1-9]\d{0,37})$/);
+const ReturnBps = z.string().regex(/^-?\d{1,43}$/);
 const OrderView = z.object({
   id: Uuid, portfolio_id: Uuid, instrument_id: Uuid, symbol: z.string(), side: z.enum(['buy', 'sell']), order_type: z.enum(['market', 'limit']),
   quantity_units: Units, filled_units: Units.optional(), limit_price_units: Units.nullable(), status: z.enum(['proposed', 'approved', 'rejected', 'submitted', 'partially_filled', 'filled', 'cancelled', 'expired']),
@@ -12,9 +13,28 @@ const OrderView = z.object({
 const PortfolioView = z.object({ id: Uuid, name: z.string(), base_asset: z.string(), book_id: Uuid, environment: z.literal('paper'), status: z.enum(['active','paused','closed']) });
 const InstrumentView = z.object({ id: Uuid, symbol: z.string(), asset_class: z.string(), quantity_scale: z.number(), exchange_code: z.string().nullable() });
 const Summary = z.object({ portfolioId: Uuid, environment: z.literal('paper'), cashUnits: Units, navUnits: Units, positions: z.array(z.object({ instrumentId: Uuid, symbol: z.string(), quantityUnits: Units, priceUnits: Units, marketValueUnits: Units })) });
+const BacktestBar = z.object({ at:z.iso.datetime({offset:true}),openUnits:z.string().regex(/^[1-9]\d{0,37}$/),highUnits:z.string().regex(/^[1-9]\d{0,37}$/),lowUnits:z.string().regex(/^[1-9]\d{0,37}$/),closeUnits:z.string().regex(/^[1-9]\d{0,37}$/) }).strict();
+const BacktestTrade = z.object({entryBar:z.number().int(),exitBar:z.number().int(),entryPriceUnits:Units,exitPriceUnits:Units,quantityUnits:Units,grossPnlUnits:Units,feesUnits:Units,netPnlUnits:Units,exitReason:z.enum(['stop','target','end_of_data'])});
+const BacktestResultView = z.object({runId:Uuid,engineVersion:z.literal('momentum-next-bar-v1'),dataVersion:z.number(),strategyId:z.string(),strategyVersion:z.number(),dataHash:z.string().regex(/^[0-9a-f]{64}$/),strategyHash:z.string().regex(/^[0-9a-f]{64}$/),trades:z.array(BacktestTrade),totalFeesUnits:Units,netPnlUnits:Units});
+const BacktestHistoryRow = z.object({id:Uuid,data_version:z.number(),source_name:z.string(),source_ref:z.string(),data_hash:z.string(),strategy_key:z.string(),strategy_version:z.number(),strategy_hash:z.string(),engine_version:z.string(),total_fees_units:Units,net_pnl_units:Units,created_at:z.string()});
+const PerformanceMarkView = z.object({id:Uuid,portfolio_id:Uuid,captured_at:z.string(),nav_units:Units,cash_units:Units,benchmark_index_units:Units,benchmark_source:z.string(),benchmark_ref:z.string(),external_flow_units:Units, cumulative_fee_units:Units});
+const PerformanceStatementData = z.object({calculationVersion:z.literal('invest-twr-fixed-v1'),fromMarkId:Uuid,toMarkId:Uuid,startNavUnits:Units,endNavUnits:Units,netExternalFlowUnits:Units,feesUnits:Units,twrBps:ReturnBps,benchmarkReturnBps:ReturnBps,relativeReturnBps:ReturnBps,markCount:z.number().int()});
+const PerformanceStatementView = z.object({id:Uuid,portfolio_id:Uuid,created_at:z.string(),report:PerformanceStatementData});
 const Empty = z.object({});
 
 export const investCapabilities = {
+  performanceMarks: defineCapability({id:'invest.performance.marks',title:'PAPER valuation marks',description:'List immutable ledger-derived PAPER valuation and benchmark marks',kind:'read',permission:'invest:portfolio:read',input:z.object({portfolioId:Uuid}).strict(),output:z.array(PerformanceMarkView)}),
+  capturePerformanceMark: defineCapability({id:'invest.performance.capture-mark',title:'Capture PAPER performance mark',description:'Capture ledger NAV, capital flows and fees against a sourced benchmark level in one scoped transaction',kind:'write',permission:'invest:performance:report',agentCallable:false,
+    input:z.object({portfolioId:Uuid,benchmarkIndexUnits:z.string().regex(/^[1-9]\d{0,37}$/),benchmarkSource:z.string().trim().min(1).max(120),benchmarkRef:z.string().trim().min(1).max(500)}).strict(),output:PerformanceMarkView}),
+  createPerformanceStatement: defineCapability({id:'invest.performance.statement',title:'Generate PAPER performance statement',description:'Persist versioned time-weighted return, fees and benchmark attribution from stored ledger-derived marks',kind:'write',permission:'invest:performance:report',agentCallable:false,
+    input:z.object({portfolioId:Uuid,fromMarkId:Uuid,toMarkId:Uuid}).strict(),output:PerformanceStatementView}),
+  performanceStatements: defineCapability({id:'invest.performance.statements',title:'PAPER performance statements',description:'List immutable versioned portfolio performance statements',kind:'read',permission:'invest:portfolio:read',input:z.object({portfolioId:Uuid}).strict(),output:z.array(PerformanceStatementView)}),
+  backtestRuns: defineCapability({id:'invest.backtests.list',title:'PAPER backtest history',description:'Read immutable versioned PAPER backtest runs and their input provenance',kind:'read',permission:'invest:market:read',
+    input:z.object({instrumentId:Uuid}).strict(),output:z.array(BacktestHistoryRow)}),
+  runBacktest: defineCapability({ id:'invest.backtests.run-paper',title:'Run versioned PAPER backtest',description:'Run a deterministic long-only next-bar OHLC simulation with pessimistic stops, explicit fees and immutable inputs/results',
+    kind:'write',permission:'invest:backtest:run',agentCallable:false,input:z.object({instrumentId:Uuid,dataVersion:z.int().min(1),sourceName:z.string().trim().min(1).max(120),sourceRef:z.string().trim().min(1).max(500),
+      bars:z.array(BacktestBar).min(2).max(10000),strategy:z.object({id:z.string().trim().min(1).max(120),version:z.int().min(1),quantityUnits:z.string().regex(/^[1-9]\d{0,37}$/),stopBps:z.int().min(1).max(9999),targetBps:z.int().min(1).max(100000),feeBps:z.int().min(0).max(2000)}).strict()}).strict(),
+    output:BacktestResultView}),
   portfolios: defineCapability({ id: 'invest.portfolios.list', title: 'Portfolios', description: 'List PAPER investment portfolios',
     kind: 'read', permission: 'invest:portfolio:read', input: Empty, output: z.array(PortfolioView) }),
   summary: defineCapability({ id: 'invest.portfolios.summary', title: 'PAPER portfolio summary', description: 'Ledger-derived cash, positions and NAV for one PAPER portfolio',
