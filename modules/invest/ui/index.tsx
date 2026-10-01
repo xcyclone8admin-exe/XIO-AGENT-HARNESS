@@ -11,6 +11,7 @@ type Portfolio = { id: string; name: string; base_asset: string; book_id: string
 type Instrument = { id: string; symbol: string; asset_class: string; quantity_scale: number; exchange_code: string|null };
 type Order = { id:string; portfolio_id:string; instrument_id:string; symbol:string; side:'buy'|'sell'; order_type:'market'|'limit'; quantity_units:string; limit_price_units:string|null; status:string; environment:'paper'; created_at:string };
 type ICMemo = { id:string; portfolio_id:string; version:number; title:string; status:'draft'|'in_review'|'approved'|'rejected'|'expired'; approvals:number; rejections:number; recusals:number; created_at:string };
+type Breach = { id:string; portfolio_id:string; instrument_id:string|null; kind:string; severity:'warning'|'high'|'critical'; status:'open'|'acknowledged'|'resolved'; owner_id:string|null; detail:Record<string,unknown>; opened_at:string };
 type Summary = { portfolioId:string; environment:'paper'; cashUnits:string; navUnits:string; positions:Array<{instrumentId:string;symbol:string;quantityUnits:string;priceUnits:string;marketValueUnits:string}> };
 
 function PaperBanner() {
@@ -137,6 +138,7 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   const portfolios = useCapability<Portfolio[]>(api, workspaceId, caps.portfolios.id);
   const instruments = useCapability<Instrument[]>(api, workspaceId, caps.instruments.id);
   const memoQueue = useCapability<ICMemo[]>(api, workspaceId, caps.icQueue.id);
+  const breaches = useCapability<Breach[]>(api, workspaceId, caps.breaches.id);
   const [symbol, setSymbol] = useState(''); const [exchange, setExchange] = useState(''); const [price, setPrice] = useState('');
   const [memoTitle, setMemoTitle] = useState(''); const [thesis, setThesis] = useState(''); const [sourceRef, setSourceRef] = useState('');
   const [maxOrderNotional, setMaxOrderNotional] = useState('1000'); const [busy, setBusy] = useState(false); const [message, setMessage] = useState<string|null>(null);
@@ -145,7 +147,7 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   async function write(id: string, input: unknown) {
     if (!api || !workspaceId) return;
     setBusy(true); setMessage(null);
-    try { await api.write(workspaceId, id, input); setMessage('Saved.'); portfolios.refresh(); instruments.refresh(); memoQueue.refresh(); }
+    try { await api.write(workspaceId, id, input); setMessage('Saved.'); portfolios.refresh(); instruments.refresh(); memoQueue.refresh(); breaches.refresh(); }
     catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Investment configuration failed'); }
     finally { setBusy(false); }
   }
@@ -203,6 +205,12 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
       {memoQueue.loading ? <LoadingState label="Loading IC decisions" rows={3} /> : null}
       {!memoQueue.loading && !memoQueue.data?.length ? <EmptyState icon={ShieldCheck} title="No committee memos">Policy drafts submitted for review will appear here.</EmptyState> : null}
       {memoQueue.data?.map((memo) => <div key={memo.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-line py-3 last:border-0"><div><p className="font-medium">{memo.title} <Badge tone={memo.status === 'approved' ? 'positive' : memo.status === 'rejected' ? 'negative' : 'caution'}>{memo.status}</Badge></p><p className="font-mono text-xs text-fg-muted">v{memo.version} · approve {memo.approvals}/2 · reject {memo.rejections} · recuse {memo.recusals}</p></div>{memo.status === 'in_review' ? <div className="flex gap-2"><Button size="sm" variant="secondary" loading={busy} onClick={() => void voteMemo(memo.id,'approve')}>Approve vote</Button><Button size="sm" variant="secondary" loading={busy} onClick={() => void voteMemo(memo.id,'recuse')}>Recuse</Button>{memo.approvals >= 2 && memo.rejections === 0 ? <Button size="sm" loading={busy} onClick={() => void activateMemo(memo.id)}>Activate mandate</Button> : null}</div> : null}</div>)}
+    </Panel>
+    <Panel title="Post-trade alert queue" description="Alerts are durable records; assignment, acknowledgement and resolution are owner-attributed and append-only.">
+      {breaches.loading ? <LoadingState label="Loading breach alerts" rows={2} /> : null}
+      {breaches.error ? <ErrorState error={breaches.error} onRetry={breaches.refresh} title="Breach queue could not be loaded" /> : null}
+      {!breaches.loading && !breaches.error && !breaches.data?.length ? <EmptyState icon={ShieldCheck} title="No open risk alerts">New post-trade limit breaches will appear here.</EmptyState> : null}
+      {breaches.data?.map((breach) => <div key={breach.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-line py-3 last:border-0"><div><p className="font-medium">{breach.kind} <Badge tone={breach.severity === 'critical' ? 'negative' : 'caution'}>{breach.severity}</Badge> <Badge tone={breach.status === 'acknowledged' ? 'positive' : 'caution'}>{breach.status}</Badge></p><p className="font-mono text-xs text-fg-muted">{breach.opened_at} · owner {breach.owner_id ?? 'unassigned'}</p></div><div className="flex gap-2">{breach.status === 'open' && !breach.owner_id ? <Button size="sm" variant="secondary" loading={busy} onClick={() => void write(caps.manageBreach.id,{breachId:breach.id,action:'assign',reason:'Owner accepted responsibility for risk alert'})}>Assign to me</Button> : null}{breach.status === 'open' && breach.owner_id ? <Button size="sm" variant="secondary" loading={busy} onClick={() => void write(caps.manageBreach.id,{breachId:breach.id,action:'acknowledge',reason:'Owner reviewed the alert'})}>Acknowledge</Button> : null}{breach.status === 'acknowledged' ? <Button size="sm" loading={busy} onClick={() => void write(caps.manageBreach.id,{breachId:breach.id,action:'resolve',reason:'Owner resolved the underlying PAPER risk condition'})}>Resolve</Button> : null}</div></div>)}
     </Panel>
     {selectedPortfolio ? <KillSwitch workspaceId={workspaceId} api={api} portfolioId={selectedPortfolio.id} /> : null}
     <Panel title="Instruments" description="Registered instruments and scale used by deterministic sizing.">{instruments.data?.length ? <ul className="divide-y divide-line">{instruments.data.map((instrument) => <li className="flex justify-between py-2 text-sm" key={instrument.id}><span>{instrument.symbol} · {instrument.asset_class}</span><span className="font-mono text-xs text-fg-muted">scale {instrument.quantity_scale} · {instrument.exchange_code ?? '24/7'}</span></li>)}</ul> : <EmptyState icon={AlertTriangle} title="No instruments configured">Register a paper instrument above before proposing an order.</EmptyState>}</Panel>

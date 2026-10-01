@@ -34,6 +34,8 @@ export class InvestService {
     reg(investCapabilities.portfolios, (_input, call) => this.portfolios(this.scope(call)));
     reg(investCapabilities.summary, (input, call) => this.summary(this.scope(call), input as { portfolioId: string }));
     reg(investCapabilities.riskState, (input, call) => this.riskState(this.scope(call), input as { portfolioId: string }));
+    reg(investCapabilities.breaches, (_input, call) => this.breaches(this.scope(call)));
+    reg(investCapabilities.manageBreach, (input, call) => this.manageBreach(this.scope(call), call, input as { breachId: string; action: 'assign'|'acknowledge'|'resolve'; reason: string }));
     reg(investCapabilities.instruments, (_input, call) => this.instruments(this.scope(call)));
     reg(investCapabilities.orders, (input, call) => this.orders(this.scope(call), input as { portfolioId?: string }));
     reg(investCapabilities.taxLots, (input, call) => this.taxLots(this.scope(call), input as { portfolioId: string }));
@@ -120,6 +122,48 @@ export class InvestService {
       WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 AND l.remaining_units>0 ORDER BY l.opened_at,l.id`,
       [scope.tenantId, scope.workspaceId, input.portfolioId])).rows;
   }
+  async breaches(scope: InvestScope): Promise<Array<{id:string;portfolio_id:string;instrument_id:string|null;kind:string;severity:'warning'|'high'|'critical';status:'open'|'acknowledged'|'resolved';owner_id:string|null;detail:Record<string,unknown>;opened_at:string}>> {
+    return (await this.scoped.query<{id:string;portfolio_id:string;instrument_id:string|null;kind:string;severity:'warning'|'high'|'critical';status:'open'|'acknowledged'|'resolved';owner_id:string|null;detail:Record<string,unknown>;opened_at:string}>(scope, `SELECT id,portfolio_id,instrument_id,kind,severity,status,owner_id,detail,opened_at::text
+      FROM invest_breaches WHERE tenant_id=$1 AND workspace_id=$2 AND status<>'resolved' ORDER BY opened_at DESC LIMIT 200`,
+      [scope.tenantId, scope.workspaceId])).rows;
+  }
+  async manageBreach(scope: InvestScope, call: Call, input: {breachId:string;action:'assign'|'acknowledge'|'resolve';reason:string}): Promise<{id:string;status:'open'|'acknowledged'|'resolved';ownerId:string|null}> {
+    const actorId = this.requireHumanOwner(scope, call);
+    return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
+      const result = await tx.query<{id:string;status:'open'|'acknowledged'|'resolved';owner_id:string|null}>(`SELECT id,status,owner_id FROM invest_breaches
+        WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, input.breachId]);
+      const breach = result.rows[0]; if (!breach || breach.status === 'resolved') throw new Error('Open breach not found');
+      let status: 'open'|'acknowledged'|'resolved' = breach.status; let ownerId = breach.owner_id;
+      if (input.action === 'assign') {
+        if (status !== 'open') throw new Error('Only open breaches can be assigned');
+        ownerId = actorId;
+        await tx.query(`UPDATE invest_breaches SET owner_id=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, breach.id, actorId]);
+      } else {
+        if (ownerId !== actorId) throw new Error('Breach action requires its assigned owner');
+        if (input.action === 'acknowledge') {
+          if (status !== 'open') throw new Error('Only open breaches can be acknowledged');
+          status = 'acknowledged';
+          await tx.query(`UPDATE invest_breaches SET status='acknowledged' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, breach.id]);
+        } else {
+          if (status !== 'acknowledged') throw new Error('Breach must be acknowledged before resolution');
+          status = 'resolved';
+          await tx.query(`UPDATE invest_breaches SET status='resolved',resolved_at=now(),resolution_reason=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,
+            [scope.tenantId, scope.workspaceId, breach.id, input.reason]);
+        }
+      }
+      await tx.query(`INSERT INTO invest_breach_events(id,tenant_id,workspace_id,breach_id,event_type,detail,actor_id)
+        VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)`, [uuidv7(), scope.tenantId, scope.workspaceId, breach.id,
+        input.action === 'assign' ? 'assigned' : input.action === 'acknowledge' ? 'acknowledged' : 'resolved', JSON.stringify({ reason: input.reason, ownerId }), actorId]);
+      return { id: breach.id, status, ownerId };
+    });
+  }
+  private async createBreach(tx: QueryTx, scope: InvestScope, actorId: string, portfolioId: string, instrumentId: string|null, severity: string, kind: string, detail: Record<string,string>): Promise<void> {
+    const id = uuidv7();
+    await tx.query(`INSERT INTO invest_breaches(id,tenant_id,workspace_id,portfolio_id,instrument_id,severity,kind,detail,created_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [id, scope.tenantId, scope.workspaceId, portfolioId, instrumentId, severity, kind, JSON.stringify(detail), actorId]);
+    await tx.query(`INSERT INTO invest_breach_events(id,tenant_id,workspace_id,breach_id,event_type,detail,actor_id)
+      VALUES($1,$2,$3,$4,'alerted',$5::jsonb,$6)`, [uuidv7(), scope.tenantId, scope.workspaceId, id, JSON.stringify({ severity, kind }), actorId]);
+  }
 
   async instruments(scope: InvestScope): Promise<Array<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>> {
     return (await this.scoped.query<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>(scope, `SELECT id,symbol,asset_class,quantity_scale,exchange_code FROM invest_instruments
@@ -200,9 +244,8 @@ export class InvestService {
         const exists = await tx.query<{id:string}>(`SELECT id FROM invest_breaches WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3
           AND kind=$4 AND instrument_id IS NOT DISTINCT FROM $5 AND status<>'resolved'`,
           [scope.tenantId, scope.workspaceId, portfolio.id, breach.kind, breach.instrumentId]);
-        if (!exists.rows.length) await tx.query(`INSERT INTO invest_breaches(id,tenant_id,workspace_id,portfolio_id,instrument_id,severity,kind,detail,created_by)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, portfolio.id, breach.instrumentId,
-          autoHalt ? 'critical' : 'high', breach.kind, JSON.stringify({ ...breach.detail, source: 'market_mark', instrumentId: changedInstrumentId }), actorId]);
+        if (!exists.rows.length) await this.createBreach(tx, scope, actorId, portfolio.id, breach.instrumentId, autoHalt ? 'critical' : 'high', breach.kind,
+          { ...breach.detail, source: 'market_mark', instrumentId: changedInstrumentId });
       }
       if (autoHalt) {
         const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
@@ -615,9 +658,8 @@ export class InvestService {
       if (navAfter > 0n && currentPositionValue * 10_000n > navAfter * BigInt(mandateLimits.maxConcentrationBps)) breaches.push({ kind: 'position_concentration', detail: { value: currentPositionValue.toString(), nav: navAfter.toString(), limitBps: String(mandateLimits.maxConcentrationBps) } });
       if (navAfter > 0n && grossExposure * 10_000n > navAfter * BigInt(mandateLimits.maxLeverageBps)) breaches.push({ kind: 'gross_leverage', detail: { exposure: grossExposure.toString(), nav: navAfter.toString(), limitBps: String(mandateLimits.maxLeverageBps) } });
       if (dailyLoss > 0n) breaches.push({ kind: 'daily_loss', detail: { lossUnits: dailyLoss.toString(), limitUnits: mandateLimits.maxDailyLossUnits } });
-      for (const breach of breaches) await tx.query(`INSERT INTO invest_breaches(id,tenant_id,workspace_id,portfolio_id,instrument_id,severity,kind,detail,created_by)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, row['portfolio_id'], row['instrument_id'],
-        autoHalt ? 'critical' : 'high', breach.kind, JSON.stringify({ ...breach.detail, sourceOrderId: input.orderId }), actorId]);
+      for (const breach of breaches) await this.createBreach(tx, scope, actorId, String(row['portfolio_id']), String(row['instrument_id']),
+        autoHalt ? 'critical' : 'high', breach.kind, { ...breach.detail, sourceOrderId: input.orderId });
       if (autoHalt) {
         const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND id<>$4 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
           [scope.tenantId, scope.workspaceId, row['portfolio_id'], input.orderId]);
