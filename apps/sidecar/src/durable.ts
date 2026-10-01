@@ -52,6 +52,33 @@ interface ApprovalRow extends Record<string, unknown> {
   expires_at: string;
 }
 
+interface ApprovalUseMarker {
+  approvalId: string;
+  decisionId: string;
+  capabilityId: string;
+  inputDigest: string;
+  idempotencyKey: string;
+}
+
+function parseApprovalUseMarker(value: unknown): ApprovalUseMarker | undefined {
+  let candidate = value;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return undefined;
+  const marker = candidate as Partial<ApprovalUseMarker>;
+  if (
+    typeof marker.approvalId !== 'string' || typeof marker.decisionId !== 'string' ||
+    typeof marker.capabilityId !== 'string' || typeof marker.inputDigest !== 'string' ||
+    typeof marker.idempotencyKey !== 'string'
+  ) return undefined;
+  return marker as ApprovalUseMarker;
+}
+
 /** Reads current scoped approval state and atomically reserves each approval for one call key. */
 export class DurableBusApproval implements BusApproval {
   constructor(private readonly store: LocalScopedStore) {}
@@ -91,7 +118,7 @@ export class DurableBusApproval implements BusApproval {
     if (!row) return null;
 
     const markerKey = `approval-use:${approvalId}`;
-    const marker = { approvalId, decisionId: row.decision_id, capabilityId, inputDigest, idempotencyKey };
+    const marker: ApprovalUseMarker = { approvalId, decisionId: row.decision_id, capabilityId, inputDigest, idempotencyKey };
     const inserted = await this.store.query<{ key: string } & Record<string, unknown>>(scope,
       `INSERT INTO capability_idempotency(key,tenant_id,workspace_id,input_hash,result)
        VALUES ($1,$2,$3,$4,$5::jsonb) ON CONFLICT (key) DO NOTHING RETURNING key`,
@@ -100,7 +127,7 @@ export class DurableBusApproval implements BusApproval {
       const previous = await this.store.query<{ input_hash: string; result: unknown } & Record<string, unknown>>(
         scope, 'SELECT input_hash,result FROM capability_idempotency WHERE key=$1', [markerKey]);
       const used = previous.rows[0];
-      const saved = typeof used?.result === 'string' ? JSON.parse(used.result) as typeof marker : used?.result as typeof marker | undefined;
+      const saved = parseApprovalUseMarker(used?.result);
       if (
         !used || used.input_hash !== inputDigest || saved?.decisionId !== row.decision_id ||
         saved?.capabilityId !== capabilityId || saved?.idempotencyKey !== idempotencyKey

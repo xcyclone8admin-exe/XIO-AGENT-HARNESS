@@ -88,6 +88,19 @@ test('CapabilityBus supplies trusted scope and only a durable exact-input approv
     idempotencyKey: 'brain-source-erase-changed-input',
   })).rejects.toMatchObject<Partial<BusFault>>({ code: 'APPROVAL_REQUIRED' });
 
+  // Corrupt durable replay data must fail closed as an unavailable approval, not throw JSON.parse.
+  await db.query(`UPDATE capability_idempotency SET result=$2::jsonb WHERE key=$1`, [
+    `approval-use:${approvalId}`, JSON.stringify('{'),
+  ]);
+  await expect(bus.call({
+    principal,
+    workspaceId,
+    capabilityId: brainCapabilities.requestErasure.id,
+    input: erasureInput,
+    approvalId,
+    idempotencyKey: 'brain-source-erase-corrupt-replay',
+  })).rejects.toMatchObject<Partial<BusFault>>({ code: 'APPROVAL_REQUIRED' });
+
   const erasures = await scoped.query<{ id: string } & Record<string, unknown>>(
     { tenantId: principal.tenantId, workspaceId },
     'SELECT id FROM brain_source_erasures WHERE source_id=$1',
