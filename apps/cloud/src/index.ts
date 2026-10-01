@@ -91,7 +91,9 @@ export interface Env {
 }
 
 const app = new Hono<{ Bindings: Env }>();
-const MAX_AUTH_BODY_BYTES = 512 * 1024;
+// Leave headroom below workerd's request transport limit so the Worker can emit
+// its own structured size error instead of a platform-generated empty 413.
+const MAX_AUTH_BODY_BYTES = 256 * 1024;
 
 function webAuthnConfig(env: Env): WebAuthnConfig | undefined {
   if (!env.AUTH_ORIGIN || !env.AUTH_RP_ID || !env.AUTH_RP_NAME) return undefined;
