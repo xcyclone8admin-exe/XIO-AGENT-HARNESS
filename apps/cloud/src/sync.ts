@@ -6,10 +6,12 @@ import {
   PushRequest as PushRequestSchema,
   SYNC_PROTOCOL_VERSION,
   SYNC_SCHEMA_VERSION,
+  assertPushResponseBoundToRequest,
   type ConflictRecord,
   type PullResponse,
   type PushRequest,
   type PushResponse,
+  type PushChangeOutcome,
   type RowChange,
   type SyncRejection,
   type SyncRejectionCode,
@@ -242,6 +244,7 @@ export class SyncAuthorityEngine {
 
     const rejected: SyncRejection[] = [];
     const conflicts: ConflictRecord[] = [];
+    const changeOutcomes: PushChangeOutcome[] = [];
     let accepted = 0;
     const reject = (index: number, change: RowChange, code: SyncRejectionCode, reason?: string): void => {
       rejected.push({ index, changeId: change.id, code, ...(reason ? { reason } : {}) });
@@ -251,6 +254,9 @@ export class SyncAuthorityEngine {
       const validated = validateChange(access, change, nowMs);
       if ('code' in validated) {
         reject(index, change, validated.code, validated.reason);
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: validated.code });
         continue;
       }
       const { rule } = validated;
@@ -258,23 +264,48 @@ export class SyncAuthorityEngine {
       const current = await store.getRow(rowKey);
 
       if (change.op === 'delete') {
-        if (current?.deletedHlc && compareHlc(change.hlc, current.deletedHlc) <= 0) continue;
+        if (current?.deletedHlc && compareHlc(change.hlc, current.deletedHlc) <= 0) {
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'unchanged', appliedFields: [], unchangedFields: [], conflictedFields: [] });
+          continue;
+        }
         // Parents referenced by live rows cannot be removed (the migration's ON DELETE RESTRICT).
         if (await store.hasLiveChildren(rowKey)) {
           reject(index, change, 'ORPHAN_REFERENCE', 'LIVE_CHILDREN');
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+            rejectionCode: 'ORPHAN_REFERENCE' });
           continue;
         }
         await store.putRow(rowKey, { fields: current?.fields ?? {}, deletedHlc: change.hlc });
         await store.setRefs(rowKey, []);
         await store.appendLog({ ...change, fields: {} });
         accepted += 1;
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'committed', appliedFields: [], unchangedFields: [], conflictedFields: [] });
         continue;
       }
       if (current?.deletedHlc) {
         reject(index, change, 'TOMBSTONED');
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [], rejectionCode: 'TOMBSTONED' });
         continue;
       }
-      if (rule.authority === 'append' && current) continue; // insert-only; redelivery is a no-op
+      if (rule.authority === 'append' && current) { // insert-only; only identical submitted values are a no-op
+        const unchangedFields = Object.keys(change.fields).filter((field) =>
+          canonical(current.fields[field]?.value) === canonical(change.fields[field]?.value)).sort();
+        const differs = unchangedFields.length !== Object.keys(change.fields).length;
+        if (differs) {
+          reject(index, change, 'IMMUTABLE_FIELD');
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+            rejectionCode: 'IMMUTABLE_FIELD' });
+        } else {
+          changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+            outcome: 'unchanged', appliedFields: [], unchangedFields, conflictedFields: [] });
+        }
+        continue;
+      }
 
       const insert = current === undefined;
       const incoming: Record<string, FieldWrite> = insert
@@ -284,21 +315,29 @@ export class SyncAuthorityEngine {
       const next: Record<string, FieldWrite> = { ...existing };
       const applied: Record<string, FieldWrite> = {};
       const rowConflicts: ConflictRecord[] = [];
+      const appliedFields: string[] = [];
+      const unchangedFields: string[] = [];
+      const conflictedFields: string[] = [];
       for (const [field, write] of Object.entries(incoming)) {
         const stored = existing[field];
         if (!stored) {
           next[field] = write;
           applied[field] = write;
+          if (Object.hasOwn(change.fields, field)) appliedFields.push(field);
+          continue;
+        }
+        if (canonical(write.value) === canonical(stored.value)) {
+          unchangedFields.push(field);
           continue;
         }
         const order = compareHlc(write.hlc, stored.hlc);
-        if (order === 0 && canonical(write.value) === canonical(stored.value)) continue; // redelivery
         // Sequential: the writer saw the stored value. Otherwise the writes were concurrent and the
         // loser is retained whichever arrived first (CLD-R-006).
         const sequential = write.baseHlc !== null && compareHlc(write.baseHlc, stored.hlc) === 0;
         if (order > 0) {
           next[field] = write;
           applied[field] = write;
+          if (Object.hasOwn(change.fields, field)) appliedFields.push(field);
           if (!sequential) {
             rowConflicts.push({
               table: change.table,
@@ -310,6 +349,7 @@ export class SyncAuthorityEngine {
             });
           }
         } else {
+          conflictedFields.push(field);
           rowConflicts.push({
             table: change.table,
             rowId: change.id,
@@ -325,15 +365,24 @@ export class SyncAuthorityEngine {
       const problem = checkRow(rule.columns, incoming, false) ?? checkRow(rule.columns, next, insert);
       if (problem) {
         reject(index, change, 'SCHEMA_VIOLATION', `${problem.kind}:${problem.field}`.slice(0, 64));
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: 'SCHEMA_VIOLATION' });
         continue;
       }
       const parents = parentKeys(rule, next);
       if (!(await Promise.all(parents.map((parent) => this.liveParent(parent)))).every(Boolean)) {
         reject(index, change, 'ORPHAN_REFERENCE');
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: 'ORPHAN_REFERENCE' });
         continue;
       }
       if (byteLength(JSON.stringify(next)) > MAX_ROW_BYTES) {
         reject(index, change, 'ROW_TOO_LARGE');
+        changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+          outcome: 'rejected', appliedFields: [], unchangedFields: [], conflictedFields: [],
+          rejectionCode: 'ROW_TOO_LARGE' });
         continue;
       }
       for (const conflict of rowConflicts) {
@@ -346,6 +395,12 @@ export class SyncAuthorityEngine {
         await store.appendLog({ ...change, fields: applied });
         accepted += 1;
       }
+      const sortedApplied = appliedFields.sort();
+      const sortedUnchanged = unchangedFields.sort();
+      const sortedConflicted = conflictedFields.sort();
+      changeOutcomes.push({ index, changeId: change.id, table: change.table, rowId: change.id,
+        outcome: sortedApplied.length ? 'committed' : sortedConflicted.length ? 'conflict' : 'unchanged',
+        appliedFields: sortedApplied, unchangedFields: sortedUnchanged, conflictedFields: sortedConflicted });
     }
 
     // Inline history is bounded; the full record is always paged from /v1/sync/conflicts.
@@ -362,8 +417,10 @@ export class SyncAuthorityEngine {
       serverSeq: (await store.serverSeq()).toString(10),
       rejected,
       conflictHistory: inline,
+      changeOutcomes,
       replayed: false,
     };
+    assertPushResponseBoundToRequest(request, response);
     await store.putIdempotency(replayKey, { hash: requestHash, response, atMs: nowMs });
     return response;
   }

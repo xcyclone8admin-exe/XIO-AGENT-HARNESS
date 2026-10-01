@@ -505,8 +505,13 @@ describe('sync on workerd', () => {
     const body = pushBody([task(uuid(1))], 'idem-roundtrip-0001');
     const first = await call('POST', '/v1/sync/push', token, body);
     expect(first.json).toMatchObject({ accepted: 1, replayed: false });
+    expect(first.json?.['changeOutcomes']).toEqual([{
+      index: 0, changeId: uuid(1), table: 'ops_tasks', rowId: uuid(1), outcome: 'committed',
+      appliedFields: ['project_id', 'title'], unchangedFields: [], conflictedFields: [],
+    }]);
     const replay = await call('POST', '/v1/sync/push', token, body);
     expect(replay.json).toMatchObject({ accepted: 1, replayed: true });
+    expect(replay.json?.['changeOutcomes']).toEqual(first.json?.['changeOutcomes']);
     const mismatch = await call(
       'POST',
       '/v1/sync/push',
@@ -518,6 +523,26 @@ describe('sync on workerd', () => {
     expect(pulled.json?.['changes'].map((c: any) => c.change.id)).toContain(uuid(1));
     const after = await call('GET', `/v1/sync/pull?cursor=${pulled.json?.['cursor']}`, token);
     expect(after.json?.['changes']).toEqual([]);
+  });
+
+  it('returns a complete field disposition for unchanged values and rejected rows', async () => {
+    await seed(U1);
+    const token = await mint(U1);
+    const id = uuid(22);
+    const initial = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'outcome-seed-0001'));
+    expect(initial.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed' });
+    const duplicate = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'outcome-repeat-0001'));
+    expect(duplicate.json).toMatchObject({ accepted: 0, changeOutcomes: [{
+      index: 0, changeId: id, table: 'ops_tasks', rowId: id, outcome: 'unchanged',
+      appliedFields: [], unchangedFields: ['project_id', 'title'], conflictedFields: [],
+    }] });
+    const rejected = await call('POST', '/v1/sync/push', token, pushBody([
+      task(uuid(23), { fields: { status: { value: 'forged', hlc: hlc(Date.now()), baseHlc: null } } }),
+    ], 'outcome-rejected-0001'));
+    expect(rejected.json?.['changeOutcomes']).toEqual([{
+      index: 0, changeId: uuid(23), table: 'ops_tasks', rowId: uuid(23), outcome: 'rejected',
+      appliedFields: [], unchangedFields: [], conflictedFields: [], rejectionCode: 'GUARDED_FIELD',
+    }]);
   });
   it('rejects cross-tenant rows and guarded fields per row', async () => {
     await seed(U1);
@@ -876,6 +901,19 @@ describe('development Worker configuration without R2', () => {
 });
 
 describe('cycle-1 review regressions on real workerd HTTP', () => {
+  it('keeps erasure initiation authenticated and fails closed without durable approval storage', async () => {
+    await seed(U1, { role: 'owner' });
+    const token = await mint(U1);
+    const request = {
+      protocolVersion: 'cloud-erasure-v1', erasureId: uuid(9101), attemptId: uuid(9102), approvalId: uuid(9103),
+      source: { kind: 'brain_source', id: uuid(9104) }, sourceVersion: `cloud-ingest-v2:sha256:${'a'.repeat(64)}`,
+    };
+    expect(await call('POST', '/v1/erasures', token, { ...request, tenantId: T2 }))
+      .toMatchObject({ status: 400, json: { code: 'INVALID_ERASURE_REQUEST' } });
+    expect(await call('POST', '/v1/erasures', token, request))
+      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+  });
+
   it('CLD-R-001 rejects a lease body that tries to replace verified claims', async () => {
     await setKill(false);
     await seed(U1);
@@ -1060,6 +1098,8 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       (await call('POST', '/v1/sync/push', token, pushBody([initial(a, 'old', older)]))).json?.['accepted'],
     ).toBe(1);
     const win = await call('POST', '/v1/sync/push', token, pushBody([update(a, 'new', newer, null)]));
+    expect(win.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed',
+      appliedFields: ['title'], unchangedFields: [], conflictedFields: [] });
     expect(win.json?.['conflictHistory']).toContainEqual(
       expect.objectContaining({ rowId: a, losingValue: 'old' }),
     );
@@ -1070,11 +1110,15 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       pushBody([update(a, 'next', hlc(base, 3), newer)]),
     );
     expect(sequential.json?.['conflicts']).toBe(0);
+    expect(sequential.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed',
+      appliedFields: ['title'], unchangedFields: [], conflictedFields: [] });
     const b = uuid(406);
     expect(
       (await call('POST', '/v1/sync/push', token, pushBody([initial(b, 'new', newer)]))).json?.['accepted'],
     ).toBe(1);
     const lose = await call('POST', '/v1/sync/push', token, pushBody([update(b, 'old', older, null)]));
+    expect(lose.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'conflict',
+      appliedFields: [], unchangedFields: [], conflictedFields: ['title'] });
     expect(lose.json?.['conflictHistory']).toContainEqual(
       expect.objectContaining({ rowId: b, losingValue: 'old' }),
     );
