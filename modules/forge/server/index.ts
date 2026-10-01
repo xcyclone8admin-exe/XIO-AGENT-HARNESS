@@ -42,10 +42,9 @@ const ForgeRegistration = {
       const request = forgeCapabilities.schedule.input.parse(input);
       const trusted = await requireRepository(repository).approvedPlanData(actor(call), request.approvalId);
       if (trusted.approval.epicId !== request.epicId || trusted.approval.workspaceId !== actor(call).workspaceId) throw new Error('FORGE_APPROVAL_SCOPE_MISMATCH');
-      const plannerRequest = { ...request, approval: trusted.approval, tickets: trusted.tickets, reservedTicketIds: trusted.reservedTicketIds, killSwitchEngaged: false };
+      const plannerRequest = { ...request, approval: trusted.approval, tickets: trusted.tickets, reservedTicketIds: trusted.reservedTicketIds, activeResourceLocks: trusted.activeResourceLocks, killSwitchEngaged: false };
       const result = planSchedule(plannerRequest);
-      await requireRepository(repository).persistSchedule(actor(call), plannerRequest, result);
-      return result;
+      return requireRepository(repository).persistSchedule(actor(call), plannerRequest, result);
     });
     bus.register(manifest, forgeCapabilities.gates, async (input, call) => {
       const request = forgeCapabilities.gates.input.parse(input);
@@ -92,12 +91,19 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.findings, (_input, call) => requireRepository(repository).findings(actor(call)));
     bus.register(manifest, forgeCapabilities.updateFinding, (input, call) => requireRepository(repository).transitionFindingRecord(actor(call), forgeCapabilities.updateFinding.input.parse(input)));
     bus.register(manifest, forgeCapabilities.gateMatrix, (input, call) => requireRepository(repository).gateMatrix(actor(call), forgeCapabilities.gateMatrix.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.riskAcceptances, (_input, call) => requireRepository(repository).riskAcceptances(actor(call)));
+    bus.register(manifest, forgeCapabilities.requestRiskAcceptance, (input, call) => requireRepository(repository).requestRiskAcceptance(actor(call), forgeCapabilities.requestRiskAcceptance.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.decideRiskAcceptance, (input, call) => requireRepository(repository).decideRiskAcceptance(actor(call), forgeCapabilities.decideRiskAcceptance.input.parse(input)));
     bus.register(manifest, forgeCapabilities.promotionList, (_input, call) => requireRepository(repository).promotions(actor(call)));
+    bus.register(manifest, forgeCapabilities.promotionApprovalList, (_input, call) => requireRepository(repository).promotionApprovalRequests(actor(call)));
+    bus.register(manifest, forgeCapabilities.requestPromotionApproval, (input, call) => requireRepository(repository).requestPromotionApproval(actor(call), forgeCapabilities.requestPromotionApproval.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.decidePromotionApproval, (input, call) => requireRepository(repository).decidePromotionApproval(actor(call), forgeCapabilities.decidePromotionApproval.input.parse(input)));
     bus.register(manifest, forgeCapabilities.specs, (input, call) => { const request = forgeCapabilities.specs.input.parse(input); return requireRepository(repository).specs(actor(call), request.projectId); });
     bus.register(manifest, forgeCapabilities.specLifecycle, (input, call) => requireRepository(repository).transitionSpec(actor(call), forgeCapabilities.specLifecycle.input.parse(input)));
     bus.register(manifest, forgeCapabilities.saveSpecs, (input, call) => { const request = forgeCapabilities.saveSpecs.input.parse(input); return requireRepository(repository).saveSpecs(actor(call), request.projectId, request.documents); });
     bus.register(manifest, forgeCapabilities.compileSpecs, (input, call) => { const request = forgeCapabilities.compileSpecs.input.parse(input); const corpus = compileSpecCorpus(request); return requireRepository(repository).saveSpecs(actor(call), request.projectId, corpus.documents); });
     bus.register(manifest, forgeCapabilities.startCouncil, (input, call) => requireRepository(repository).startCouncil(actor(call), forgeCapabilities.startCouncil.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.assignCouncilReviewer, (input, call) => requireRepository(repository).assignCouncilReviewer(actor(call), forgeCapabilities.assignCouncilReviewer.input.parse(input)));
     bus.register(manifest, forgeCapabilities.councils, (_input, call) => requireRepository(repository).councils(actor(call)));
     bus.register(manifest, forgeCapabilities.submitCouncilDecision, (input, call) => requireRepository(repository).submitCouncilDecision(actor(call), forgeCapabilities.submitCouncilDecision.input.parse(input)));
     bus.register(manifest, forgeCapabilities.escalations, (_input, call) => requireRepository(repository).escalations(actor(call)));

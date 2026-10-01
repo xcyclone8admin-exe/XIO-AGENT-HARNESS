@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- untyped JSON responses from the Worker under test */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
@@ -43,7 +44,7 @@ const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64u
 async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
   let pair = deviceKeyPairs.get(deviceId);
   if (!pair) {
-    pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     deviceKeyPairs.set(deviceId, pair);
   }
   return pair;
@@ -51,7 +52,7 @@ async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
 
 async function thumbprint(deviceId: string): Promise<string> {
   const jwk = await crypto.subtle.exportKey('jwk', (await deviceKey(deviceId)).publicKey);
-  const canonical = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: jwk.x });
+  const canonical = JSON.stringify({ crv: 'P-256', kty: 'EC', x: jwk.x, y: jwk.y });
   return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))));
 }
 
@@ -61,7 +62,7 @@ const hlc = (ms: number, counter = 0) =>
 async function mint(sub: string, over: Record<string, unknown> = {}, key = privateKey): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const deviceId = typeof over['device_id'] === 'string' ? over['device_id'] : DEVICE_A;
-  const head = b64(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' }));
+  const head = b64(JSON.stringify({ alg: 'ES256', typ: 'JWT' }));
   const body = b64(
     JSON.stringify({
       sub,
@@ -80,7 +81,7 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
     }),
   );
   const sig = new Uint8Array(
-    await crypto.subtle.sign('Ed25519', key, new TextEncoder().encode(`${head}.${body}`)),
+    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(`${head}.${body}`)),
   );
   return `${head}.${body}.${b64(sig)}`;
 }
@@ -101,7 +102,7 @@ async function dpop(token: string, method: string, route: string): Promise<strin
   url.search = '';
   url.hash = '';
   const header = b64(
-    JSON.stringify({ typ: 'dpop+jwt', alg: 'EdDSA', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x } }),
+    JSON.stringify({ typ: 'dpop+jwt', alg: 'ES256', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } }),
   );
   const ath = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
   const body = b64(
@@ -114,7 +115,7 @@ async function dpop(token: string, method: string, route: string): Promise<strin
     }),
   );
   const signature = new Uint8Array(
-    await crypto.subtle.sign('Ed25519', pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
+    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
   );
   return `${header}.${body}.${b64(signature)}`;
 }
@@ -247,6 +248,25 @@ async function rawPut(url: string, body: string): Promise<Response> {
   const base = await mf.ready;
   return fetch(new URL(new URL(url).pathname, base), { method: 'PUT', body });
 }
+/** Actual chunked HTTP ingress with no Content-Length, bypassing Miniflare's dispatchFetch bridge. */
+async function rawChunkedPut(url: string, body: string): Promise<Response> {
+  const base = new URL(await mf.ready);
+  const target = new URL(new URL(url).pathname, base);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(
+      target,
+      { method: 'PUT', headers: { 'transfer-encoding': 'chunked' } },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })));
+        response.on('error', reject);
+      },
+    );
+    request.on('error', reject);
+    request.end(body);
+  });
+}
 const uuid = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
 
 beforeAll(async () => {
@@ -255,7 +275,7 @@ beforeAll(async () => {
     shell: true,
     stdio: 'pipe',
   });
-  const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   privateKey = pair.privateKey;
   const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', pair.publicKey));
   mf = new Miniflare(
@@ -407,10 +427,9 @@ describe('auth on the real Worker', () => {
       const result = await call('POST', route, null, {});
       expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
     }
-    // workerd may reject this payload before Worker code runs; bounded-json.test.ts
-    // asserts the application error code independently of transport limits.
-    expect(await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(70_000) }).then((r) => r.status))
-      .toBe(413);
+    expect(
+      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(60_000) }),
+    ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
   });
   it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
     await seed(U1, { role: 'owner' });
@@ -427,7 +446,7 @@ describe('auth on the real Worker', () => {
   it('fails closed without or with bad credentials', async () => {
     expect((await call('GET', '/v1/sync/pull', null)).status).toBe(401);
     expect((await call('GET', '/v1/sync/pull', 'a.b.c')).status).toBe(401);
-    const other = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    const other = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
     const forged = await mint(U1, {}, other.privateKey);
     expect(await call('GET', '/v1/sync/pull', forged)).toMatchObject({
       status: 401,
@@ -773,18 +792,9 @@ describe('blob references on workerd', () => {
     expect(put.json).toMatchObject({ mode: 'PUT', referenceStatus: 'references_unknown' });
     expect(put.json?.['url']).toMatch(/^\/v1\/blobs\/access\/[A-Za-z0-9_.-]+$/);
     const url = `${URL_BASE}${put.json?.['url']}`;
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode('hi'));
-        controller.close();
-      },
-    });
-    const noLength = await mf.dispatchFetch(url, {
-      method: 'PUT',
-      body: stream,
-      duplex: 'half',
-    } as never);
+    const noLength = await rawChunkedPut(url, 'hi');
     expect(noLength.status).toBe(411);
+    expect(await noLength.json()).toMatchObject({ code: 'LENGTH_REQUIRED' });
     const oversize = 17;
     const tooBig = await rawPut(url, 'a'.repeat(oversize));
     expect(tooBig.status).toBe(413);
@@ -819,7 +829,9 @@ describe('development Worker configuration without R2', () => {
     expect(devConfig).toContain('No-R2 development deployment is supported');
 
     const original = mf;
-    const signingJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', privateKey));
+    const exportedSigningJwk = await crypto.subtle.exportKey('jwk', privateKey);
+    const signingJwk = JSON.stringify({ kty: exportedSigningJwk.kty, crv: exportedSigningJwk.crv,
+      x: exportedSigningJwk.x, y: exportedSigningJwk.y });
     const noR2 = new Miniflare(
       convertV4MiniflareOptions({
         modules: true,
@@ -1386,15 +1398,14 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     const key = 'review:lease-cleanup';
     const first = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(first.status).toBe(200);
-    const expiryDeadline = Date.now() + 8_000;
-    let expiredLeases = 0;
-    while (expiredLeases < 1 && Date.now() < expiryDeadline) {
-      const maintained = await hub('/internal/maintenance', {});
-      const body = (await maintained.json()) as Record<string, any>;
-      expiredLeases = typeof body['expiredLeases'] === 'number' ? body['expiredLeases'] : 0;
-      if (expiredLeases < 1) await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    expect(expiredLeases, 'lease did not expire within the 8 second poll deadline').toBeGreaterThanOrEqual(1);
+    const expiresAtMs = first.json?.['lease']?.expiresAtMs;
+    expect(Number.isSafeInteger(expiresAtMs), `invalid lease expiry: ${JSON.stringify(first)}`).toBe(true);
+    const beforeExpiry = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
+    expect(beforeExpiry).toMatchObject({ status: 409, json: { code: 'LEASE_UNAVAILABLE' } });
+    const untilExpiry = expiresAtMs - Date.now() + 1;
+    if (untilExpiry > 0) await new Promise((resolve) => setTimeout(resolve, untilExpiry));
+    expect(Date.now(), 'lease expiry timestamp has not elapsed').toBeGreaterThan(expiresAtMs);
+    await hub('/internal/maintenance', {});
     const next = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(next.status, `lease reacquire response: ${JSON.stringify(next)}`).toBe(200);
     expect(next.json?.['lease'], `lease missing from successful reacquire: ${JSON.stringify(next)}`).toBeTruthy();

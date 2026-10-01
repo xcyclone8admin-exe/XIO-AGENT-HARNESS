@@ -599,4 +599,67 @@ mod tests {
         assert!(!format!("{endpoint:?}").contains(&endpoint.token));
         assert!(!format!("{endpoint:?}").contains(&endpoint.native_sync_token));
     }
+
+    #[test]
+    fn rust_launcher_bootstraps_staged_sidecar_over_stdin_and_reaches_health() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let staged = manifest_dir.join("resources/sidecar/main.mjs");
+        assert!(
+            staged.is_file(),
+            "run node ../scripts/prepare-package.mjs before this packaged-sidecar smoke test"
+        );
+        let port = free_port().unwrap();
+        let launch_token = random_token();
+        let native_sync_token = random_token();
+        let endpoint = Endpoint {
+            port,
+            token: launch_token.clone(),
+            native_sync_token: native_sync_token.clone(),
+        };
+        let log_dir = std::env::temp_dir().join(format!("xyra-bootstrap-{}", random_token()));
+        let log = Log::open(&log_dir, "smoke.log");
+        let sup = Supervisor::new(
+            Launch {
+                program: PathBuf::from("node"),
+                args: vec![staged.into_os_string()],
+                env: vec![
+                    ("XYRA_SIDECAR_PORT", port.to_string()),
+                    ("XYRA_DATA_DIR", "memory://".into()),
+                    ("XYRA_OS_SUBJECT", "smoke:rust-launcher".into()),
+                    ("XYRA_DISPLAY_NAME", "Rust launcher smoke".into()),
+                    ("XYRA_ALLOWED_ORIGINS", "http://tauri.localhost".into()),
+                ],
+                launch_token: launch_token.clone(),
+                native_sync_token: native_sync_token.clone(),
+                cwd: Some(manifest_dir),
+            },
+            endpoint,
+            fast_policy(),
+            log.clone(),
+            Box::new(move |value| value == launch_token || value == native_sync_token),
+        );
+        sup.start();
+        let ready = match sup.wait_ready(Duration::from_secs(30)) {
+            Ok(ready) => ready,
+            Err(status) => {
+                let contents = log
+                    .path()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .unwrap_or_default();
+                sup.shutdown();
+                panic!("sidecar bootstrap failed: {status:?}; launcher log: {contents}");
+            }
+        };
+        assert_eq!(ready.port, port);
+        let response = reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/v1/session"))
+            .header("authorization", format!("Bearer {}", ready.token))
+            .header("origin", "http://tauri.localhost")
+            .send()
+            .expect("staged sidecar health request");
+        let body: serde_json::Value = response.json().expect("session response JSON");
+        assert_eq!(body["workspaces"].as_array().map(Vec::len), Some(2));
+        sup.shutdown();
+        let _ = std::fs::remove_dir_all(log_dir);
+    }
 }

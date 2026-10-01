@@ -16,6 +16,38 @@
 
 Worker binding names are `NEON_DATABASE_URL`, `HUB_INTERNAL_TOKEN`, `AUTH_JWT_JWK`, `AUTH_SIGNING_JWK`, `BLOB_ACCESS_SECRET`, and `WEBHOOK_SECRET`; the issuer/audience and local RP values are non-secret Wrangler vars. Current broker inventory confirms the restricted runtime DB URL grant only. Hub token and auth keys are not confirmed provisioned; webhook HMAC is required when webhook processing is enabled; blob secret and R2 bucket are unavailable while R2 is disabled. The migration owner URL `NEON_MIGRATION_DATABASE_URL` must remain in the isolated `migration` environment and is never a Worker binding. Do not hardcode `CLOUDFLARE_ACCOUNT_ID`; deployment tooling injects it separately.
 
+## Auth signing and device proof algorithms
+
+Cloud accepts ES256/P-256 as the preferred path and retains EdDSA/Ed25519 compatibility. Passkey
+begin accepts a strict public device JWK with exactly `{kty:"EC",crv:"P-256",x,y}` or the legacy
+`{kty:"OKP",crv:"Ed25519",x}`; private `d` and extra caller fields are rejected. Coordinates
+must import as a valid WebCrypto P-256 public key. The Cloud-computed RFC 7638 thumbprint hashes
+UTF-8 canonical JSON with EC members in this exact order:
+`{"crv":"P-256","kty":"EC","x":"…","y":"…"}`. It is base64url without padding.
+The device identifier remains an independent stable UUID; JWT `device_id` is not the thumbprint.
+
+ES256 JWT and DPoP JWS use the WebCrypto JOSE/P1363 64-byte `r||s` signature. JWT/DPoP JOSE
+headers use `alg:"ES256"`; Ed25519 signatures retain `alg:"EdDSA"`. A DPoP proof requires
+`htu` (request URL without query/fragment), uppercase `htm`, integer `iat` within 60 seconds,
+unique caller-generated `jti` (16–128 base64url-safe characters; replay is rejected), and `ath` (base64url SHA-256 of the
+bound access token, refresh token, or authorization code). The public JWK in the proof must
+recompute to the stored device thumbprint and must match the header algorithm. No algorithm
+downgrade is attempted.
+
+`AUTH_SIGNING_JWK` is the private signing JWK and `AUTH_JWT_JWK` is public-only; never bind the
+private JWK as the verifier key. For both, `alg` if present must match the key algorithm and `use`
+if present must be `sig`. `kid` is optional, but if present on either configured key it must match
+the JWT header and its counterpart. Cloud verifies every newly issued access token against the
+configured public key, so a keypair mismatch fails closed as `AUTH_SIGNING_KEY_MISMATCH`; metadata
+matching alone is not treated as proof that the pair matches. Current configuration supports one
+active signing/verifying JWK pair per Worker environment, not JWKS rotation. The JWT `sid` is an
+optional UUID for legacy tokens; `/v1/auth/logout` requires it and returns `SESSION_NOT_FOUND`
+when absent, and still requires the normal DPoP proof when present.
+
+These are source-level/local workerd cryptographic checks. CNG/TPM key creation, non-exportability,
+provider configuration and production key provisioning must be independently verified by
+Desktop and deployment owners; Cloud support does not certify that a caller used hardware keys.
+
 ## Verification and remaining gates
 
 PGlite migration/role/RLS tests and real workerd/Miniflare HTTP tests run locally; they do not certify live provider behavior. The dedicated Neon dev project `fragrant-resonance-90329467` is in `aws-us-west-2` (PG18, database `neondb`). `xyra_cloud_runtime_app` login and restricted role flags have been verified through the broker, but the database is currently empty and has no applied migration ledger. A read-only migration-state probe must record baseline status/checksums before any migration. `apps/cloud/scripts/apply-cloud-baseline.mjs` applies/verifies only platform/0001–0004 and core/0001 with exact source checksums; `apps/cloud/scripts/apply-cloud-sync-migration.mjs` is a separate reviewed step and refuses unless that full baseline matches.

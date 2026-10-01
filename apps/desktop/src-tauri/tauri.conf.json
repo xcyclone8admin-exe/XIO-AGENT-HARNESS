@@ -4,6 +4,10 @@
   "identifier": "systems.xyra.agentos",
   "mainBinaryName": "xyra-desktop",
   "build": {
+    "beforeBuildCommand": {
+      "script": "node scripts/prepare-package.mjs",
+      "cwd": ".."
+    },
     "frontendDist": "../../web/out"
   },
   "app": {

@@ -1,0 +1,114 @@
+import { defineModule } from '@xyra/contracts';
+
+export default defineModule({
+  id: 'flow',
+  version: '1.0.0',
+  pillar: 'FLOW',
+  title: 'Flow',
+  description: 'Durable, user-operable workflows: bounded step execution, checkpoint/resume, retries and dead-letter handling',
+  icon: 'workflow',
+  order: 50,
+  requirements: ['XIO-REQ-FLW-001', 'REQ-AIS-002', 'REQ-AIS-005', 'REQ-DATA-001'],
+  permissions: [
+    'flow:workflow:read',
+    'flow:workflow:write',
+    'flow:run:trigger',
+    'flow:run:read',
+    'flow:run:cancel',
+    'flow:run:retry',
+    'flow:run:approve',
+  ],
+  roleGrants: {
+    owner: ['flow:workflow:read', 'flow:workflow:write', 'flow:run:trigger', 'flow:run:read', 'flow:run:cancel', 'flow:run:retry', 'flow:run:approve'],
+    admin: ['flow:workflow:read', 'flow:workflow:write', 'flow:run:trigger', 'flow:run:read', 'flow:run:cancel', 'flow:run:retry', 'flow:run:approve'],
+    manager: ['flow:workflow:read', 'flow:workflow:write', 'flow:run:trigger', 'flow:run:read', 'flow:run:cancel', 'flow:run:retry', 'flow:run:approve'],
+    member: ['flow:workflow:read', 'flow:run:trigger', 'flow:run:read'],
+    viewer: ['flow:workflow:read', 'flow:run:read'],
+    auditor: ['flow:workflow:read', 'flow:run:read'],
+  },
+  dependsOn: ['core'],
+  nav: [
+    { path: '', title: 'Workflows', keywords: ['flow', 'workflows', 'automation'] },
+    { path: 'runs', title: 'Runs', keywords: ['runs', 'executions', 'dead letter', 'dlq'] },
+  ],
+  events: {
+    emits: ['flow.run.started', 'flow.run.succeeded', 'flow.run.failed', 'flow.run.dead-lettered'],
+    consumes: [],
+  },
+  tables: [
+    { name: 'flow_workflows', class: 'local', authority: 'local' },
+    // Durable per-run identity: one immutable row per logical run_id, inserted once by
+    // triggerRun before any flow_runs event. This is what flow_runs/flow_checkpoints/
+    // flow_approvals really have a foreign key into — flow_runs.run_id by itself repeats across
+    // every lifecycle event row for a run and cannot back a real reference (migration 0003).
+    { name: 'flow_run_registry', class: 'local', authority: 'local' },
+    // Mutable (claim/release/reclaim) concurrency fence for a scheduled dispatcher; server-only —
+    // no capability exposes it, so it is reachable only through FlowRepository.claimStep /
+    // advanceClaimedRun by a trusted host caller (migration 0004).
+    { name: 'flow_step_claims', class: 'local', authority: 'local' },
+    {
+      name: 'flow_runs',
+      class: 'append',
+      authority: 'append',
+      actorField: 'created_by',
+      receivedAtField: 'created_at',
+      writePermission: 'flow:run:trigger',
+      readPermission: 'flow:run:read',
+      allowedFields: ['run_id', 'workflow_id', 'trigger', 'state', 'step_index', 'attempt', 'detail', 'ended_at'],
+      columns: {
+        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_run_registry' } },
+        workflow_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_workflows' } },
+        trigger: { type: 'text', requiredOnInsert: true },
+        state: { type: 'text', requiredOnInsert: true },
+        // DB defaults to 0 (migration 0001); not required on insert, matching the schema.
+        step_index: { type: 'integer', min: '0' },
+        attempt: { type: 'integer', min: '0' },
+        detail: { type: 'jsonb' },
+        ended_at: { type: 'timestamptz', nullable: true },
+        created_by: { type: 'uuid', requiredOnInsert: true },
+        created_at: { type: 'timestamptz' },
+      },
+    },
+    {
+      name: 'flow_checkpoints',
+      class: 'append',
+      authority: 'append',
+      actorField: 'created_by',
+      receivedAtField: 'created_at',
+      writePermission: 'flow:run:trigger',
+      readPermission: 'flow:run:read',
+      allowedFields: ['run_id', 'step_index', 'step_id', 'status', 'attempt', 'output', 'error'],
+      columns: {
+        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_run_registry' } },
+        step_index: { type: 'integer', requiredOnInsert: true, min: '0' },
+        step_id: { type: 'text', requiredOnInsert: true },
+        status: { type: 'text', requiredOnInsert: true },
+        attempt: { type: 'integer', requiredOnInsert: true, min: '0' },
+        output: { type: 'jsonb' },
+        error: { type: 'text', nullable: true },
+        created_by: { type: 'uuid', requiredOnInsert: true },
+        created_at: { type: 'timestamptz' },
+      },
+    },
+    {
+      name: 'flow_approvals',
+      class: 'append',
+      authority: 'append',
+      actorField: 'decided_by',
+      receivedAtField: 'created_at',
+      writePermission: 'flow:run:approve',
+      readPermission: 'flow:run:read',
+      allowedFields: ['run_id', 'step_index', 'attempt', 'decision', 'reason'],
+      columns: {
+        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_run_registry' } },
+        step_index: { type: 'integer', requiredOnInsert: true, min: '0' },
+        attempt: { type: 'integer', requiredOnInsert: true, min: '0' },
+        decision: { type: 'text', requiredOnInsert: true },
+        reason: { type: 'text' },
+        decided_by: { type: 'uuid', requiredOnInsert: true },
+        created_at: { type: 'timestamptz' },
+      },
+    },
+  ],
+  dataClassification: 'confidential',
+});

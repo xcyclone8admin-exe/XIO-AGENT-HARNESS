@@ -3,6 +3,8 @@ import { HybridClock, uuidv7 } from '@xyra/core';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
 import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/ledger/contracts';
+import type { KillSwitchReader } from '@xyra/mod-swarm/server';
+import type { StepContext } from '@xyra/mod-flow/server';
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
 import { allocateFifoTaxLots } from './tax-lots';
@@ -10,13 +12,12 @@ import { backtestStrategyIdentity, runMomentumStopTargetBacktest, type OhlcBar, 
 import { calculateTimeWeightedStatement, type PerformanceMark, type PerformanceStatement } from './performance';
 import { investCapabilities } from './capabilities';
 import manifest from '../manifest';
+import { validateScheduledCustodyContext, type PersistedCustodyStatementInbox, type PersistedCustodyStatement } from './scheduled-reconciliation';
 
 type Call = { readonly principal: Principal; readonly workspaceId: string };
 type Registrar = { register(manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: Call) => Promise<unknown>): void };
 type QueryTx = Pick<ScopedTransaction, 'query'>;
-type KillSwitchSnapshot = { readonly engaged: boolean; readonly reason: string | null; readonly changedBy: string | null; readonly changedAt: string | null };
-/** Structural mirror of @xyra/mod-swarm/server's KillSwitchReader contract. */
-export interface KillSwitchReader { getKillSwitch(scope: Scope): Promise<KillSwitchSnapshot> }
+type KillSwitchSnapshot = Awaited<ReturnType<KillSwitchReader['getKillSwitch']>>;
 type OrderRow = {
   id: string; portfolio_id: string; instrument_id: string; symbol: string; side: 'buy'|'sell'; order_type: 'market'|'limit';
   quantity_units: string; limit_price_units: string|null; status: 'proposed'|'approved'|'submitted'|'partially_filled'|'filled'|'cancelled'|'expired';
@@ -35,6 +36,7 @@ export class InvestService {
     private readonly ledger: LedgerApi,
     private readonly paperLedger: PaperTradeLedgerApi,
     private readonly killSwitchReader: KillSwitchReader | null = null,
+    private readonly custodyInbox: PersistedCustodyStatementInbox | null = null,
   ) {}
 
   private async assertGlobalTradingEnabled(scope: InvestScope): Promise<void> {
@@ -196,15 +198,26 @@ export class InvestService {
   }
   async reconcileStatement(scope: InvestScope, call: Call, input: {portfolioId:string;sourceName:string;sourceRef:string;statementDate:string;statementHash:string;cashUnits:string;positions:Array<{symbol:string;units:string}>}): Promise<{runId:string;status:'matched'|'needs_review';discrepancyCount:number;idempotent:boolean}> {
     const actorId = this.requireHumanOwner(scope, call);
+    return this.reconcilePersistedStatement(scope, actorId, input);
+  }
+
+  private async reconcilePersistedStatement(scope: InvestScope, actorId: string, input: {portfolioId:string;sourceName:string;sourceRef:string;statementDate:string;statementHash:string;cashUnits:string;positions:readonly {symbol:string;units:string}[]}, transaction?: QueryTx): Promise<{runId:string;status:'matched'|'needs_review';discrepancyCount:number;idempotent:boolean}> {
     const normalizedPositions = input.positions.map((position) => ({ symbol: position.symbol.trim().toUpperCase(), units: position.units })).sort((a,b)=>a.symbol.localeCompare(b.symbol));
     const canonical = JSON.stringify({ portfolioId:input.portfolioId,source:input.sourceName,ref:input.sourceRef,statementDate:input.statementDate,cashUnits:input.cashUnits,positions:normalizedPositions });
     const computedHash = createHash('sha256').update(canonical).digest('hex');
     if (computedHash !== input.statementHash) throw new Error('Statement content hash does not match the submitted snapshot');
-    const prior = await this.scoped.query<{id:string;status:'matched'|'needs_review';discrepancy_count:number}>(scope,
+    const priorQuery = transaction
+      ? transaction.query<{id:string;status:'matched'|'needs_review';discrepancy_count:number}>(
+        `SELECT r.id,r.status,count(d.id)::int AS discrepancy_count FROM invest_reconciliation_runs r
+         LEFT JOIN invest_reconciliation_discrepancies d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.run_id=r.id
+         WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.portfolio_id=$3 AND r.statement_hash=$4 GROUP BY r.id`,
+        [scope.tenantId, scope.workspaceId, input.portfolioId, input.statementHash])
+      : this.scoped.query<{id:string;status:'matched'|'needs_review';discrepancy_count:number}>(scope,
       `SELECT r.id,r.status,count(d.id)::int AS discrepancy_count FROM invest_reconciliation_runs r
        LEFT JOIN invest_reconciliation_discrepancies d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.run_id=r.id
        WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.portfolio_id=$3 AND r.statement_hash=$4 GROUP BY r.id`,
       [scope.tenantId, scope.workspaceId, input.portfolioId, input.statementHash]);
+    const prior = await priorQuery;
     if (prior.rows[0]) return { runId: prior.rows[0].id, status: prior.rows[0].status, discrepancyCount: prior.rows[0].discrepancy_count, idempotent: true };
     const portfolio = await this.scoped.query<{base_asset:string}>(scope, `SELECT base_asset FROM invest_portfolios WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status='active'`,
       [scope.tenantId, scope.workspaceId, input.portfolioId]);
@@ -223,7 +236,7 @@ export class InvestService {
     const runId = uuidv7(); const status = mismatches.length ? 'needs_review' : 'matched';
     const ledgerSnapshot = { cashAsset: baseAsset, cashUnits: ledger.cashUnits, positions: ledger.positions.map(({symbol,quantityUnits}) => ({symbol,units:quantityUnits})) };
     const statementSnapshot = { sourceName: input.sourceName, sourceRef: input.sourceRef, statementDate: input.statementDate, cashUnits: input.cashUnits, positions: normalizedPositions };
-    await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
+    const persist = async (tx: QueryTx): Promise<void> => {
       await tx.query(`INSERT INTO invest_reconciliation_runs(id,tenant_id,workspace_id,portfolio_id,source_name,source_ref,statement_date,statement_hash,status,ledger_snapshot,statement_snapshot,created_by)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12)`, [runId,scope.tenantId,scope.workspaceId,input.portfolioId,input.sourceName,input.sourceRef,input.statementDate,input.statementHash,status,JSON.stringify(ledgerSnapshot),JSON.stringify(statementSnapshot),actorId]);
       await tx.query(`INSERT INTO invest_reconciliation_events(id,tenant_id,workspace_id,run_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'run_recorded',$5::jsonb,$6)`,
@@ -235,8 +248,105 @@ export class InvestService {
         await tx.query(`INSERT INTO invest_reconciliation_events(id,tenant_id,workspace_id,run_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'discrepancy_detected',$5::jsonb,$6)`,
           [uuidv7(),scope.tenantId,scope.workspaceId,runId,JSON.stringify({discrepancyId:id,key:discrepancy.key,kind:discrepancy.kind,differenceUnits:difference.toString()}),actorId]);
       }
-    });
+    };
+    if (transaction) await persist(transaction);
+    else await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, persist);
     return { runId, status, discrepancyCount:mismatches.length, idempotent:false };
+  }
+
+  /**
+   * Callable only from the trusted FLOW host handler. FLOW derives scheduledFor
+   * from persisted run detail; no schedule data is accepted from workflow input.
+   */
+  async dispatchScheduledCustody(context: StepContext): Promise<{
+    status:'completed'; idempotent:boolean; utcDay:string;
+    inputs:Array<{statementId:string;runId:string;reconciliation:'matched'|'needs_review';discrepancyCount:number}>;
+  }> {
+    const dispatch = validateScheduledCustodyContext(context);
+    const scope: InvestScope = { ...dispatch.scope, hlc:this.clock.now() };
+    type DispatchOutput = {utcDay:string;inputs:Array<{statementId:string;runId:string;reconciliation:'matched'|'needs_review';discrepancyCount:number}>};
+    const completed = await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,(tx)=>tx.query<{result:DispatchOutput}>(
+      `SELECT result FROM invest_custody_dispatches WHERE tenant_id=$1 AND workspace_id=$2 AND idempotency_key=$3 AND status='completed'`,
+      [scope.tenantId,scope.workspaceId,dispatch.idempotencyKey]));
+    if (completed.rows[0]) {
+      const output = completed.rows[0].result;
+      if (this.custodyInbox) {
+        try { await this.custodyInbox.acknowledgeProcessed(dispatch.scope,output.inputs.map((input)=>input.statementId),dispatch.dispatchId); }
+        catch { throw new Error('INVEST_CUSTODY_ACK_PENDING'); }
+      }
+      return {status:'completed',...output,idempotent:true};
+    }
+    if (!this.custodyInbox) {
+      await this.recordCustodyDispatchFailure(scope,dispatch,'connector_unavailable','INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
+      throw new Error('INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
+    }
+    let statements: readonly PersistedCustodyStatement[];
+    try { statements = await this.custodyInbox.listEligible(dispatch.scope,dispatch.scheduledFor); }
+    catch {
+      await this.recordCustodyDispatchFailure(scope,dispatch,'connector_unavailable','INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
+      throw new Error('INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
+    }
+    if (statements.length > 500 || new Set(statements.map((statement)=>statement.id)).size !== statements.length) throw new Error('INVEST_CUSTODY_INPUT_SET_INVALID');
+    for (const statement of statements) {
+      if (![statement.id,statement.ownerId,statement.portfolioId].every((value)=>/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))) {
+        throw new Error('INVEST_CUSTODY_INPUT_ID_INVALID');
+      }
+    }
+    const claimed = await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,async(tx)=>{
+      const prior=await tx.query<{status:string;result:DispatchOutput|null;lease_until:string|null}>(`SELECT status,result,lease_until::text FROM invest_custody_dispatches
+        WHERE tenant_id=$1 AND workspace_id=$2 AND idempotency_key=$3 FOR UPDATE`,[scope.tenantId,scope.workspaceId,dispatch.idempotencyKey]);
+      if(prior.rows[0]?.status==='completed' && prior.rows[0].result) return {state:'completed' as const,result:prior.rows[0].result};
+      if(prior.rows[0]?.status==='running' && prior.rows[0].lease_until && Date.parse(prior.rows[0].lease_until)>Date.now()) return {state:'running' as const};
+      const acquired=await tx.query<{id:string}>(`INSERT INTO invest_custody_dispatches(id,tenant_id,workspace_id,workflow_id,run_id,step_id,dispatch_id,idempotency_key,scheduled_for,status,result,error_code,attempts,lease_until)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'running',NULL,NULL,1,now()+interval '15 minutes')
+        ON CONFLICT(tenant_id,workspace_id,idempotency_key) DO UPDATE SET workflow_id=EXCLUDED.workflow_id,run_id=EXCLUDED.run_id,
+          step_id=EXCLUDED.step_id,dispatch_id=EXCLUDED.dispatch_id,scheduled_for=EXCLUDED.scheduled_for,status='running',result=NULL,error_code=NULL,
+          completed_at=NULL,lease_until=EXCLUDED.lease_until,attempts=invest_custody_dispatches.attempts+1,updated_at=now()
+        WHERE invest_custody_dispatches.status<>'completed' AND (invest_custody_dispatches.status<>'running' OR invest_custody_dispatches.lease_until<=now())
+        RETURNING id`,
+        [uuidv7(),scope.tenantId,scope.workspaceId,dispatch.workflowId,dispatch.runId,dispatch.stepId,dispatch.dispatchId,dispatch.idempotencyKey,dispatch.scheduledFor]);
+      if(!acquired.rows[0]) return {state:'running' as const};
+      return {state:'claimed' as const};
+    });
+    if(claimed.state==='completed'){
+      try { await this.custodyInbox.acknowledgeProcessed(dispatch.scope,claimed.result.inputs.map((input)=>input.statementId),dispatch.dispatchId); }
+      catch { throw new Error('INVEST_CUSTODY_ACK_PENDING'); }
+      return {status:'completed',...claimed.result,idempotent:true};
+    }
+    if(claimed.state==='running') throw new Error('INVEST_CUSTODY_DISPATCH_IN_PROGRESS');
+    let result: DispatchOutput;
+    try {
+      const inputs:DispatchOutput['inputs']=[];
+      for(const statement of statements){
+        const reconciliation=await this.reconcilePersistedStatement(scope,statement.ownerId,statement);
+        inputs.push({statementId:statement.id,runId:reconciliation.runId,reconciliation:reconciliation.status,discrepancyCount:reconciliation.discrepancyCount});
+      }
+      result={utcDay:dispatch.utcDay,inputs};
+      await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,(tx)=>tx.query(`UPDATE invest_custody_dispatches
+        SET status='completed',result=$4::jsonb,error_code=NULL,completed_at=now(),lease_until=NULL,updated_at=now()
+        WHERE tenant_id=$1 AND workspace_id=$2 AND idempotency_key=$3 AND status='running' AND dispatch_id=$5`,
+        [scope.tenantId,scope.workspaceId,dispatch.idempotencyKey,JSON.stringify(result),dispatch.dispatchId]));
+    } catch(error) {
+      const code=error instanceof Error && error.message==='INVEST_CUSTODY_CONNECTOR_UNAVAILABLE' ? 'INVEST_CUSTODY_CONNECTOR_UNAVAILABLE' : 'INVEST_CUSTODY_RECONCILIATION_FAILED';
+      await this.recordCustodyDispatchFailure(scope,dispatch,code==='INVEST_CUSTODY_CONNECTOR_UNAVAILABLE'?'connector_unavailable':'failed',code);
+      throw error;
+    }
+    try { await this.custodyInbox.acknowledgeProcessed(dispatch.scope,result.inputs.map((input)=>input.statementId),dispatch.dispatchId); }
+    catch { throw new Error('INVEST_CUSTODY_ACK_PENDING'); }
+    return {status:'completed',...result,idempotent:false};
+  }
+
+  private async recordCustodyDispatchFailure(scope:InvestScope,dispatch:ReturnType<typeof validateScheduledCustodyContext>,status:'connector_unavailable'|'failed',code:string):Promise<void>{
+    await this.scoped.withServerScope(scope,'invest_paper',scope.hlc,async(tx)=>{
+      await tx.query(`INSERT INTO invest_custody_dispatches(id,tenant_id,workspace_id,workflow_id,run_id,step_id,dispatch_id,idempotency_key,scheduled_for,status,result,error_code,attempts)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,$11,1,NULL)
+        ON CONFLICT(tenant_id,workspace_id,idempotency_key) DO UPDATE SET workflow_id=EXCLUDED.workflow_id,run_id=EXCLUDED.run_id,
+          step_id=EXCLUDED.step_id,dispatch_id=EXCLUDED.dispatch_id,scheduled_for=EXCLUDED.scheduled_for,
+          status=EXCLUDED.status,error_code=EXCLUDED.error_code,lease_until=NULL,
+          attempts=invest_custody_dispatches.attempts+1,updated_at=now()
+        WHERE invest_custody_dispatches.status<>'completed' AND (invest_custody_dispatches.status<>'running' OR invest_custody_dispatches.lease_until<=now())`,
+        [uuidv7(),scope.tenantId,scope.workspaceId,dispatch.workflowId,dispatch.runId,dispatch.stepId,dispatch.dispatchId,dispatch.idempotencyKey,dispatch.scheduledFor,status,code]);
+    });
   }
 
   async reconciliationQueue(scope: InvestScope): Promise<Array<{id:string;run_id:string;portfolio_id:string;source_name:string;source_ref:string;statement_date:string;discrepancy_key:string;kind:'cash_mismatch'|'position_mismatch'|'unknown_position';expected_units:string;observed_units:string;difference_units:string;owner_id:string;created_at:string}>> {

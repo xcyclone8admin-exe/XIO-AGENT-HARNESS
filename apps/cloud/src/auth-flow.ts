@@ -8,12 +8,11 @@ import {
   type RegistrationResponseJSON,
   type WebAuthnCredential,
 } from '@simplewebauthn/server';
-import { issueAccessToken, verifyAccessToken } from './auth';
+import { isUuid, issueAccessToken, verifyAccessToken } from './auth';
 import { verifyDpopProofForToken } from './dpop';
 import { readCurrentAuthority, withNeonTransaction } from './neon';
 import type { CandidateClaims } from './model';
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{12}$/i;
 const URL_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const encoder = new TextEncoder();
 
@@ -70,21 +69,33 @@ export async function publicDeviceKey(
 ): Promise<{ jwk: JsonWebKey; thumbprint: string } | null> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const input = value as Record<string, unknown>;
-  if (
-    input['kty'] !== 'OKP' ||
-    input['crv'] !== 'Ed25519' ||
-    typeof input['x'] !== 'string' ||
-    !/^[A-Za-z0-9_-]{43}$/.test(input['x']) ||
-    Object.keys(input).some((key) => !['kty', 'crv', 'x'].includes(key))
-  )
+  const keys = Object.keys(input);
+  let canonicalJwk: string;
+  let jwk: JsonWebKey;
+  if (input['kty'] === 'OKP' && input['crv'] === 'Ed25519' && typeof input['x'] === 'string' &&
+      /^[A-Za-z0-9_-]{43}$/.test(input['x']) && keys.every((key) => ['kty', 'crv', 'x'].includes(key)) &&
+      keys.length === 3) {
+    jwk = { kty: 'OKP', crv: 'Ed25519', x: input['x'] };
+    canonicalJwk = JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: input['x'] });
+  } else if (input['kty'] === 'EC' && input['crv'] === 'P-256' && typeof input['x'] === 'string' &&
+      typeof input['y'] === 'string' && /^[A-Za-z0-9_-]{43}$/.test(input['x']) &&
+      /^[A-Za-z0-9_-]{43}$/.test(input['y']) && keys.every((key) => ['kty', 'crv', 'x', 'y'].includes(key)) &&
+      keys.length === 4) {
+    jwk = { kty: 'EC', crv: 'P-256', x: input['x'], y: input['y'] };
+    // RFC 7638 required-member order for EC public keys.
+    canonicalJwk = JSON.stringify({ crv: 'P-256', kty: 'EC', x: input['x'], y: input['y'] });
+  } else return null;
+  try {
+    await crypto.subtle.importKey(
+      'jwk', jwk, jwk.kty === 'OKP' ? { name: 'Ed25519' } : { name: 'ECDSA', namedCurve: 'P-256' },
+      false, ['verify'],
+    );
+  } catch {
     return null;
-  const digestValue = await crypto.subtle.digest(
-    'SHA-256',
-    encoder.encode(JSON.stringify({ crv: 'Ed25519', kty: 'OKP', x: input['x'] })),
-  );
+  }
+  const digestValue = await crypto.subtle.digest('SHA-256', encoder.encode(canonicalJwk));
   return {
-    jwk: { kty: 'OKP', crv: 'Ed25519', x: input['x'] },
-    // RFC 7638 canonical ordering for an OKP public key.
+    jwk,
     thumbprint: b64url(new Uint8Array(digestValue)),
   };
 }
@@ -135,9 +146,9 @@ export async function beginPasskeyAuthentication(
     !URL_TOKEN.test(body['pkceChallenge']) ||
     !validRedirect(body['redirectUri']) ||
     typeof body['deviceId'] !== 'string' ||
-    !UUID.test(body['deviceId']) ||
+    !isUuid(body['deviceId']) ||
     typeof body['workspaceId'] !== 'string' ||
-    !UUID.test(body['workspaceId'])
+    !isUuid(body['workspaceId'])
   )
     throw new AuthFlowError('INVALID_AUTH_REQUEST');
   const device = await publicDeviceKey(body['deviceJwk']);
@@ -243,7 +254,7 @@ export async function finishPasskeyRegistration(
   response: unknown,
 ): Promise<{ registered: true }> {
   if (!validWebAuthnConfig(config)) throw new AuthFlowError('AUTH_NOT_CONFIGURED', 503);
-  if (claims.kind !== 'user' || !UUID.test(transactionId) || !URL_TOKEN.test(state))
+  if (claims.kind !== 'user' || !isUuid(transactionId) || !URL_TOKEN.test(state))
     throw new AuthFlowError('INVALID_AUTH_REQUEST');
   if (!response || typeof response !== 'object' || Array.isArray(response))
     throw new AuthFlowError('INVALID_CREDENTIAL');
@@ -317,7 +328,7 @@ export async function finishPasskeyAuthentication(
   response: unknown,
 ): Promise<string> {
   if (!validWebAuthnConfig(config)) throw new AuthFlowError('AUTH_NOT_CONFIGURED', 503);
-  if (!UUID.test(transactionId) || !URL_TOKEN.test(state)) throw new AuthFlowError('INVALID_AUTH_REQUEST');
+  if (!isUuid(transactionId) || !URL_TOKEN.test(state)) throw new AuthFlowError('INVALID_AUTH_REQUEST');
   if (!response || typeof response !== 'object' || Array.isArray(response))
     throw new AuthFlowError('INVALID_CREDENTIAL');
   const credentialResponse = response as AuthenticationResponseJSON;
@@ -443,7 +454,7 @@ export async function exchangeAuthorizationCode(
   config: { privateJwk: string; publicJwk: string; audience: string; issuer: string },
 ): Promise<{ accessToken: string; refreshToken: string; expiresIn: 900; tokenType: 'DPoP' }> {
   if (
-    !UUID.test(input.transactionId) ||
+    !isUuid(input.transactionId) ||
     !URL_TOKEN.test(input.code) ||
     !/^[A-Za-z0-9._~-]{43,128}$/.test(input.verifier)
   )
