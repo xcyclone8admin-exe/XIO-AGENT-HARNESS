@@ -9,10 +9,11 @@ use tauri::State;
 use crate::cloud_service::SignalConsumeResponse;
 use crate::commands::AppState;
 
-/// These slots are deliberately unset until the execution lead approves an account-level
-/// development endpoint and a production endpoint. Do not populate from a WebView setting,
-/// environment variable, command argument, or remote response.
-const DEVELOPMENT_ORIGIN: Option<&str> = None;
+/// These slots are native-owned build configuration. The development origin is enabled only by
+/// the explicit `cloud-dev` feature; callers cannot supply a base URL.
+const DEVELOPMENT_ORIGIN: Option<&str> = Some(
+    "https://institutional-agent-os-dev-cloud.institutional-agent-os-dev.workers.dev",
+);
 const PRODUCTION_ORIGIN: Option<&str> = None;
 /// The Cloud service currently caps blobs at 10 MiB. Native memory use is bounded to this size.
 const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
@@ -24,9 +25,12 @@ enum CloudEnvironment {
 }
 
 impl CloudEnvironment {
-    /// Build-time host selection only. A local/development build may opt into the development
-    /// registry entry by changing this constant after that endpoint is approved.
-    const SELECTED: Self = Self::Production;
+    /// Build-time host selection only. Production stays unconfigured until separately approved.
+    const SELECTED: Self = if cfg!(feature = "cloud-dev") {
+        Self::Development
+    } else {
+        Self::Production
+    };
 
     fn origin(self) -> Result<&'static str, &'static str> {
         let candidate = match self {
@@ -370,9 +374,20 @@ pub(crate) fn validate_blob_access_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "cloud-dev"))]
     #[test]
     fn origin_registry_is_fail_closed_until_configured() {
         assert_eq!(selected_cloud_origin().unwrap(), None);
+    }
+
+    #[cfg(feature = "cloud-dev")]
+    #[test]
+    fn development_feature_selects_only_the_pinned_development_origin() {
+        assert_eq!(
+            selected_cloud_origin().unwrap(),
+            Some("https://institutional-agent-os-dev-cloud.institutional-agent-os-dev.workers.dev")
+        );
+        assert_eq!(PRODUCTION_ORIGIN, None);
     }
 
     #[test]

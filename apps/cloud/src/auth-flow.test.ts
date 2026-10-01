@@ -16,6 +16,13 @@ describe('Cloud passkey login boundary', () => {
       validWebAuthnConfig({ origin: 'https://cloud.example.com', rpId: 'example.com', rpName: 'XYRA' }),
     ).toBe(true);
     expect(
+      validWebAuthnConfig({
+        origin: 'https://institutional-agent-os-dev-cloud.institutional-agent-os-dev.workers.dev',
+        rpId: 'institutional-agent-os-dev.workers.dev',
+        rpName: 'XYRA Development',
+      }),
+    ).toBe(true);
+    expect(
       validWebAuthnConfig({ origin: 'https://notexample.com', rpId: 'example.com', rpName: 'XYRA' }),
     ).toBe(false);
     expect(validWebAuthnConfig(undefined)).toBe(false);
