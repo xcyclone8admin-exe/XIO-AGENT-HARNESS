@@ -20,12 +20,15 @@ UUID and is independent of the thumbprint. DPoP uses `alg:"ES256"`; CNG signs th
 of the JWS signing input and returns the 64-byte raw P1363 `r||s` signature expected by JOSE.
 
 Existing sessions without an algorithm marker are treated as EdDSA-bound to preserve compatibility.
-New sessions use ES256. A refresh keeps the session's recorded algorithm. Logout clears the session
-but leaves the device key and device UUID in place. The key is never silently replaced. If key
-metadata exists but the CNG key is missing, the session is marked reauthentication-required; user
-reenrollment creates a new identity. A device reset or TPM replacement therefore requires fresh
-passkey authentication, and any old server refresh family can only be revoked if its refresh token
-is still usable before the reset.
+Desktop migrates every legacy EdDSA software-key session, whether live or expired, to
+`reauth_required` at startup and deletes its saved PKCS#8 key. It clears any unfinished legacy
+EdDSA passkey transaction as well. No refresh request is sent for those identities. New sessions
+use ES256. A refresh keeps the session's recorded algorithm. Logout clears the session but leaves
+the device key and device UUID in place. The key is never silently replaced. If key metadata exists
+but the CNG key is missing, the session is marked reauthentication-required; user reenrollment
+creates a new identity. A device reset or TPM replacement therefore requires fresh passkey
+authentication, and any old server refresh family can only be revoked if its refresh token is still
+usable before the reset.
 
 The CNG path was compiled with the Windows target and its surrounding Rust tests exercise algorithm
 selection and device-ID persistence. This checkout has not certified that a physical TPM is present,
