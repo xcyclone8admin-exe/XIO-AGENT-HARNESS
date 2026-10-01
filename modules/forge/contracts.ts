@@ -25,7 +25,7 @@ export const HierarchyNode = z.object({
 });
 export type HierarchyNode = z.infer<typeof HierarchyNode>;
 export const ForgeNodeCreate = HierarchyNode.omit({ id: true, tenantId: true, workspaceId: true, projectId: true, archivedAt: true, createdBy: true, createdAt: true, updatedAt: true });
-export const ForgeNodeUpdate = z.object({ nodeId: UUID, title: z.string().min(1).max(500).optional(), description: z.string().max(20_000).optional(), state: z.string().min(1).optional(), priority: ForgePriority.optional(), dependencies: z.array(UUID).max(500).optional(), requirements: z.array(RequirementRef).max(500).optional(), acceptanceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(), ownerId: UUID.nullable().optional() }).refine((value) => Object.keys(value).some((key) => key !== 'nodeId'), 'At least one node field is required');
+export const ForgeNodeUpdate = z.object({ nodeId: UUID, parentId: UUID.nullable().optional(), title: z.string().min(1).max(500).optional(), description: z.string().max(20_000).optional(), state: z.string().min(1).optional(), priority: ForgePriority.optional(), dependencies: z.array(UUID).max(500).optional(), requirements: z.array(RequirementRef).max(500).optional(), acceptanceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(), ownerId: UUID.nullable().optional() }).refine((value) => Object.keys(value).some((key) => key !== 'nodeId'), 'At least one node field is required');
 export const ArchiveNodeRequest = z.object({ nodeId: UUID, reason: z.string().min(1).max(4000) });
 
 export const SpecDocument = z.object({

@@ -103,6 +103,10 @@ describe('Forge schema and workspace isolation', () => {
     await expect(scoped.query(scopeA, "UPDATE forge_sources SET status='rejected' WHERE id=$1", [source.id])).rejects.toThrow();
     const task = await forge.createNode(actorA, project.id, { parentId: epic.id, kind: 'ticket', title: 'First work', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [{ id: 'XIO-REQ-FRG-008', statement: 'evidence gate' }], acceptanceCriteria: ['pass'], ownerId: null });
     const dependent = await forge.createNode(actorA, project.id, { parentId: epic.id, kind: 'ticket', title: 'Dependent work', description: '', state: 'ready', priority: 'normal', dependencies: [task.id], requirements: [], acceptanceCriteria: ['wait'], ownerId: null });
+    const planNode = await forge.createNode(actorA, project.id, { parentId: epic.id, kind: 'plan', title: 'Plan', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    const waveNode = await forge.createNode(actorA, project.id, { parentId: planNode.id, kind: 'wave', title: 'Wave', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    expect((await forge.updateNode(actorA, { nodeId: task.id, parentId: waveNode.id })).parentId).toBe(waveNode.id);
+    await expect(forge.updateNode(actorA, { nodeId: task.id, parentId: dependent.id })).rejects.toThrow('FORGE_NODE_PARENT_KIND_INVALID');
     const evidenceRecord = await forge.createEvidence(actorA, { requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest fixture', deterministic: true, result: 'pass', payload: { test: 'green' }, ticketId: task.id });
     expect((await forge.nodes(actorA, project.id)).find((node) => node.id === task.id)?.evidenceIds).toContain(evidenceRecord.id);
     const context = await forge.compileTicketContext(actorA, { ticketId: task.id, budgetTokens: 8000, sourceIds: [ingested.id] });

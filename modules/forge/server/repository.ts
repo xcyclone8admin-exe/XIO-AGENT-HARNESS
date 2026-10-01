@@ -54,13 +54,30 @@ export class ForgeRepository {
     const { nodeId, ...input } = ForgeNodeUpdate.parse(raw);
     const current = await this.store.query<NodeRow>(this.scope(actor), 'SELECT id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, nodeId]);
     const old = current.rows[0]; if (!old) throw new Error('FORGE_NODE_NOT_FOUND'); if (old.archived_at) throw new Error('FORGE_NODE_ARCHIVED');
+    if (input.parentId !== undefined && input.parentId !== old.parent_id) {
+      const allowedParents: Record<string, string[]> = { epic: [], spec: ['epic'], plan: ['epic'], wave: ['plan'], ticket: ['epic', 'plan', 'wave'], subtask: ['ticket'] };
+      if (old.kind === 'epic' ? input.parentId !== null : input.parentId === null) throw new Error('FORGE_NODE_PARENT_KIND_INVALID');
+      if (input.parentId) {
+        const parent = (await this.store.query<NodeRow>(this.scope(actor), 'SELECT id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND project_id=$3 AND id=$4 AND archived_at IS NULL', [actor.tenantId, actor.workspaceId, old.project_id, input.parentId])).rows[0];
+        if (!parent || !allowedParents[old.kind]?.includes(parent.kind)) throw new Error('FORGE_NODE_PARENT_KIND_INVALID');
+        let frontier = new Set([old.id]);
+        const nodes = await this.nodes(actor, old.project_id);
+        const descendants = new Set<string>();
+        while (frontier.size) {
+          const children = nodes.filter((node) => node.parentId !== null && frontier.has(node.parentId));
+          for (const child of children) descendants.add(child.id);
+          frontier = new Set(children.map((child) => child.id));
+        }
+        if (descendants.has(parent.id) || parent.id === old.id) throw new Error('FORGE_NODE_PARENT_CYCLE');
+      }
+    }
     if (input.state && input.state !== old.state) {
       if (old.kind === 'epic' || old.kind === 'spec' || old.kind === 'plan' || old.kind === 'wave') transitionEpic(old.state, input.state);
       else if (old.kind === 'ticket' || old.kind === 'subtask') {
         const { transitionTicket } = await import('./state-machine'); transitionTicket(old.state, input.state);
       } else throw new Error('FORGE_NODE_STATE_TRANSITION_UNSUPPORTED');
     }
-    const { rows } = await this.store.query<NodeRow>(this.scope(actor), 'UPDATE forge_nodes SET title=COALESCE($4,title),description=COALESCE($5,description),state=COALESCE($6,state),priority=COALESCE($7,priority),dependencies=COALESCE($8::jsonb,dependencies),requirement_refs=COALESCE($9::jsonb,requirement_refs),acceptance_criteria=COALESCE($10::jsonb,acceptance_criteria),owner_id=CASE WHEN $12 THEN $11 ELSE owner_id END,updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND archived_at IS NULL RETURNING id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason', [actor.tenantId, actor.workspaceId, nodeId, input.title ?? null, input.description ?? null, input.state ?? null, input.priority ?? null, input.dependencies === undefined ? null : json(input.dependencies), input.requirements === undefined ? null : json(input.requirements), input.acceptanceCriteria === undefined ? null : json(input.acceptanceCriteria), input.ownerId ?? null, input.ownerId !== undefined]);
+    const { rows } = await this.store.query<NodeRow>(this.scope(actor), 'UPDATE forge_nodes SET parent_id=CASE WHEN $14 THEN $13 ELSE parent_id END,title=COALESCE($4,title),description=COALESCE($5,description),state=COALESCE($6,state),priority=COALESCE($7,priority),dependencies=COALESCE($8::jsonb,dependencies),requirement_refs=COALESCE($9::jsonb,requirement_refs),acceptance_criteria=COALESCE($10::jsonb,acceptance_criteria),owner_id=CASE WHEN $12 THEN $11 ELSE owner_id END,updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND archived_at IS NULL RETURNING id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason', [actor.tenantId, actor.workspaceId, nodeId, input.title ?? null, input.description ?? null, input.state ?? null, input.priority ?? null, input.dependencies === undefined ? null : json(input.dependencies), input.requirements === undefined ? null : json(input.requirements), input.acceptanceCriteria === undefined ? null : json(input.acceptanceCriteria), input.ownerId ?? null, input.ownerId !== undefined, input.parentId ?? null, input.parentId !== undefined]);
     const row = rows[0]; if (!row) throw new Error('FORGE_NODE_NOT_FOUND');
     return HierarchyNode.parse({ id: row.id, tenantId: row.tenant_id, workspaceId: row.workspace_id, projectId: row.project_id, parentId: row.parent_id, archivedAt: row.archived_at ? timestamp(row.archived_at) : null, kind: row.kind, title: row.title, description: row.description, state: row.state, priority: row.priority, dependencies: row.dependencies, requirements: row.requirement_refs, acceptanceCriteria: row.acceptance_criteria, evidenceIds: row.evidence_ids, ownerId: row.owner_id, createdBy: row.created_by, createdAt: timestamp(row.created_at), updatedAt: timestamp(row.updated_at) });
   }
