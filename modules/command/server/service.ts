@@ -91,16 +91,15 @@ export class CommandService {
     const unread = await this.store.query<{ count: number } & Record<string, unknown>>(scope,
       'SELECT count(*)::int AS count FROM command_alerts WHERE workspace_id=$1 AND dismissed_at IS NULL',
       [scope.workspaceId]);
-    const pending = await this.store.query<{ count: number } & Record<string, unknown>>(scope,
-      'SELECT count(*)::int AS count FROM approval_requests WHERE workspace_id=$1 AND expires_at > now()',
-      [scope.workspaceId]);
+    // pending_approvals is owned by core; command must not directly query approval_requests.
+    // The count is supplied by the host runtime via capability composition and stays 0 until wired.
     return {
       greeting,
       systems_live: 0,
       systems_total: 0,
       agents_live: 0,
       agents_total: 0,
-      pending_approvals: Number(pending.rows[0]?.count ?? 0),
+      pending_approvals: 0,
       unread_alerts: Number(unread.rows[0]?.count ?? 0),
     };
   }

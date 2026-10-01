@@ -3,7 +3,6 @@ import type { PGlite } from '@electric-sql/pglite';
 import { applyPGliteMigrations, LocalScopedStore, prepareLocalAppRole } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
 import { uuidv7 } from '@xyra/core';
-import coreManifest from '@xyra/mod-core/manifest';
 import commandManifest from '../manifest';
 import { CommandService } from '../server/service';
 import { loadMigrations } from './fixtures';
@@ -14,7 +13,7 @@ let service: CommandService;
 beforeAll(async () => {
   db = await openLocalStore();
   await applyPGliteMigrations(db, loadMigrations());
-  await prepareLocalAppRole(db, [...coreManifest.tables, ...commandManifest.tables]);
+  await prepareLocalAppRole(db, commandManifest.tables);
   service = new CommandService(new LocalScopedStore(db));
 }, 60_000);
 

@@ -105,7 +105,7 @@ export function generate() {
 
   const sidecar = [
     header,
-    "import type { ModuleServer } from '../modules/types';",
+    "import type { ModuleServerEntry } from '../modules/types';",
     "import type { ModuleManifest } from '@xyra/contracts';",
     ...mods.map((m, i) => `import manifest${i} from '${m.pkg}/manifest';`),
     ...mods.filter((m) => m.hasServer).map((m) => `import server_${m.id.replace(/-/g, '_')} from '${m.pkg}/server';`),
@@ -113,7 +113,7 @@ export function generate() {
     '',
     `export const MODULE_IDS = ${ids} as const;`,
     'export const MANIFESTS: readonly ModuleManifest[] = [' + mods.map((_, i) => `manifest${i}`).join(', ') + '];',
-    'export const SERVERS: readonly ModuleServer[] = [' +
+    'export const SERVERS: readonly ModuleServerEntry[] = [' +
       mods.filter((m) => m.hasServer).map((m) => `server_${m.id.replace(/-/g, '_')}`).join(', ') +
       '];',
     'export const SAMPLES = {' +
