@@ -7,7 +7,8 @@
     "id": "invest",
     "dependsOn": [
       "money",
-      "swarm"
+      "swarm",
+      "flow"
     ]
   },
   "exports": {
@@ -28,6 +29,7 @@
     "@xyra/db": "0.1.0",
     "@xyra/ledger": "0.1.0",
     "@xyra/mod-swarm": "0.1.0",
+    "@xyra/mod-flow": "0.1.0",
     "@xyra/sdk": "0.1.0",
     "@xyra/ui": "0.1.0",
     "lucide-react": "1.49.0",

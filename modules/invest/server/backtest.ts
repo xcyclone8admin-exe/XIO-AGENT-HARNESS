@@ -5,6 +5,13 @@ export type OhlcBar = { at: string; openUnits: string; highUnits: string; lowUni
 export type MomentumStopTargetStrategy = { id: string; version: number; quantityUnits: string; stopBps: number; targetBps: number; feeBps: number };
 export type BacktestTrade = { entryBar: number; exitBar: number; entryPriceUnits: string; exitPriceUnits: string; quantityUnits: string; grossPnlUnits: string; feesUnits: string; netPnlUnits: string; exitReason: 'stop'|'target'|'end_of_data' };
 export type BacktestResult = { engineVersion: 'momentum-next-bar-v1'; dataHash: string; strategyHash: string; trades: BacktestTrade[]; totalFeesUnits: string; netPnlUnits: string };
+export const BACKTEST_ENGINE_VERSION = 'momentum-next-bar-v1' as const;
+export const BACKTEST_IDENTITY_VERSION = 'invest-strategy-identity-v2' as const;
+
+export function backtestStrategyIdentity(strategy: MomentumStopTargetStrategy, quantityScale: number) {
+  if (!Number.isInteger(quantityScale) || quantityScale < 0 || quantityScale > 18) throw new RangeError('Invalid quantity scale');
+  return { identityVersion: BACKTEST_IDENTITY_VERSION, engineVersion: BACKTEST_ENGINE_VERSION, strategy, quantityScale };
+}
 
 const integer = (value: string, label: string, positive = true) => {
   if (!/^(0|[1-9]\d{0,37})$/.test(value) || (positive && BigInt(value) <= 0n)) throw new RangeError(`${label} must be a canonical ${positive ? 'positive' : 'non-negative'} integer`);
@@ -81,6 +88,7 @@ export function runMomentumStopTargetBacktest(barsInput: readonly OhlcBar[], str
       else if (index === bars.length - 1) closeTrade(index, bar.close, 'end_of_data');
     }
   }
-  return { engineVersion: 'momentum-next-bar-v1', dataHash: canonicalHash(barsInput), strategyHash: canonicalHash(strategyInput), trades,
+  const identity = backtestStrategyIdentity(strategyInput, quantityScale);
+  return { engineVersion: BACKTEST_ENGINE_VERSION, dataHash: canonicalHash(barsInput), strategyHash: canonicalHash(identity), trades,
     totalFeesUnits: totalFees.toString(), netPnlUnits: netPnl.toString() };
 }

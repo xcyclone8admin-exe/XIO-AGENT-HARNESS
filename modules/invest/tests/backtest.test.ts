@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { runMomentumStopTargetBacktest, type OhlcBar } from '../server/backtest';
+import { backtestStrategyIdentity, runMomentumStopTargetBacktest, type OhlcBar } from '../server/backtest';
 
 const bar = (at: string, openUnits: string, highUnits: string, lowUnits: string, closeUnits: string): OhlcBar => ({ at, openUnits, highUnits, lowUnits, closeUnits });
 const strategy = { id: 'golden-momentum', version: 3, quantityUnits: '1', stopBps: 500, targetBps: 1000, feeBps: 100 };
@@ -30,4 +30,12 @@ test('invalid ordering, OHLC ranges, versions and quantity are rejected', () => 
   expect(() => runMomentumStopTargetBacktest([...rising,bar('2026-01-03T00:00:00.000Z','120','110','100','130')],strategy,0)).toThrow(/inconsistent/);
   expect(() => runMomentumStopTargetBacktest(rising,{...strategy,version:0},0)).toThrow(/strategy version/);
   expect(() => runMomentumStopTargetBacktest(rising,{...strategy,quantityUnits:'0'},0)).toThrow(/positive integer/);
+});
+
+test('strategy identity binds every material stored input including instrument quantity scale and engine version', () => {
+  const scaleZero = runMomentumStopTargetBacktest(rising,strategy,0);
+  const scaleSix = runMomentumStopTargetBacktest(rising,strategy,6);
+  expect(scaleZero.strategyHash).not.toBe(scaleSix.strategyHash);
+  expect(backtestStrategyIdentity(strategy,0)).toEqual({identityVersion:'invest-strategy-identity-v2',engineVersion:'momentum-next-bar-v1',strategy,quantityScale:0});
+  expect(backtestStrategyIdentity(strategy,18).engineVersion).toBe('momentum-next-bar-v1');
 });

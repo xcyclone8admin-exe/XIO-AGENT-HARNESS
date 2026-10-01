@@ -12,6 +12,7 @@ type Instrument = { id: string; symbol: string; asset_class: string; quantity_sc
 type Order = { id:string; portfolio_id:string; instrument_id:string; symbol:string; side:'buy'|'sell'; order_type:'market'|'limit'; quantity_units:string; filled_units:string; limit_price_units:string|null; status:string; environment:'paper'; created_at:string };
 type ICMemo = { id:string; portfolio_id:string; version:number; title:string; status:'draft'|'in_review'|'approved'|'rejected'|'expired'; approvals:number; rejections:number; recusals:number; created_at:string };
 type Breach = { id:string; portfolio_id:string; instrument_id:string|null; kind:string; severity:'warning'|'high'|'critical'; status:'open'|'acknowledged'|'resolved'; owner_id:string|null; detail:Record<string,unknown>; opened_at:string };
+type ReconciliationDiscrepancy = { id:string; run_id:string; portfolio_id:string; source_name:string; source_ref:string; statement_date:string; discrepancy_key:string; kind:'cash_mismatch'|'position_mismatch'|'unknown_position'; expected_units:string; observed_units:string; difference_units:string; owner_id:string; created_at:string };
 type Summary = { portfolioId:string; environment:'paper'; cashUnits:string; navUnits:string; positions:Array<{instrumentId:string;symbol:string;quantityUnits:string;priceUnits:string;marketValueUnits:string}> };
 
 function PaperBanner() {
@@ -140,6 +141,7 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   const instruments = useCapability<Instrument[]>(api, workspaceId, caps.instruments.id);
   const memoQueue = useCapability<ICMemo[]>(api, workspaceId, caps.icQueue.id);
   const breaches = useCapability<Breach[]>(api, workspaceId, caps.breaches.id);
+  const reconciliationQueue = useCapability<ReconciliationDiscrepancy[]>(api, workspaceId, caps.reconciliationQueue.id);
   const [symbol, setSymbol] = useState(''); const [exchange, setExchange] = useState(''); const [price, setPrice] = useState('');
   const [memoTitle, setMemoTitle] = useState(''); const [thesis, setThesis] = useState(''); const [sourceRef, setSourceRef] = useState('');
   const [policy, setPolicy] = useState({ maxOrderNotionalUnits:'1000', maxPositionNotionalUnits:'100000000', maxDailyLossUnits:'1000000', maxOrdersPerHour:'10',
@@ -155,7 +157,7 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   async function write(id: string, input: unknown) {
     if (!api || !workspaceId) return;
     setBusy(true); setMessage(null);
-    try { await api.write(workspaceId, id, input); setMessage('Saved.'); portfolios.refresh(); instruments.refresh(); memoQueue.refresh(); breaches.refresh(); }
+    try { await api.write(workspaceId, id, input); setMessage('Saved.'); portfolios.refresh(); instruments.refresh(); memoQueue.refresh(); breaches.refresh(); reconciliationQueue.refresh(); }
     catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Investment configuration failed'); }
     finally { setBusy(false); }
   }
@@ -213,6 +215,7 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
       const result = await api.write<{runId:string;status:'matched'|'needs_review';discrepancyCount:number;idempotent:boolean}>(workspaceId,caps.reconcileStatement.id,
         {portfolioId:selectedPortfolio.id,sourceName:statementSource,sourceRef:statementRef,statementDate,statementHash,cashUnits:statementCash,positions});
       setMessage(`Statement reconciliation ${result.status}; ${result.discrepancyCount} discrepancies${result.idempotent ? ' (existing run)' : ''}. Run ${result.runId}.`);
+      reconciliationQueue.refresh();
     } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Statement reconciliation failed'); }
     finally { setBusy(false); }
   }
@@ -259,6 +262,12 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
         <Button loading={busy} disabled={!statementSource.trim() || !statementRef.trim() || !/^-?(0|[1-9]\d{0,37})$/.test(statementCash)} onClick={()=>void reconcileStatement()}>Compare and record statement</Button>
         {message ? <p role="status" className="text-sm text-fg-muted">{message}</p> : null}
       </div>}
+    </Panel>
+    <Panel title="Reconciliation discrepancy queue" description="Immutable mismatches retain the submitting owner; corrections must be recorded as forward journals with a new statement run.">
+      {reconciliationQueue.loading ? <LoadingState label="Loading reconciliation discrepancies" rows={2} /> : null}
+      {reconciliationQueue.error ? <ErrorState error={reconciliationQueue.error} onRetry={reconciliationQueue.refresh} title="Reconciliation queue could not be loaded" /> : null}
+      {!reconciliationQueue.loading && !reconciliationQueue.error && !reconciliationQueue.data?.length ? <EmptyState icon={ShieldCheck} title="No reconciliation discrepancies">Mismatches from statement comparisons will be assigned to the submitting owner and listed here.</EmptyState> : null}
+      {reconciliationQueue.data?.map((item) => <div key={item.id} className="border-b border-line py-3 last:border-0"><p className="font-medium">{item.kind}: {item.discrepancy_key} <Badge tone="caution">needs review</Badge></p><p className="mt-1 text-xs text-fg-muted">{item.source_name} · {item.source_ref} · {item.statement_date} · owner id {item.owner_id}</p><p className="font-mono text-xs text-fg-muted">expected {item.expected_units} · observed {item.observed_units} · difference {item.difference_units} · run {item.run_id}</p></div>)}
     </Panel>
     {selectedPortfolio ? <KillSwitch workspaceId={workspaceId} api={api} portfolioId={selectedPortfolio.id} /> : null}
     <Panel title="Instruments" description="Registered instruments and scale used by deterministic sizing.">{instruments.data?.length ? <ul className="divide-y divide-line">{instruments.data.map((instrument) => <li className="flex justify-between py-2 text-sm" key={instrument.id}><span>{instrument.symbol} · {instrument.asset_class}</span><span className="font-mono text-xs text-fg-muted">scale {instrument.quantity_scale} · {instrument.exchange_code ?? '24/7'}</span></li>)}</ul> : <EmptyState icon={AlertTriangle} title="No instruments configured">Register a paper instrument above before proposing an order.</EmptyState>}</Panel>
