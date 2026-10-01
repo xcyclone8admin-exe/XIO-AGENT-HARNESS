@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { HybridClock, uuidv7 } from '@xyra/core';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
@@ -36,6 +37,7 @@ export class InvestService {
     reg(investCapabilities.riskState, (input, call) => this.riskState(this.scope(call), input as { portfolioId: string }));
     reg(investCapabilities.breaches, (_input, call) => this.breaches(this.scope(call)));
     reg(investCapabilities.manageBreach, (input, call) => this.manageBreach(this.scope(call), call, input as { breachId: string; action: 'assign'|'acknowledge'|'resolve'; reason: string }));
+    reg(investCapabilities.reconcileStatement, (input, call) => this.reconcileStatement(this.scope(call), call, input as { portfolioId:string;sourceName:string;sourceRef:string;statementDate:string;statementHash:string;cashUnits:string;positions:Array<{symbol:string;units:string}> }));
     reg(investCapabilities.instruments, (_input, call) => this.instruments(this.scope(call)));
     reg(investCapabilities.orders, (input, call) => this.orders(this.scope(call), input as { portfolioId?: string }));
     reg(investCapabilities.taxLots, (input, call) => this.taxLots(this.scope(call), input as { portfolioId: string }));
@@ -163,6 +165,50 @@ export class InvestService {
       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [id, scope.tenantId, scope.workspaceId, portfolioId, instrumentId, severity, kind, JSON.stringify(detail), actorId]);
     await tx.query(`INSERT INTO invest_breach_events(id,tenant_id,workspace_id,breach_id,event_type,detail,actor_id)
       VALUES($1,$2,$3,$4,'alerted',$5::jsonb,$6)`, [uuidv7(), scope.tenantId, scope.workspaceId, id, JSON.stringify({ severity, kind }), actorId]);
+  }
+  async reconcileStatement(scope: InvestScope, call: Call, input: {portfolioId:string;sourceName:string;sourceRef:string;statementDate:string;statementHash:string;cashUnits:string;positions:Array<{symbol:string;units:string}>}): Promise<{runId:string;status:'matched'|'needs_review';discrepancyCount:number;idempotent:boolean}> {
+    const actorId = this.requireHumanOwner(scope, call);
+    const normalizedPositions = input.positions.map((position) => ({ symbol: position.symbol.trim().toUpperCase(), units: position.units })).sort((a,b)=>a.symbol.localeCompare(b.symbol));
+    const canonical = JSON.stringify({ portfolioId:input.portfolioId,source:input.sourceName,ref:input.sourceRef,statementDate:input.statementDate,cashUnits:input.cashUnits,positions:normalizedPositions });
+    const computedHash = createHash('sha256').update(canonical).digest('hex');
+    if (computedHash !== input.statementHash) throw new Error('Statement content hash does not match the submitted snapshot');
+    const prior = await this.scoped.query<{id:string;status:'matched'|'needs_review';discrepancy_count:number}>(scope,
+      `SELECT r.id,r.status,count(d.id)::int AS discrepancy_count FROM invest_reconciliation_runs r
+       LEFT JOIN invest_reconciliation_discrepancies d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.run_id=r.id
+       WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.portfolio_id=$3 AND r.statement_hash=$4 GROUP BY r.id`,
+      [scope.tenantId, scope.workspaceId, input.portfolioId, input.statementHash]);
+    if (prior.rows[0]) return { runId: prior.rows[0].id, status: prior.rows[0].status, discrepancyCount: prior.rows[0].discrepancy_count, idempotent: true };
+    const portfolio = await this.scoped.query<{base_asset:string}>(scope, `SELECT base_asset FROM invest_portfolios WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND status='active'`,
+      [scope.tenantId, scope.workspaceId, input.portfolioId]);
+    const baseAsset = portfolio.rows[0]?.base_asset; if (!baseAsset) throw new Error('Active PAPER portfolio not found');
+    const ledger = await this.summary(scope, { portfolioId: input.portfolioId });
+    const recorded = new Map(ledger.positions.map((position) => [position.symbol.toUpperCase(), BigInt(position.quantityUnits)]));
+    const external = new Map(normalizedPositions.map((position) => [position.symbol, BigInt(position.units)]));
+    const mismatches: Array<{key:string;kind:'cash_mismatch'|'position_mismatch'|'unknown_position';expected:bigint;observed:bigint}> = [];
+    if (BigInt(ledger.cashUnits) !== BigInt(input.cashUnits)) mismatches.push({ key:`cash:${baseAsset}`,kind:'cash_mismatch',expected:BigInt(ledger.cashUnits),observed:BigInt(input.cashUnits) });
+    for (const [symbol, units] of external) {
+      const expected = recorded.get(symbol);
+      if (expected === undefined) mismatches.push({ key:`position:${symbol}`,kind:'unknown_position',expected:0n,observed:units });
+      else if (expected !== units) mismatches.push({ key:`position:${symbol}`,kind:'position_mismatch',expected,observed:units });
+    }
+    for (const [symbol, units] of recorded) if (!external.has(symbol)) mismatches.push({ key:`position:${symbol}`,kind:'position_mismatch',expected:units,observed:0n });
+    const runId = uuidv7(); const status = mismatches.length ? 'needs_review' : 'matched';
+    const ledgerSnapshot = { cashAsset: baseAsset, cashUnits: ledger.cashUnits, positions: ledger.positions.map(({symbol,quantityUnits}) => ({symbol,units:quantityUnits})) };
+    const statementSnapshot = { sourceName: input.sourceName, sourceRef: input.sourceRef, statementDate: input.statementDate, cashUnits: input.cashUnits, positions: normalizedPositions };
+    await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
+      await tx.query(`INSERT INTO invest_reconciliation_runs(id,tenant_id,workspace_id,portfolio_id,source_name,source_ref,statement_date,statement_hash,status,ledger_snapshot,statement_snapshot,created_by)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11::jsonb,$12)`, [runId,scope.tenantId,scope.workspaceId,input.portfolioId,input.sourceName,input.sourceRef,input.statementDate,input.statementHash,status,JSON.stringify(ledgerSnapshot),JSON.stringify(statementSnapshot),actorId]);
+      await tx.query(`INSERT INTO invest_reconciliation_events(id,tenant_id,workspace_id,run_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'run_recorded',$5::jsonb,$6)`,
+        [uuidv7(),scope.tenantId,scope.workspaceId,runId,JSON.stringify({status,discrepancyCount:mismatches.length,statementHash:input.statementHash}),actorId]);
+      for (const discrepancy of mismatches) {
+        const id=uuidv7(); const difference=discrepancy.observed-discrepancy.expected;
+        await tx.query(`INSERT INTO invest_reconciliation_discrepancies(id,tenant_id,workspace_id,run_id,discrepancy_key,kind,expected_units,observed_units,difference_units,owner_id)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [id,scope.tenantId,scope.workspaceId,runId,discrepancy.key,discrepancy.kind,discrepancy.expected.toString(),discrepancy.observed.toString(),difference.toString(),actorId]);
+        await tx.query(`INSERT INTO invest_reconciliation_events(id,tenant_id,workspace_id,run_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'discrepancy_detected',$5::jsonb,$6)`,
+          [uuidv7(),scope.tenantId,scope.workspaceId,runId,JSON.stringify({discrepancyId:id,key:discrepancy.key,kind:discrepancy.kind,differenceUnits:difference.toString()}),actorId]);
+      }
+    });
+    return { runId, status, discrepancyCount:mismatches.length, idempotent:false };
   }
 
   async instruments(scope: InvestScope): Promise<Array<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>> {

@@ -76,6 +76,59 @@ CREATE TABLE invest_breach_events (
   FOREIGN KEY (tenant_id,actor_id) REFERENCES users(tenant_id,id) ON DELETE RESTRICT
 );
 
+CREATE TABLE invest_reconciliation_runs (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  portfolio_id uuid NOT NULL,
+  source_name text NOT NULL CHECK (length(source_name) BETWEEN 1 AND 120),
+  source_ref text NOT NULL CHECK (length(source_ref) BETWEEN 1 AND 500),
+  statement_date date NOT NULL,
+  statement_hash text NOT NULL CHECK (statement_hash ~ '^[0-9a-f]{64}$'),
+  status text NOT NULL CHECK (status IN ('matched','needs_review')),
+  ledger_snapshot jsonb NOT NULL CHECK (jsonb_typeof(ledger_snapshot)='object'),
+  statement_snapshot jsonb NOT NULL CHECK (jsonb_typeof(statement_snapshot)='object'),
+  created_by uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id,workspace_id,id),
+  UNIQUE (tenant_id,workspace_id,portfolio_id,statement_hash),
+  FOREIGN KEY (tenant_id,workspace_id,portfolio_id) REFERENCES invest_portfolios(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,created_by) REFERENCES users(tenant_id,id) ON DELETE RESTRICT
+);
+CREATE TABLE invest_reconciliation_discrepancies (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  run_id uuid NOT NULL,
+  discrepancy_key text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('cash_mismatch','position_mismatch','unknown_position')),
+  expected_units numeric(38,0) NOT NULL,
+  observed_units numeric(38,0) NOT NULL,
+  difference_units numeric(38,0) NOT NULL,
+  owner_id uuid NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id,workspace_id,id),
+  UNIQUE (tenant_id,workspace_id,run_id,discrepancy_key),
+  FOREIGN KEY (tenant_id,workspace_id,run_id) REFERENCES invest_reconciliation_runs(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,owner_id) REFERENCES users(tenant_id,id) ON DELETE RESTRICT
+);
+CREATE TABLE invest_reconciliation_events (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  run_id uuid NOT NULL,
+  event_type text NOT NULL CHECK (event_type IN ('run_recorded','discrepancy_detected')),
+  detail jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(detail)='object'),
+  actor_id uuid NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id,workspace_id,id),
+  FOREIGN KEY (tenant_id,workspace_id,run_id) REFERENCES invest_reconciliation_runs(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,actor_id) REFERENCES users(tenant_id,id) ON DELETE RESTRICT
+);
+
 CREATE TABLE invest_portfolio_risk_state (
   tenant_id uuid NOT NULL,
   workspace_id uuid NOT NULL,
@@ -171,7 +224,7 @@ CREATE FUNCTION invest_controls_scope(tenant_id uuid, workspace_id uuid) RETURNS
     AND workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
 $$;
 DO $$ DECLARE name text; BEGIN
-  FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_tax_lots','invest_tax_lot_events','invest_breach_events','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP
+  FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_tax_lots','invest_tax_lot_events','invest_breach_events','invest_reconciliation_runs','invest_reconciliation_discrepancies','invest_reconciliation_events','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
     EXECUTE format('CREATE POLICY %I ON %I USING (invest_controls_scope(tenant_id,workspace_id)) WITH CHECK (invest_controls_scope(tenant_id,workspace_id))', name || '_scope', name);
@@ -180,6 +233,9 @@ END $$;
 CREATE TRIGGER invest_market_sessions_immutable BEFORE UPDATE OR DELETE ON invest_market_sessions FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_tax_lot_events_immutable BEFORE UPDATE OR DELETE ON invest_tax_lot_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_breach_events_immutable BEFORE UPDATE OR DELETE ON invest_breach_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
+CREATE TRIGGER invest_reconciliation_runs_immutable BEFORE UPDATE OR DELETE ON invest_reconciliation_runs FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
+CREATE TRIGGER invest_reconciliation_discrepancies_immutable BEFORE UPDATE OR DELETE ON invest_reconciliation_discrepancies FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
+CREATE TRIGGER invest_reconciliation_events_immutable BEFORE UPDATE OR DELETE ON invest_reconciliation_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_limit_changes_immutable BEFORE UPDATE OR DELETE ON invest_limit_changes FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_ic_memo_events_immutable BEFORE UPDATE OR DELETE ON invest_ic_memo_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_ic_votes_immutable BEFORE UPDATE OR DELETE ON invest_ic_votes FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();

@@ -27,6 +27,12 @@ export const investCapabilities = {
   manageBreach: defineCapability({ id: 'invest.breaches.manage', title: 'Assign and resolve risk alert', description: 'Assign, acknowledge or resolve a post-trade alert with an immutable owner audit event', kind: 'write', permission: 'invest:breach:manage', agentCallable: false,
     input: z.object({ breachId: Uuid, action: z.enum(['assign','acknowledge','resolve']), reason: z.string().trim().min(1).max(1000) }).strict(),
     output: z.object({ id: Uuid, status: z.enum(['open','acknowledged','resolved']), ownerId: Uuid.nullable() }) }),
+  reconcileStatement: defineCapability({ id: 'invest.reconciliation.import-paper-statement', title: 'Reconcile PAPER custodian statement', description: 'Compare a human-submitted custodian statement snapshot with ledger-derived cash and positions', kind: 'write', permission: 'invest:breach:manage', agentCallable: false,
+    input: z.object({ portfolioId: Uuid, sourceName: z.string().trim().min(1).max(120), sourceRef: z.string().trim().min(1).max(500), statementDate: z.iso.date(),
+      statementHash: z.string().regex(/^[0-9a-f]{64}$/), cashUnits: Units,
+      positions: z.array(z.object({ symbol: z.string().trim().toUpperCase().min(1).max(32), units: Units.refine((value) => BigInt(value) >= 0n) })).max(500) }).strict()
+      .superRefine((value, ctx) => { if (new Set(value.positions.map((position) => position.symbol)).size !== value.positions.length) ctx.addIssue({ code: 'custom', path: ['positions'], message: 'Statement must contain at most one row per instrument symbol' }); }),
+    output: z.object({ runId: Uuid, status: z.enum(['matched','needs_review']), discrepancyCount: z.number().int().min(0), idempotent: z.boolean() }) }),
   instruments: defineCapability({ id: 'invest.instruments.list', title: 'Instruments', description: 'List active investment instruments',
     kind: 'read', permission: 'invest:market:read', input: Empty, output: z.array(InstrumentView) }),
   orders: defineCapability({ id: 'invest.orders.list', title: 'Paper orders', description: 'List PAPER orders and their fills',

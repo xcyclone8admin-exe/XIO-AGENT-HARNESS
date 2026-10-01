@@ -143,6 +143,10 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   const [memoTitle, setMemoTitle] = useState(''); const [thesis, setThesis] = useState(''); const [sourceRef, setSourceRef] = useState('');
   const [maxOrderNotional, setMaxOrderNotional] = useState('1000'); const [busy, setBusy] = useState(false); const [message, setMessage] = useState<string|null>(null);
   const [marketSession, setMarketSession] = useState(true);
+  const [statementSource, setStatementSource] = useState('Manual custodian statement');
+  const [statementRef, setStatementRef] = useState('');
+  const [statementCash, setStatementCash] = useState('0');
+  const [statementPositions, setStatementPositions] = useState('[]');
   const selectedPortfolio = portfolios.data?.[0];
   async function write(id: string, input: unknown) {
     if (!api || !workspaceId) return;
@@ -183,6 +187,23 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
     await write(caps.voteMemo.id, { memoId, vote, reason: vote === 'approve' ? 'Reviewed source-cited thesis and risk policy' : vote === 'reject' ? 'IC review rejected this mandate draft' : 'IC member recused from this decision' });
   }
   async function activateMemo(memoId: string) { await write(caps.activateMandate.id, { memoId }); }
+  async function reconcileStatement() {
+    if (!selectedPortfolio || !api || !workspaceId) return;
+    let positions: Array<{symbol:string;units:string}>;
+    try { positions = (JSON.parse(statementPositions) as Array<{symbol:string;units:string}>).map((position)=>({symbol:position.symbol.trim().toUpperCase(),units:position.units})).sort((a,b)=>a.symbol.localeCompare(b.symbol)); }
+    catch { setMessage('Positions must be valid JSON, for example [{"symbol":"ACME","units":"100"}].'); return; }
+    const statementDate = new Date().toISOString().slice(0,10);
+    const canonical = JSON.stringify({portfolioId:selectedPortfolio.id,source:statementSource,ref:statementRef,statementDate,cashUnits:statementCash,positions});
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+    const statementHash = [...new Uint8Array(digest)].map((byte)=>byte.toString(16).padStart(2,'0')).join('');
+    setBusy(true); setMessage(null);
+    try {
+      const result = await api.write<{runId:string;status:'matched'|'needs_review';discrepancyCount:number;idempotent:boolean}>(workspaceId,caps.reconcileStatement.id,
+        {portfolioId:selectedPortfolio.id,sourceName:statementSource,sourceRef:statementRef,statementDate,statementHash,cashUnits:statementCash,positions});
+      setMessage(`Statement reconciliation ${result.status}; ${result.discrepancyCount} discrepancies${result.idempotent ? ' (existing run)' : ''}. Run ${result.runId}.`);
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Statement reconciliation failed'); }
+    finally { setBusy(false); }
+  }
   return <div className="space-y-5">
     <PageHeader eyebrow="Invest / controls" title="Risk and mandates" description="Versioned portfolio policy and fail-closed market calendar inputs." />
     <PaperBanner />
@@ -211,6 +232,16 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
       {breaches.error ? <ErrorState error={breaches.error} onRetry={breaches.refresh} title="Breach queue could not be loaded" /> : null}
       {!breaches.loading && !breaches.error && !breaches.data?.length ? <EmptyState icon={ShieldCheck} title="No open risk alerts">New post-trade limit breaches will appear here.</EmptyState> : null}
       {breaches.data?.map((breach) => <div key={breach.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-line py-3 last:border-0"><div><p className="font-medium">{breach.kind} <Badge tone={breach.severity === 'critical' ? 'negative' : 'caution'}>{breach.severity}</Badge> <Badge tone={breach.status === 'acknowledged' ? 'positive' : 'caution'}>{breach.status}</Badge></p><p className="font-mono text-xs text-fg-muted">{breach.opened_at} · owner {breach.owner_id ?? 'unassigned'}</p></div><div className="flex gap-2">{breach.status === 'open' && !breach.owner_id ? <Button size="sm" variant="secondary" loading={busy} onClick={() => void write(caps.manageBreach.id,{breachId:breach.id,action:'assign',reason:'Owner accepted responsibility for risk alert'})}>Assign to me</Button> : null}{breach.status === 'open' && breach.owner_id ? <Button size="sm" variant="secondary" loading={busy} onClick={() => void write(caps.manageBreach.id,{breachId:breach.id,action:'acknowledge',reason:'Owner reviewed the alert'})}>Acknowledge</Button> : null}{breach.status === 'acknowledged' ? <Button size="sm" loading={busy} onClick={() => void write(caps.manageBreach.id,{breachId:breach.id,action:'resolve',reason:'Owner resolved the underlying PAPER risk condition'})}>Resolve</Button> : null}</div></div>)}
+    </Panel>
+    <Panel title="Reconcile a PAPER custodian statement" description="Upload data by entering an external statement snapshot; matching uses exact minor-unit strings. This local workflow does not connect to a custodian.">
+      {!selectedPortfolio ? <p className="text-sm text-fg-muted">Create a PAPER portfolio before reconciling a statement.</p> : <div className="space-y-3">
+        <label className="block space-y-1 text-xs text-fg-muted">Statement source<Input aria-label="Statement source" value={statementSource} onChange={(event)=>setStatementSource(event.target.value)} maxLength={120} /></label>
+        <label className="block space-y-1 text-xs text-fg-muted">Statement reference<Input aria-label="Statement reference" value={statementRef} onChange={(event)=>setStatementRef(event.target.value)} maxLength={500} /></label>
+        <label className="block max-w-xs space-y-1 text-xs text-fg-muted">Cash units in {selectedPortfolio.base_asset}<Input aria-label="Statement cash units" inputMode="numeric" value={statementCash} onChange={(event)=>setStatementCash(event.target.value)} /></label>
+        <label className="block space-y-1 text-xs text-fg-muted">Position snapshot JSON (symbol and integer minor units)<textarea aria-label="Statement positions" className="min-h-24 w-full rounded-md border border-line bg-surface px-3 py-2 font-mono text-sm text-fg" value={statementPositions} onChange={(event)=>setStatementPositions(event.target.value)} /></label>
+        <Button loading={busy} disabled={!statementSource.trim() || !statementRef.trim() || !/^-?(0|[1-9]\d{0,37})$/.test(statementCash)} onClick={()=>void reconcileStatement()}>Compare and record statement</Button>
+        {message ? <p role="status" className="text-sm text-fg-muted">{message}</p> : null}
+      </div>}
     </Panel>
     {selectedPortfolio ? <KillSwitch workspaceId={workspaceId} api={api} portfolioId={selectedPortfolio.id} /> : null}
     <Panel title="Instruments" description="Registered instruments and scale used by deterministic sizing.">{instruments.data?.length ? <ul className="divide-y divide-line">{instruments.data.map((instrument) => <li className="flex justify-between py-2 text-sm" key={instrument.id}><span>{instrument.symbol} · {instrument.asset_class}</span><span className="font-mono text-xs text-fg-muted">scale {instrument.quantity_scale} · {instrument.exchange_code ?? '24/7'}</span></li>)}</ul> : <EmptyState icon={AlertTriangle} title="No instruments configured">Register a paper instrument above before proposing an order.</EmptyState>}</Panel>
