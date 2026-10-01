@@ -51,8 +51,9 @@ export default defineModule({
         workflow_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_workflows' } },
         trigger: { type: 'text', requiredOnInsert: true },
         state: { type: 'text', requiredOnInsert: true },
-        step_index: { type: 'integer', requiredOnInsert: true, min: '0' },
-        attempt: { type: 'integer', requiredOnInsert: true, min: '0' },
+        // DB defaults to 0 (migration 0001); not required on insert, matching the schema.
+        step_index: { type: 'integer', min: '0' },
+        attempt: { type: 'integer', min: '0' },
         detail: { type: 'jsonb' },
         ended_at: { type: 'timestamptz', nullable: true },
         created_by: { type: 'uuid', requiredOnInsert: true },

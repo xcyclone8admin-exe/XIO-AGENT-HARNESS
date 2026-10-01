@@ -56,6 +56,34 @@ describe('FLOW schema and workspace isolation', () => {
     const tableNames = new Set(result.rows.map((row) => row.tablename));
     expect(manifest.tables.map((table) => table.name).filter((name) => !tableNames.has(name))).toEqual([]);
   });
+
+  /**
+   * Mirrors apps/sidecar/src/registry.test.ts's "manifest column specs match the migrated schema"
+   * check, scoped to this module: `requiredOnInsert` must be true exactly when the column is
+   * NOT NULL with no DB default (CLD-R-007). A column with a DEFAULT (e.g. flow_runs.step_index,
+   * flow_runs.attempt) is NOT required on insert even though it is NOT NULL — the regression this
+   * guards against.
+   */
+  it('keeps every column spec in parity with the migrated schema (type, nullable, requiredOnInsert)', async () => {
+    for (const table of manifest.tables) {
+      if (!table.columns) continue;
+      const described = await db.query<{ column_name: string; data_type: string; is_nullable: string; column_default: string | null }>(
+        `SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,
+        [table.name],
+      );
+      const byName = new Map(described.rows.map((row) => [row.column_name, row]));
+      for (const [name, spec] of Object.entries(table.columns)) {
+        const column = byName.get(name);
+        const where = `${table.name}.${name}`;
+        expect(column, where).toBeDefined();
+        if (!column) continue;
+        const pgType = column.data_type === 'timestamp with time zone' ? 'timestamptz' : column.data_type;
+        expect(pgType, `${where} type`).toBe(spec.type);
+        expect(column.is_nullable === 'YES', `${where} nullable`).toBe(spec.nullable);
+        expect(column.is_nullable === 'NO' && column.column_default === null, `${where} requiredOnInsert`).toBe(spec.requiredOnInsert);
+      }
+    }
+  });
 });
 
 describe('FLOW durable run execution', () => {
