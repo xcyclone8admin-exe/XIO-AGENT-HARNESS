@@ -213,4 +213,54 @@ describe('Forge schema and workspace isolation', () => {
     const visible = await handlers.get('forge.projects.list')?.({}, callB);
     expect(visible).toEqual([]);
   });
+
+  it('connects the project hierarchy UI payloads to scoped capabilities and durable rows', async () => {
+    const handlers = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    registerForge({ register: (_manifest, descriptor: AnyCapability, handler) => { handlers.set(descriptor.id, handler); } }, manifest, forge);
+    const callA: ForgeCall = { principal: { id: actor, tenantId: tenantA }, workspaceId: workspaceA };
+    const call = async <T>(id: string, input: unknown, context = callA) => {
+      const handler = handlers.get(id);
+      if (!handler) throw new Error(`missing Forge capability: ${id}`);
+      return await handler(input, context) as T;
+    };
+
+    // These match the payload shapes used by the connected project and hierarchy forms.
+    const project = await call<{ id: string }>('forge.projects.create', { name: 'Connected workflow', description: '', requirements: [] });
+    await call('forge.projects.update', { projectId: project.id, name: 'Connected workflow updated', description: 'UI metadata edit', requirements: [{ id: 'FRG-001', statement: 'Persist the hierarchy workflow' }] });
+    const otherProject = await call<{ id: string }>('forge.projects.create', { name: 'Other project', description: '', requirements: [] });
+    const otherEpic = await call<{ id: string }>('forge.nodes.create', { projectId: otherProject.id, node: { parentId: null, kind: 'epic', title: 'Other epic', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const otherPlan = await call<{ id: string }>('forge.nodes.create', { projectId: otherProject.id, node: { parentId: otherEpic.id, kind: 'plan', title: 'Other plan', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const otherWave = await call<{ id: string }>('forge.nodes.create', { projectId: otherProject.id, node: { parentId: otherPlan.id, kind: 'wave', title: 'Other wave', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const epic = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: null, kind: 'epic', title: 'Connected epic', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const spec = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: epic.id, kind: 'spec', title: 'Connected spec', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const plan = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: epic.id, kind: 'plan', title: 'Connected plan', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const wave = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: plan.id, kind: 'wave', title: 'Connected wave', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const firstTicket = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: epic.id, kind: 'ticket', title: 'First connected ticket', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [{ id: 'FRG-001', statement: 'Create and edit' }], acceptanceCriteria: ['Changes persist'], ownerId: null } });
+    const secondTicket = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: epic.id, kind: 'ticket', title: 'Second connected ticket', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+    const subtask = await call<{ id: string }>('forge.nodes.create', { projectId: project.id, node: { parentId: firstTicket.id, kind: 'subtask', title: 'Connected subtask', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null } });
+
+    const moved = await call<{ parentId: string; title: string; dependencies: string[] }>('forge.nodes.update', { nodeId: firstTicket.id, parentId: wave.id, title: 'Edited and moved ticket', description: 'Edited through the hierarchy form', requirements: [{ id: 'FRG-001', statement: 'Move tickets within project' }], acceptanceCriteria: ['Saved'], dependencies: [secondTicket.id] });
+    expect(moved).toMatchObject({ parentId: wave.id, title: 'Edited and moved ticket', dependencies: [secondTicket.id] });
+    expect((await scoped.query<Record<string, unknown> & { parent_id: string; dependencies: string[] }>(scopeA, 'SELECT parent_id,dependencies FROM forge_nodes WHERE id=$1', [firstTicket.id])).rows[0]).toMatchObject({ parent_id: wave.id, dependencies: [secondTicket.id] });
+    await expect(call('forge.nodes.update', { nodeId: firstTicket.id, parentId: otherWave.id })).rejects.toThrow('FORGE_NODE_PARENT_KIND_INVALID');
+    await expect(call('forge.nodes.update', { nodeId: secondTicket.id, dependencies: [otherWave.id] })).rejects.toThrow('FORGE_NODE_DEPENDENCY_NOT_ACTIVE_IN_PROJECT');
+    await expect(call('forge.nodes.update', { nodeId: secondTicket.id, dependencies: [firstTicket.id] })).rejects.toThrow('FORGE_NODE_DEPENDENCY_CYCLE');
+
+    await call('forge.nodes.update', { nodeId: firstTicket.id, parentId: epic.id });
+    // Corrupt a parent edge below the service layer to prove the move guard still stops a cycle.
+    await scoped.query(scopeA, 'UPDATE forge_nodes SET parent_id=$1 WHERE id=$2', [firstTicket.id, wave.id]);
+    await expect(call('forge.nodes.update', { nodeId: firstTicket.id, parentId: wave.id })).rejects.toThrow('FORGE_NODE_PARENT_CYCLE');
+    await scoped.query(scopeA, 'UPDATE forge_nodes SET parent_id=$1 WHERE id=$2', [plan.id, wave.id]);
+
+    const archived = await call<{ archivedAt: string | null }>('forge.nodes.archive', { nodeId: secondTicket.id, reason: 'Remove obsolete connected work' });
+    expect(archived.archivedAt).toBeTruthy();
+    const persistedProject = await scoped.query<Record<string, unknown> & { name: string; requirements: Array<{ id: string }> }>(scopeA, 'SELECT name,requirements FROM forge_projects WHERE id=$1', [project.id]);
+    expect(persistedProject.rows[0]).toMatchObject({ name: 'Connected workflow updated', requirements: [{ id: 'FRG-001' }] });
+    const persistedNodes = await scoped.query<Record<string, unknown> & { id: string; parent_id: string | null; title: string; dependencies: string[]; archived_at: string | null }>(scopeA, 'SELECT id,parent_id,title,dependencies,archived_at FROM forge_nodes WHERE project_id=$1', [project.id]);
+    expect(persistedNodes.rows.find((node) => node.id === firstTicket.id)).toMatchObject({ parent_id: epic.id, title: 'Edited and moved ticket', dependencies: [secondTicket.id] });
+    expect(persistedNodes.rows.find((node) => node.id === secondTicket.id)?.archived_at).toBeTruthy();
+    expect((await scoped.query(scopeA, 'SELECT id FROM forge_node_archive_events WHERE node_id=$1', [secondTicket.id])).rows).toHaveLength(1);
+    expect((await scoped.query(scopeB, 'SELECT id FROM forge_nodes WHERE project_id=$1', [project.id])).rows).toEqual([]);
+    expect((await call<{ id: string }[]>('forge.nodes.list', { projectId: project.id })).map((node) => node.id)).toEqual(expect.arrayContaining([epic.id, spec.id, plan.id, wave.id, firstTicket.id, secondTicket.id, subtask.id]));
+  });
 });

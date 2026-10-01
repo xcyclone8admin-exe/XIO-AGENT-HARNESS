@@ -50,6 +50,7 @@ export class ForgeRepository {
     }
     if (node.kind === 'epic' || node.kind === 'spec' || node.kind === 'plan' || node.kind === 'wave') EpicState.parse(node.state);
     else TicketState.parse(node.state);
+    await this.validateDependencies(actor, projectId, id, node.dependencies);
     const { rows } = await this.store.query<NodeRow>(this.scope(actor), 'INSERT INTO forge_nodes(id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,owner_id,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14,$15) RETURNING id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason', [id, actor.tenantId, actor.workspaceId, projectId, node.parentId, node.kind, node.title, node.description, node.state, node.priority, json(node.dependencies), json(node.requirements), json(node.acceptanceCriteria), node.ownerId, actor.id]);
     const row = rows[0]; if (!row) throw new Error('FORGE_NODE_CREATE_FAILED');
     return HierarchyNode.parse({ id: row.id, tenantId: row.tenant_id, workspaceId: row.workspace_id, projectId: row.project_id, parentId: row.parent_id, archivedAt: null, kind: row.kind, title: row.title, description: row.description, state: row.state, priority: row.priority, dependencies: row.dependencies, requirements: row.requirement_refs, acceptanceCriteria: row.acceptance_criteria, evidenceIds: row.evidence_ids, ownerId: row.owner_id, createdBy: row.created_by, createdAt: timestamp(row.created_at), updatedAt: timestamp(row.updated_at) });
@@ -58,6 +59,7 @@ export class ForgeRepository {
     const { nodeId, ...input } = ForgeNodeUpdate.parse(raw);
     const current = await this.store.query<NodeRow>(this.scope(actor), 'SELECT id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, nodeId]);
     const old = current.rows[0]; if (!old) throw new Error('FORGE_NODE_NOT_FOUND'); if (old.archived_at) throw new Error('FORGE_NODE_ARCHIVED');
+    if (input.dependencies !== undefined) await this.validateDependencies(actor, old.project_id, old.id, input.dependencies);
     if (input.parentId !== undefined && input.parentId !== old.parent_id) {
       const allowedParents: Record<string, string[]> = { epic: [], spec: ['epic'], plan: ['epic'], wave: ['plan'], ticket: ['epic', 'plan', 'wave'], subtask: ['ticket'] };
       if (old.kind === 'epic' ? input.parentId !== null : input.parentId === null) throw new Error('FORGE_NODE_PARENT_KIND_INVALID');
@@ -68,7 +70,7 @@ export class ForgeRepository {
         const nodes = await this.nodes(actor, old.project_id);
         const descendants = new Set<string>();
         while (frontier.size) {
-          const children = nodes.filter((node) => node.parentId !== null && frontier.has(node.parentId));
+          const children = nodes.filter((node) => node.parentId !== null && frontier.has(node.parentId) && node.id !== old.id && !descendants.has(node.id));
           for (const child of children) descendants.add(child.id);
           frontier = new Set(children.map((child) => child.id));
         }
@@ -85,6 +87,25 @@ export class ForgeRepository {
     const row = rows[0]; if (!row) throw new Error('FORGE_NODE_NOT_FOUND');
     return HierarchyNode.parse({ id: row.id, tenantId: row.tenant_id, workspaceId: row.workspace_id, projectId: row.project_id, parentId: row.parent_id, archivedAt: row.archived_at ? timestamp(row.archived_at) : null, kind: row.kind, title: row.title, description: row.description, state: row.state, priority: row.priority, dependencies: row.dependencies, requirements: row.requirement_refs, acceptanceCriteria: row.acceptance_criteria, evidenceIds: row.evidence_ids, ownerId: row.owner_id, createdBy: row.created_by, createdAt: timestamp(row.created_at), updatedAt: timestamp(row.updated_at) });
   }
+  private async validateDependencies(actor: ForgeActor, projectId: string, nodeId: string, dependencies: readonly string[]) {
+    const nodes = await this.nodes(actor, projectId);
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    for (const dependencyId of dependencies) {
+      const dependency = byId.get(dependencyId);
+      if (!dependency || dependency.archivedAt) throw new Error('FORGE_NODE_DEPENDENCY_NOT_ACTIVE_IN_PROJECT');
+      if (dependencyId === nodeId) throw new Error('FORGE_NODE_DEPENDENCY_CYCLE');
+      const seen = new Set<string>();
+      const frontier = [...(dependency.dependencies ?? [])];
+      while (frontier.length) {
+        const currentId = frontier.pop();
+        if (!currentId || seen.has(currentId)) continue;
+        if (currentId === nodeId) throw new Error('FORGE_NODE_DEPENDENCY_CYCLE');
+        seen.add(currentId);
+        const current = byId.get(currentId);
+        if (current) frontier.push(...current.dependencies);
+      }
+    }
+  }
   async archiveNode(actor: ForgeActor, raw: unknown) {
     const input = ArchiveNodeRequest.parse(raw);
     const current = await this.store.query<NodeRow>(this.scope(actor), 'SELECT id,tenant_id,workspace_id,project_id,parent_id,kind,title,description,state,priority,dependencies,requirement_refs,acceptance_criteria,evidence_ids,owner_id,created_by,created_at,updated_at,archived_at,archive_reason FROM forge_nodes WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, input.nodeId]);
@@ -94,7 +115,7 @@ export class ForgeRepository {
     const descendants = new Set<string>();
     let frontier = new Set([node.id]);
     while (frontier.size) {
-      const next = children.filter((child) => child.parentId !== null && frontier.has(child.parentId) && !child.archivedAt);
+      const next = children.filter((child) => child.parentId !== null && frontier.has(child.parentId) && !child.archivedAt && child.id !== node.id && !descendants.has(child.id));
       for (const child of next) descendants.add(child.id);
       frontier = new Set(next.map((child) => child.id));
     }
