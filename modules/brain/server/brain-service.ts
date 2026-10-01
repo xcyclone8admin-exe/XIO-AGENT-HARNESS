@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson, uuidv7 } from '@xyra/core';
+import { assertBrainReferenceSyncAcknowledgement, PushRequest, PushResponse, type BrainReferenceSyncAcknowledgement, type BrainReferenceSyncExpectation } from '@xyra/contracts';
 import type { LocalScopedStore, Scope } from '@xyra/db';
 import { ClaimDraft, CloudReferenceStageInput, IngestDraft, MemoryDraft, MemoryListInput, ProcedureListInput, SearchInput, type MemoryType } from '../contracts';
 import { BrainErasureService } from './brain-erasure-service';
@@ -46,7 +47,7 @@ export class BrainService {
          WHERE tenant_id=$1 AND workspace_id=$2 AND source_version_id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
       return result.rows[0];
     });
-    if (!local || local.ingestion_id !== ingestionId || local.status === 'unknown') throw new Error('SOURCE_REFERENCES_UNAVAILABLE');
+    if (!local || local.ingestion_id !== ingestionId || local.status !== 'sync_accepted') throw new Error('SOURCE_REFERENCE_SYNC_NOT_ACCEPTED');
     const source = await this.store.query<Record<string, unknown> & { id: string; content_hash: string; cloud_object_ref_ids: string[] | null }>(scope,
       `SELECT s.id,v.content_hash,s.cloud_object_ref_ids FROM brain_sources s JOIN brain_source_versions v
        ON (v.tenant_id,v.workspace_id,v.source_id)=(s.tenant_id,s.workspace_id,s.id)
@@ -154,6 +155,75 @@ export class BrainService {
         objectRefId: parsed.mode === 'with_objects' ? parsed.objectRefId : null, objectRefIds: refs,
         contentDigest: currentVersion.content_hash, referenceSetDigest,
         referenceState: 'pending' as const, syncRequired: true as const };
+    });
+  }
+
+  /**
+   * Records a sync acknowledgement only from the trusted native sync adapter.
+   * Expected bindings are loaded under row locks; callback input cannot choose them.
+   */
+  async acceptCloudReferenceSync(scope: Scope, request: PushRequest, response: PushResponse) {
+    return this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      const parsedRequest = PushRequest.parse(request);
+      const parsedResponse = PushResponse.parse(response);
+      // The source row is identified from the unique BRAIN source change in the request,
+      // then all authorization expectations are derived from the local locked snapshot.
+      const sourceChanges = parsedRequest.changes.filter((change) => change.table === 'brain_sources');
+      const versionChanges = parsedRequest.changes.filter((change) => change.table === 'brain_source_versions');
+      if (sourceChanges.length !== 1 || versionChanges.length !== 1) throw new Error('SYNC_REFERENCE_ROWS_MISSING');
+      const sourceChange = sourceChanges[0]!;
+      const versionChange = versionChanges[0]!;
+      if (sourceChange.op !== 'upsert' || sourceChange.tenantId !== scope.tenantId || sourceChange.workspaceId !== scope.workspaceId ||
+        versionChange.tenantId !== scope.tenantId || versionChange.workspaceId !== scope.workspaceId ||
+        versionChange.id === sourceChange.id) throw new Error('SYNC_REFERENCE_SCOPE_MISMATCH');
+
+      const sourceResult = await tx.query<Record<string, unknown> & { cloud_object_ref_ids: string[] | null; external_blob_refs: string[] }>(
+        `SELECT cloud_object_ref_ids,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, sourceChange.id]);
+      const versionResult = await tx.query<Record<string, unknown> & { id: string; content_hash: string }>(
+        `SELECT id,content_hash FROM brain_source_versions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3
+         ORDER BY version DESC,id LIMIT 1 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceChange.id]);
+      const stateResult = await tx.query<Record<string, unknown> & { id: string; source_id: string; source_version_id: string; content_digest: string;
+        ingestion_id: string | null; status: string; object_ref_ids: string[] | null; sync_ack_id: string | null; sync_idempotency_key: string | null;
+        sync_server_seq: string | null; sync_request_digest: string | null; sync_outcome_evidence: BrainReferenceSyncAcknowledgement | null }>(
+        `SELECT id,source_id,source_version_id,content_digest,ingestion_id,status,object_ref_ids,sync_ack_id,sync_idempotency_key,sync_server_seq,
+          sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets
+         WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_version_id=$4 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, sourceChange.id, versionChange.id]);
+      const state = stateResult.rows[0];
+      const sourceRow = sourceResult.rows[0];
+      const versionRow = versionResult.rows[0];
+      if (!state || state.status !== 'pending' && state.status !== 'sync_accepted' || !state.ingestion_id || !state.object_ref_ids)
+        throw new Error('SOURCE_REFERENCES_NOT_PENDING');
+      if (!sourceRow || sourceRow.external_blob_refs?.length || !sourceRow.cloud_object_ref_ids ||
+        canonicalJson(sourceRow.cloud_object_ref_ids) !== canonicalJson(state.object_ref_ids) || !versionRow ||
+        versionRow.id !== state.source_version_id || versionRow.content_hash !== state.content_digest)
+        throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
+      const refs = [...state.object_ref_ids];
+      if (refs.some((id, index) => id !== id.toLowerCase() || (index > 0 && refs[index - 1]! >= id))) throw new Error('SOURCE_REFERENCE_SET_INVALID');
+      const expectation: BrainReferenceSyncExpectation = {
+        tenantId: scope.tenantId, workspaceId: scope.workspaceId, sourceId: state.source_id,
+        sourceVersionId: state.source_version_id, contentDigest: state.content_digest,
+        objectRefIds: refs, referenceSetDigest: await brainReferenceSetDigest(state.source_id, state.source_version_id, refs),
+      };
+      if (parsedResponse.conflicts !== 0 || parsedResponse.rejected.length !== 0) throw new Error('SYNC_PUSH_NOT_FULLY_ACCEPTED');
+      const acknowledgement = await assertBrainReferenceSyncAcknowledgement(parsedRequest, parsedResponse, expectation);
+      const requestDigest = createHash('sha256').update(canonicalJson(parsedRequest), 'utf8').digest('hex');
+      if (acknowledgement.idempotencyKey !== parsedRequest.idempotencyKey || acknowledgement.serverSeq !== parsedResponse.serverSeq)
+        throw new Error('SYNC_ACKNOWLEDGEMENT_BINDING_MISMATCH');
+      if (state.status === 'sync_accepted') {
+        if (state.sync_idempotency_key !== parsedRequest.idempotencyKey || state.sync_server_seq !== acknowledgement.serverSeq ||
+          state.sync_request_digest !== requestDigest || !state.sync_outcome_evidence) throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
+        if (!state.sync_ack_id) throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
+        return { ...state.sync_outcome_evidence, ackId: state.sync_ack_id, status: 'sync_accepted' as const };
+      }
+      const ackId = uuid();
+      await tx.query(`UPDATE brain_source_blob_reference_sets SET status='sync_accepted',sync_ack_id=$1,sync_idempotency_key=$2,
+        sync_server_seq=$3,sync_request_digest=$4,sync_outcome_evidence=$5::jsonb,sync_accepted_at=now(),updated_at=now()
+        WHERE tenant_id=$6 AND workspace_id=$7 AND id=$8 AND status='pending'`,
+      [ackId, parsedRequest.idempotencyKey, acknowledgement.serverSeq, requestDigest, JSON.stringify(acknowledgement),
+        scope.tenantId, scope.workspaceId, state.id]);
+      return { ...acknowledgement, ackId, status: 'sync_accepted' as const };
     });
   }
 

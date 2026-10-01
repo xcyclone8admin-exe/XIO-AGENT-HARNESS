@@ -10,6 +10,7 @@ import { BrainService } from './brain-service';
 import type { CloudErasureClient } from './erasure-cloud';
 import { brainReferenceSetDigest, brainSourceVersionV2 } from './erasure-fingerprint';
 import type { CloudBrainIngestionClient } from './cloud-ingestion';
+import { SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION, type PushRequest, type PushResponse } from '@xyra/contracts';
 import { GOLDEN_RETRIEVAL } from '../tests/golden-retrieval';
 
 const tenantA = '019a0000-0000-7000-8000-000000000001';
@@ -29,9 +30,25 @@ let db: Awaited<ReturnType<typeof openLocalStore>>;
 let store: LocalScopedStore;
 let brain: BrainService;
 
+async function acknowledgeReferenceSync(scope: typeof scopeA, source: { sourceId: string; versionId: string; contentDigest: string }, refs: string[]) {
+  const hlc = '1790726400000-0000-test';
+  const fieldWrites = (values: Record<string, unknown>) => Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value, hlc, baseHlc: null }]));
+  const changes: PushRequest['changes'] = [
+    { table: 'brain_sources', id: source.sourceId, tenantId: scope.tenantId, workspaceId: scope.workspaceId, op: 'upsert', fields: fieldWrites({ cloud_object_ref_ids: refs }), hlc },
+    { table: 'brain_source_versions', id: source.versionId, tenantId: scope.tenantId, workspaceId: scope.workspaceId, op: 'append', fields: fieldWrites({ source_id: source.sourceId, content_hash: source.contentDigest }), hlc },
+  ];
+  const request: PushRequest = { protocolVersion: SYNC_PROTOCOL_VERSION, schemaVersion: SYNC_SCHEMA_VERSION, nodeId: 'brain-test',
+    idempotencyKey: `brain-ack-${source.versionId}`, changes };
+  const response: PushResponse = { accepted: 0, conflicts: 0, serverSeq: '31', rejected: [], conflictHistory: [], replayed: false,
+    changeOutcomes: changes.map((change, index) => ({ index, changeId: change.id, table: change.table, rowId: change.id, outcome: 'unchanged' as const,
+      appliedFields: [], unchangedFields: Object.keys(change.fields).sort(), conflictedFields: [] })) };
+  return brain.acceptCloudReferenceSync(scope, request, response);
+}
+
 async function trustCloudFinalization(scope: typeof scopeA, source: { sourceId: string; versionId: string; contentDigest: string }, ingestionId = uuidv7(), overrides: Partial<CloudBrainIngestionFinalizationReceipt> = {}) {
   await brain.stageCloudReference(scope, { mode: 'text_only', sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId });
   const refs: string[] = [];
+  await acknowledgeReferenceSync(scope, source, refs);
   const receipt = {
     protocolVersion: 'cloud-ingest-v2' as const, status: 'finalized' as const, ingestionId,
     tenantId: scope.tenantId, workspaceId: scope.workspaceId, sourceId: source.sourceId, sourceVersionId: source.versionId,
@@ -108,6 +125,40 @@ describe('BRAIN schema and provenance', () => {
       `SELECT s.cloud_object_ref_ids,r.status,r.object_ref_ids FROM brain_sources s JOIN brain_source_blob_reference_sets r
        ON (r.tenant_id,r.workspace_id,r.source_id)=(s.tenant_id,s.workspace_id,s.id) WHERE s.id=$1 AND r.source_version_id=$2`, [source.sourceId, source.versionId]);
     expect(rows.rows[0]).toMatchObject({ cloud_object_ref_ids: [objectRefId], status: 'pending', object_ref_ids: [objectRefId] });
+  });
+
+  it('accepts only a fully bound native sync acknowledgement and persists idempotent evidence', async () => {
+    const ingestionId = uuidv7();
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Sync ack', trustLevel: 'user' }, cloudIngestionId: ingestionId, content: 'Sync acknowledgement source.', contentType: 'text/plain' });
+    const objectRefId = '019a0000-0000-7000-8000-000000000078';
+    await brain.stageCloudReference(scopeA, { mode: 'with_objects', sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId, objectRefId });
+    const fields = (entries: Record<string, unknown>) => Object.fromEntries(Object.entries(entries).map(([key, value]) => [key, { value, hlc: '1790726400000-0000-test', baseHlc: null }]));
+    const changes: PushRequest['changes'] = [
+      { table: 'brain_sources', id: source.sourceId, tenantId: tenantA, workspaceId: workspaceA, op: 'upsert', fields: fields({ cloud_object_ref_ids: [objectRefId] }), hlc: '1790726400000-0000-test' },
+      { table: 'brain_source_versions', id: source.versionId, tenantId: tenantA, workspaceId: workspaceA, op: 'append', fields: fields({ source_id: source.sourceId, content_hash: source.contentDigest }), hlc: '1790726400000-0000-test' },
+    ];
+    const request: PushRequest = { protocolVersion: SYNC_PROTOCOL_VERSION, schemaVersion: SYNC_SCHEMA_VERSION, nodeId: 'brain-test', idempotencyKey: 'brain-ack-idempotency-01', changes };
+    const response: PushResponse = { accepted: 0, conflicts: 0, serverSeq: '31', rejected: [], conflictHistory: [], replayed: false,
+      changeOutcomes: changes.map((change, index) => ({ index, changeId: change.id, table: change.table, rowId: change.id, outcome: 'unchanged' as const,
+        appliedFields: [], unchangedFields: Object.keys(change.fields).sort(), conflictedFields: [] })) };
+    let cloudFinalizeCalls = 0;
+    const cloud: CloudBrainIngestionClient = { async begin() { throw new Error('unused'); }, async finalize() { cloudFinalizeCalls++; throw new Error('must not finalize'); }, async status() { throw new Error('unused'); } };
+    await expect(brain.finalizeCloudIngestion(scopeA, source.versionId, ingestionId, cloud)).rejects.toThrow('SOURCE_REFERENCE_SYNC_NOT_ACCEPTED');
+    expect(cloudFinalizeCalls).toBe(0);
+    await expect(brain.acceptCloudReferenceSync(scopeA, request, { ...response, conflicts: 1 })).rejects.toThrow('SYNC_PUSH_NOT_FULLY_ACCEPTED');
+    const changedRequest = { ...request, changes: request.changes.map((change) => change.table === 'brain_sources'
+      ? { ...change, fields: { ...change.fields, cloud_object_ref_ids: { ...change.fields.cloud_object_ref_ids!, value: [] } } }
+      : change) };
+    await expect(brain.acceptCloudReferenceSync(scopeA, changedRequest, response)).rejects.toThrow('SYNC_REFERENCE_REQUEST_CONTENT_MISMATCH');
+    const ack = await brain.acceptCloudReferenceSync(scopeA, request, response);
+    expect(ack).toMatchObject({ status: 'sync_accepted', idempotencyKey: request.idempotencyKey, serverSeq: response.serverSeq,
+      sourceId: source.sourceId, sourceVersionId: source.versionId, contentDigest: source.contentDigest, objectRefIds: [objectRefId] });
+    expect(await brain.acceptCloudReferenceSync(scopeA, request, { ...response, replayed: true })).toMatchObject({ status: 'sync_accepted', serverSeq: response.serverSeq });
+    const row = await store.query<Record<string, unknown> & { status: string; sync_idempotency_key: string; sync_server_seq: string; sync_request_digest: string; sync_outcome_evidence: unknown }>(scopeA,
+      `SELECT status,sync_idempotency_key,sync_server_seq,sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets WHERE source_version_id=$1`, [source.versionId]);
+    expect(row.rows[0]).toMatchObject({ status: 'sync_accepted', sync_idempotency_key: request.idempotencyKey, sync_server_seq: response.serverSeq });
+    expect(row.rows[0]?.sync_request_digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(row.rows[0]?.sync_outcome_evidence).toMatchObject({ sourceId: source.sourceId, sourceVersionId: source.versionId });
   });
 
   it('measures Recall@10 against the independent labeled golden corpus', async () => {
