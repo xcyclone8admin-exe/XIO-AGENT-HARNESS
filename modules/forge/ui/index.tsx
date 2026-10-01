@@ -110,6 +110,9 @@ function ForgePage({ workspaceId, api }: ModulePageProps) {
     if (!api || !workspaceId) { setProjects([]); setNodes([]); setApprovals([]); setSources([]); setSchedules([]); setRuns([]); setEvidence([]); setFindings([]); setPromotions([]); setCouncils([]); setCouncilReviewDrafts([]); setEscalations([]); return; }
     try {
       setError('');
+      const nodeRefresh = projectId
+        ? api.read<Node[]>(workspaceId, 'forge.nodes.list', { projectId }).then(setNodes).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : 'FORGE_NODES_LOAD_FAILED'))
+        : Promise.resolve(setNodes([]));
       const [nextProjects, nextApprovals, nextSources, nextSchedules, nextRuns, nextEvidence, nextFindings, nextPromotions, nextCouncils, nextCouncilReviewDrafts, nextEscalations, nextRiskAcceptances, nextPromotionApprovals] = await Promise.all([
         api.read<Project[]>(workspaceId, 'forge.projects.list'),
         api.read<Approval[]>(workspaceId, 'forge.approvals.list'),
@@ -124,6 +127,7 @@ function ForgePage({ workspaceId, api }: ModulePageProps) {
         api.read<Escalation[]>(workspaceId, 'forge.discoveries.list'),
         api.read<RiskAcceptance[]>(workspaceId, 'forge.risk-acceptances.list'),
         api.read<PromotionApproval[]>(workspaceId, 'forge.promotions.approvals.list'),
+        nodeRefresh,
       ]);
       setProjects(nextProjects); setApprovals(nextApprovals); setSources(nextSources); setSchedules(nextSchedules); setRuns(nextRuns); setEvidence(nextEvidence); setFindings(nextFindings); setPromotions(nextPromotions); setCouncils(nextCouncils); setCouncilReviewDrafts(nextCouncilReviewDrafts); setEscalations(nextEscalations); setRiskAcceptances(nextRiskAcceptances); setPromotionApprovals(nextPromotionApprovals);
       if (nextProjects.length && !nextProjects.some((item) => item.id === selectedId)) {
@@ -132,19 +136,20 @@ function ForgePage({ workspaceId, api }: ModulePageProps) {
       }
       if (!nextProjects.length) setNodes([]);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'FORGE_LOAD_FAILED'); }
-  }, [api, workspaceId, selectedId]);
+  }, [api, workspaceId, selectedId, projectId]);
   useEffect(() => { void Promise.resolve().then(refresh); }, [refresh]);
-  useEffect(() => {
-    if (!api || !workspaceId || !projectId) return;
-    void api.read<Node[]>(workspaceId, 'forge.nodes.list', { projectId }).then(setNodes).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : 'FORGE_NODES_LOAD_FAILED'));
-  }, [api, workspaceId, projectId]);
   useEffect(() => {
     if (!api || !workspaceId || !projectId) return;
     void api.read<Spec[]>(workspaceId, 'forge.specs.list', { projectId }).then(setSpecs).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : 'FORGE_SPECS_LOAD_FAILED'));
   }, [api, workspaceId, projectId]);
   const write = async <T,>(capability: string, input: unknown): Promise<T | undefined> => {
     if (!api || !workspaceId) { setError('SELECT_A_WORKSPACE'); return undefined; }
-    try { setError(''); const value = await api.write<T>(workspaceId, capability, input); await refresh(); return value; }
+    try {
+      setError('');
+      const value = await api.write<T>(workspaceId, capability, input);
+      await refresh();
+      return value;
+    }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'FORGE_WRITE_FAILED'); return undefined; }
   };
   const createProject = async (event: React.FormEvent) => {
