@@ -12,6 +12,7 @@ type IdRow = Record<string, unknown> & { id: string };
 type SearchRow = Record<string, unknown> & { source_id: string; source_version_id: string; chunk_id: string; content_text: string; rank: number };
 type BrainReferenceSyncEvidence = { acknowledgement: BrainReferenceSyncAcknowledgement; responseDigest: string; outcomes: PushChangeOutcome[] };
 const uuid = () => uuidv7();
+const MAX_BRAIN_REFERENCE_SYNC_ACKS = 64;
 
 /** Source-backed BRAIN data access. Every read/write carries an explicit tenant/workspace scope. */
 export class BrainService {
@@ -167,73 +168,74 @@ export class BrainService {
     return this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
       const parsedRequest = PushRequest.parse(request);
       const parsedResponse = PushResponse.parse(response);
-      // The source row is identified from the unique BRAIN source change in the request,
-      // then all authorization expectations are derived from the local locked snapshot.
+      // Only reference-bearing source changes are candidates. A source without a pending
+      // Cloud-ingestion snapshot is ignored; pending snapshots are loaded from BRAIN state.
       const sourceChanges = parsedRequest.changes.filter((change) => change.table === 'brain_sources' && change.op === 'upsert' &&
         change.tenantId === scope.tenantId && change.workspaceId === scope.workspaceId &&
         Array.isArray(change.fields.cloud_object_ref_ids?.value));
-      const stagedSourceIds = new Set(sourceChanges.map((change) => change.id));
-      const versionChanges = parsedRequest.changes.filter((change) => change.table === 'brain_source_versions' &&
-        change.tenantId === scope.tenantId && change.workspaceId === scope.workspaceId && stagedSourceIds.has(String(change.fields.source_id?.value)) &&
-        Object.hasOwn(change.fields, 'source_id') && Object.hasOwn(change.fields, 'content_hash'));
-      if (sourceChanges.length !== 1 || versionChanges.length !== 1) throw new Error('SYNC_REFERENCE_ROWS_MISSING');
-      const sourceChange = sourceChanges[0]!;
-      const versionChange = versionChanges[0]!;
-      if (versionChange.id === sourceChange.id) throw new Error('SYNC_REFERENCE_SCOPE_MISMATCH');
+      if (!sourceChanges.length) return [];
+      if (new Set(sourceChanges.map((change) => change.id)).size !== sourceChanges.length) throw new Error('SYNC_REFERENCE_ROWS_AMBIGUOUS');
 
-      const sourceResult = await tx.query<Record<string, unknown> & { cloud_object_ref_ids: string[] | null; external_blob_refs: string[] }>(
-        `SELECT cloud_object_ref_ids,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
-        [scope.tenantId, scope.workspaceId, sourceChange.id]);
-      const versionResult = await tx.query<Record<string, unknown> & { id: string; content_hash: string }>(
-        `SELECT id,content_hash FROM brain_source_versions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3
-         ORDER BY version DESC,id LIMIT 1 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceChange.id]);
-      const stateResult = await tx.query<Record<string, unknown> & { id: string; source_id: string; source_version_id: string; content_digest: string;
-        ingestion_id: string | null; status: string; object_ref_ids: string[] | null; sync_ack_id: string | null; sync_idempotency_key: string | null;
-        sync_server_seq: string | null; sync_request_digest: string | null; sync_outcome_evidence: BrainReferenceSyncEvidence | null }>(
-        `SELECT id,source_id,source_version_id,content_digest,ingestion_id,status,object_ref_ids,sync_ack_id,sync_idempotency_key,sync_server_seq,
-          sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets
-         WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_version_id=$4 FOR UPDATE`,
-        [scope.tenantId, scope.workspaceId, sourceChange.id, versionChange.id]);
-      const state = stateResult.rows[0];
-      const sourceRow = sourceResult.rows[0];
-      const versionRow = versionResult.rows[0];
-      if (!state || state.status !== 'pending' && state.status !== 'sync_accepted' || !state.ingestion_id || !state.object_ref_ids)
-        throw new Error('SOURCE_REFERENCES_NOT_PENDING');
-      if (!sourceRow || sourceRow.external_blob_refs?.length || !sourceRow.cloud_object_ref_ids ||
-        canonicalJson(sourceRow.cloud_object_ref_ids) !== canonicalJson(state.object_ref_ids) || !versionRow ||
-        versionRow.id !== state.source_version_id || versionRow.content_hash !== state.content_digest)
-        throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
-      const refs = [...state.object_ref_ids];
-      if (refs.some((id, index) => id !== id.toLowerCase() || (index > 0 && refs[index - 1]! >= id))) throw new Error('SOURCE_REFERENCE_SET_INVALID');
-      const expectation: BrainReferenceSyncExpectation = {
-        tenantId: scope.tenantId, workspaceId: scope.workspaceId, sourceId: state.source_id,
-        sourceVersionId: state.source_version_id, contentDigest: state.content_digest,
-        objectRefIds: refs, referenceSetDigest: await brainReferenceSetDigest(state.source_id, state.source_version_id, refs),
-      };
-      if (parsedResponse.conflicts !== 0 || parsedResponse.rejected.length !== 0) throw new Error('SYNC_PUSH_NOT_FULLY_ACCEPTED');
-      const acknowledgement = await assertBrainReferenceSyncAcknowledgement(parsedRequest, parsedResponse, expectation);
       const requestDigest = createHash('sha256').update(canonicalJson(parsedRequest), 'utf8').digest('hex');
-      if (acknowledgement.idempotencyKey !== parsedRequest.idempotencyKey || acknowledgement.serverSeq !== parsedResponse.serverSeq)
-        throw new Error('SYNC_ACKNOWLEDGEMENT_BINDING_MISMATCH');
-      const outcomes = [parsedResponse.changeOutcomes![acknowledgement.sourceChangeIndex]!, parsedResponse.changeOutcomes![acknowledgement.versionChangeIndex]!];
-      const responseDigest = createHash('sha256').update(canonicalJson({ accepted: parsedResponse.accepted, conflicts: parsedResponse.conflicts,
-        rejected: parsedResponse.rejected, serverSeq: parsedResponse.serverSeq, outcomes }), 'utf8').digest('hex');
-      if (state.status === 'sync_accepted') {
-        if (state.sync_idempotency_key !== parsedRequest.idempotencyKey || state.sync_server_seq !== acknowledgement.serverSeq ||
-          state.sync_request_digest !== requestDigest || !state.sync_outcome_evidence || state.sync_outcome_evidence.responseDigest !== responseDigest)
-          throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
-        if (!state.sync_ack_id) throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
-        return { ...state.sync_outcome_evidence.acknowledgement, ackId: state.sync_ack_id,
-          responseDigest, status: 'sync_accepted' as const };
+      const acknowledgements: Array<BrainReferenceSyncAcknowledgement & { ackId: string; responseDigest: string; status: 'sync_accepted' }> = [];
+      for (const sourceChange of [...sourceChanges].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) {
+        const sourceResult = await tx.query<Record<string, unknown> & { cloud_object_ref_ids: string[] | null; external_blob_refs: string[] }>(
+          `SELECT cloud_object_ref_ids,external_blob_refs FROM brain_sources WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
+          [scope.tenantId, scope.workspaceId, sourceChange.id]);
+        const sourceRow = sourceResult.rows[0];
+        if (!sourceRow) throw new Error('SOURCE_NOT_FOUND');
+        const versionResult = await tx.query<Record<string, unknown> & { id: string; content_hash: string }>(
+          `SELECT id,content_hash FROM brain_source_versions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3
+           ORDER BY version DESC,id LIMIT 1 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceChange.id]);
+        const stateResult = await tx.query<Record<string, unknown> & { id: string; source_id: string; source_version_id: string; content_digest: string;
+          ingestion_id: string | null; status: string; object_ref_ids: string[] | null; sync_ack_id: string | null; sync_idempotency_key: string | null;
+          sync_server_seq: string | null; sync_request_digest: string | null; sync_outcome_evidence: BrainReferenceSyncEvidence | null }>(
+          `SELECT id,source_id,source_version_id,content_digest,ingestion_id,status,object_ref_ids,sync_ack_id,sync_idempotency_key,sync_server_seq,
+            sync_request_digest,sync_outcome_evidence FROM brain_source_blob_reference_sets
+           WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND status IN ('pending','sync_accepted')
+           ORDER BY source_version_id FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceChange.id]);
+        const states = stateResult.rows;
+        if (!states.length) continue;
+        if (states.length !== 1) throw new Error('SOURCE_REFERENCE_MULTIPLE_PENDING_SNAPSHOTS');
+        if (acknowledgements.length >= MAX_BRAIN_REFERENCE_SYNC_ACKS) throw new Error('SYNC_REFERENCE_BATCH_TOO_LARGE');
+        const state = states[0]!;
+        const versionRow = versionResult.rows[0];
+        if (!state.ingestion_id || !state.object_ref_ids) throw new Error('SOURCE_REFERENCES_NOT_PENDING');
+        if (sourceRow.external_blob_refs?.length || !sourceRow.cloud_object_ref_ids ||
+          canonicalJson(sourceRow.cloud_object_ref_ids) !== canonicalJson(state.object_ref_ids) || !versionRow ||
+          versionRow.id !== state.source_version_id || versionRow.content_hash !== state.content_digest)
+          throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
+        const refs = [...state.object_ref_ids];
+        if (refs.some((id, index) => id !== id.toLowerCase() || (index > 0 && refs[index - 1]! >= id))) throw new Error('SOURCE_REFERENCE_SET_INVALID');
+        const expectation: BrainReferenceSyncExpectation = {
+          tenantId: scope.tenantId, workspaceId: scope.workspaceId, sourceId: state.source_id,
+          sourceVersionId: state.source_version_id, contentDigest: state.content_digest,
+          objectRefIds: refs, referenceSetDigest: await brainReferenceSetDigest(state.source_id, state.source_version_id, refs),
+        };
+        if (parsedResponse.conflicts !== 0 || parsedResponse.rejected.length !== 0) throw new Error('SYNC_PUSH_NOT_FULLY_ACCEPTED');
+        const acknowledgement = await assertBrainReferenceSyncAcknowledgement(parsedRequest, parsedResponse, expectation);
+        if (acknowledgement.idempotencyKey !== parsedRequest.idempotencyKey || acknowledgement.serverSeq !== parsedResponse.serverSeq)
+          throw new Error('SYNC_ACKNOWLEDGEMENT_BINDING_MISMATCH');
+        const outcomes = [parsedResponse.changeOutcomes![acknowledgement.sourceChangeIndex]!, parsedResponse.changeOutcomes![acknowledgement.versionChangeIndex]!];
+        const responseDigest = createHash('sha256').update(canonicalJson({ accepted: parsedResponse.accepted, conflicts: parsedResponse.conflicts,
+          rejected: parsedResponse.rejected, serverSeq: parsedResponse.serverSeq, outcomes }), 'utf8').digest('hex');
+        if (state.status === 'sync_accepted') {
+          if (state.sync_idempotency_key !== parsedRequest.idempotencyKey || state.sync_server_seq !== acknowledgement.serverSeq ||
+            state.sync_request_digest !== requestDigest || !state.sync_outcome_evidence || state.sync_outcome_evidence.responseDigest !== responseDigest || !state.sync_ack_id)
+            throw new Error('SYNC_ACKNOWLEDGEMENT_REPLAY_MISMATCH');
+          acknowledgements.push({ ...state.sync_outcome_evidence.acknowledgement, ackId: state.sync_ack_id, responseDigest, status: 'sync_accepted' });
+          continue;
+        }
+        const ackId = uuid();
+        const evidence: BrainReferenceSyncEvidence = { acknowledgement, responseDigest, outcomes };
+        await tx.query(`UPDATE brain_source_blob_reference_sets SET status='sync_accepted',sync_ack_id=$1,sync_idempotency_key=$2,
+          sync_server_seq=$3,sync_request_digest=$4,sync_outcome_evidence=$5::jsonb,sync_accepted_at=now(),updated_at=now()
+          WHERE tenant_id=$6 AND workspace_id=$7 AND id=$8 AND status='pending'`,
+        [ackId, parsedRequest.idempotencyKey, acknowledgement.serverSeq, requestDigest, JSON.stringify(evidence),
+          scope.tenantId, scope.workspaceId, state.id]);
+        acknowledgements.push({ ...acknowledgement, ackId, responseDigest, status: 'sync_accepted' });
       }
-      const ackId = uuid();
-      const evidence: BrainReferenceSyncEvidence = { acknowledgement, responseDigest, outcomes };
-      await tx.query(`UPDATE brain_source_blob_reference_sets SET status='sync_accepted',sync_ack_id=$1,sync_idempotency_key=$2,
-        sync_server_seq=$3,sync_request_digest=$4,sync_outcome_evidence=$5::jsonb,sync_accepted_at=now(),updated_at=now()
-        WHERE tenant_id=$6 AND workspace_id=$7 AND id=$8 AND status='pending'`,
-      [ackId, parsedRequest.idempotencyKey, acknowledgement.serverSeq, requestDigest, JSON.stringify(evidence),
-        scope.tenantId, scope.workspaceId, state.id]);
-      return { ...acknowledgement, ackId, responseDigest, status: 'sync_accepted' as const };
+      return acknowledgements;
     });
   }
 
