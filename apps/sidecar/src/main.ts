@@ -6,6 +6,7 @@ const dataDir = process.env.XYRA_DATA_DIR;
 const osSubject = process.env.XYRA_OS_SUBJECT;
 const displayName = process.env.XYRA_DISPLAY_NAME;
 const launchToken = process.env.XYRA_LAUNCH_TOKEN;
+const nativeSyncToken = process.env.XYRA_NATIVE_SYNC_TOKEN;
 const allowedOrigins = process.env.XYRA_ALLOWED_ORIGINS?.split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -29,6 +30,7 @@ const session = await startLocalSidecar({
   osSubject,
   displayName,
   launchToken,
+  ...(nativeSyncToken ? { nativeSyncToken } : {}),
   allowedOrigins,
 });
 process.stdout.write(`sidecar ready on 127.0.0.1:${session.port}\n`);

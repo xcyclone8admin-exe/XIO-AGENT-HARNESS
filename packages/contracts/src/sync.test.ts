@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { compareHlc, encodeHlc, MAX_DRIFT_MS } from '@xyra/core';
+import { cloudReferenceSetDigest } from './erasure';
 import {
   HLC_PATTERN,
   MAX_HLC_DRIFT_MS,
@@ -10,6 +11,7 @@ import {
   assertPushResponseBoundToRequest,
   SyncUpdateRequired,
 } from './sync';
+import { assertBrainReferenceSyncAcknowledgement } from './sync-ack';
 
 const tenantId = '019a0000-0000-7000-8000-000000000001';
 const workspaceId = '019a0000-0000-7000-8000-000000000011';
@@ -149,5 +151,68 @@ describe('version negotiation (CLD-R-009)', () => {
     expect(() => PullRequest.parse({ schemaVersion: 'cloud-sync-v1' })).toThrow();
     expect(SyncUpdateRequired.parse({ code: 'UPDATE_REQUIRED', ...versions }).code).toBe('UPDATE_REQUIRED');
     expect(() => PullResponse.parse({ changes: [], cursor: 'x', more: false, serverSeq: '0' })).toThrow();
+  });
+});
+
+describe('BRAIN reference push acknowledgement', () => {
+  const sourceId = '019a0000-0000-7000-8000-000000000201';
+  const versionId = '019a0000-0000-7000-8000-000000000202';
+  const refIds = ['019a0000-0000-7000-8000-000000000203', '019a0000-0000-7000-8000-000000000204'];
+  const contentDigest = 'a'.repeat(64);
+
+  function brainPush() {
+    return PushRequest.parse({
+      protocolVersion: 1,
+      schemaVersion: 'cloud-sync-v1',
+      nodeId: 'devicea',
+      idempotencyKey: 'brain-ref-sync-000001',
+      changes: [
+        {
+          table: 'brain_sources', id: sourceId, tenantId, workspaceId, op: 'upsert', hlc,
+          fields: { cloud_object_ref_ids: { value: refIds, hlc, baseHlc: null } },
+        },
+        {
+          table: 'brain_source_versions', id: versionId, tenantId, workspaceId, op: 'append', hlc,
+          fields: {
+            source_id: { value: sourceId, hlc, baseHlc: null },
+            content_hash: { value: contentDigest, hlc, baseHlc: null },
+          },
+        },
+      ],
+    });
+  }
+
+  it('acknowledges only exact scoped source refs and matching immutable source version', async () => {
+    const request = brainPush();
+    const referenceSetDigest = await cloudReferenceSetDigest({ sourceId, sourceVersionId: versionId, objectRefIds: refIds });
+    const response = PushResponse.parse({
+      accepted: 2, conflicts: 0, serverSeq: '42', rejected: [], conflictHistory: [], replayed: false,
+      changeOutcomes: [
+        { index: 0, changeId: sourceId, table: 'brain_sources', rowId: sourceId, outcome: 'committed', appliedFields: ['cloud_object_ref_ids'], unchangedFields: [], conflictedFields: [] },
+        { index: 1, changeId: versionId, table: 'brain_source_versions', rowId: versionId, outcome: 'committed', appliedFields: ['content_hash', 'source_id'], unchangedFields: [], conflictedFields: [] },
+      ],
+    });
+    await expect(assertBrainReferenceSyncAcknowledgement(request, response, {
+      tenantId, workspaceId, sourceId, sourceVersionId: versionId, contentDigest, objectRefIds: refIds, referenceSetDigest,
+    })).resolves.toMatchObject({ sourceId, sourceVersionId: versionId, serverSeq: '42', idempotencyKey: request.idempotencyKey });
+    await expect(assertBrainReferenceSyncAcknowledgement(request, response, {
+      tenantId, workspaceId: '019a0000-0000-7000-8000-000000000099', sourceId,
+      sourceVersionId: versionId, contentDigest, objectRefIds: refIds, referenceSetDigest,
+    })).rejects.toThrow('SYNC_REFERENCE_ROWS_MISSING_OR_AMBIGUOUS');
+  });
+
+  it('keeps a partial HLC loser pending even when another row in the batch committed', async () => {
+    const request = brainPush();
+    const referenceSetDigest = await cloudReferenceSetDigest({ sourceId, sourceVersionId: versionId, objectRefIds: refIds });
+    const response = PushResponse.parse({
+      accepted: 1, conflicts: 1, serverSeq: '43', rejected: [], conflictHistory: [], replayed: false,
+      changeOutcomes: [
+        { index: 0, changeId: sourceId, table: 'brain_sources', rowId: sourceId, outcome: 'conflict', appliedFields: [], unchangedFields: [], conflictedFields: ['cloud_object_ref_ids'] },
+        { index: 1, changeId: versionId, table: 'brain_source_versions', rowId: versionId, outcome: 'committed', appliedFields: ['content_hash', 'source_id'], unchangedFields: [], conflictedFields: [] },
+      ],
+    });
+    await expect(assertBrainReferenceSyncAcknowledgement(request, response, {
+      tenantId, workspaceId, sourceId, sourceVersionId: versionId, contentDigest, objectRefIds: refIds, referenceSetDigest,
+    })).rejects.toThrow('SYNC_REFERENCE_FIELD_NOT_COMMITTED');
   });
 });

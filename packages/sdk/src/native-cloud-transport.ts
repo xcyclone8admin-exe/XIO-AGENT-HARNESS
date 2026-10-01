@@ -1,5 +1,12 @@
 import type { AuthenticatedCloudTransport } from './cloud-ingestion';
-import { CloudBlobReferenceIssueRequest, CloudBlobUploadResult } from '@xyra/contracts';
+import {
+  CloudBlobReferenceIssueRequest,
+  CloudBlobUploadResult,
+  MAX_PULL_ROWS,
+  MAX_PUSH_BYTES,
+  PullRequest,
+  PushRequest,
+} from '@xyra/contracts';
 
 export interface NativeCloudRequestResult {
   status: number;
@@ -17,6 +24,27 @@ export type NativeCloudInvoker = (
 export const MAX_CLOUD_BLOB_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 function isAllowedCloudPath(path: string, method: 'GET' | 'POST'): boolean {
+  if (path === '/v1/sync/push') return method === 'POST';
+  if (path.startsWith('/v1/sync/pull?')) {
+    if (method !== 'GET') return false;
+    try {
+      const url = new URL(path, 'https://native-route.invalid');
+      if (url.origin !== 'https://native-route.invalid' || url.pathname !== '/v1/sync/pull' || url.hash) return false;
+      const allowed = new Set(['protocolVersion', 'schemaVersion', 'cursor', 'limit']);
+      const seen = new Set<string>();
+      for (const key of url.searchParams.keys()) {
+        if (!allowed.has(key) || seen.has(key)) return false;
+        seen.add(key);
+      }
+      const parsed = PullRequest.safeParse(Object.fromEntries(url.searchParams.entries()));
+      if (!parsed.success || !seen.has('protocolVersion') || !seen.has('schemaVersion')) return false;
+      if (parsed.data.cursor !== undefined && parsed.data.cursor.length === 0) return false;
+      if (parsed.data.limit !== undefined && parsed.data.limit > MAX_PULL_ROWS) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
   if (path === '/v2/brain/ingestions') return method === 'POST';
   const match =
     /^\/v2\/brain\/ingestions\/([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?:\/finalize)?$/.exec(
@@ -55,6 +83,13 @@ export class NativeCloudTransport implements AuthenticatedCloudTransport {
       }
       if (body === null || typeof body !== 'object' || Array.isArray(body)) {
         throw new TypeError('CLOUD_BODY_INVALID_SHAPE');
+      }
+      if (path === '/v1/sync/push') {
+        const parsed = PushRequest.safeParse(body);
+        if (!parsed.success) throw new TypeError('CLOUD_SYNC_PUSH_INVALID');
+        const size = new TextEncoder().encode(JSON.stringify(parsed.data)).byteLength;
+        if (size > MAX_PUSH_BYTES) throw new RangeError('CLOUD_SYNC_PUSH_TOO_LARGE');
+        body = parsed.data;
       }
     }
     const result = (await this.invoke('cloud_authenticated_request', {
