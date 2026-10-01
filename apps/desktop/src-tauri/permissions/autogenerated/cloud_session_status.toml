@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-session-status"
+description = "Enables the cloud_session_status command without any pre-configured scope."
+commands.allow = ["cloud_session_status"]
+
+[[permission]]
+identifier = "deny-cloud-session-status"
+description = "Denies the cloud_session_status command without any pre-configured scope."
+commands.deny = ["cloud_session_status"]
