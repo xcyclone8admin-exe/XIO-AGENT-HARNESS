@@ -17,6 +17,47 @@ CREATE TABLE invest_market_sessions (
   CHECK (closes_at > opens_at)
 );
 
+CREATE TABLE invest_tax_lots (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  portfolio_id uuid NOT NULL,
+  instrument_id uuid NOT NULL,
+  opening_fill_id uuid NOT NULL,
+  acquired_units numeric(38,0) NOT NULL CHECK (acquired_units > 0),
+  remaining_units numeric(38,0) NOT NULL CHECK (remaining_units >= 0 AND remaining_units <= acquired_units),
+  cost_basis_units numeric(38,0) NOT NULL CHECK (cost_basis_units >= 0),
+  remaining_basis_units numeric(38,0) NOT NULL CHECK (remaining_basis_units >= 0 AND remaining_basis_units <= cost_basis_units),
+  opened_at timestamptz NOT NULL,
+  closed_at timestamptz,
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id,workspace_id,id),
+  UNIQUE (tenant_id,workspace_id,opening_fill_id),
+  FOREIGN KEY (tenant_id,workspace_id,portfolio_id) REFERENCES invest_portfolios(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,workspace_id,instrument_id) REFERENCES invest_instruments(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,workspace_id,opening_fill_id) REFERENCES invest_fills(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  CHECK ((remaining_units=0) = (closed_at IS NOT NULL))
+);
+CREATE INDEX invest_tax_lots_fifo ON invest_tax_lots(tenant_id,workspace_id,portfolio_id,instrument_id,opened_at,id) WHERE remaining_units>0;
+
+CREATE TABLE invest_tax_lot_events (
+  id uuid NOT NULL,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  lot_id uuid NOT NULL,
+  fill_id uuid NOT NULL,
+  event_type text NOT NULL CHECK (event_type IN ('acquired','disposed')),
+  quantity_units numeric(38,0) NOT NULL CHECK (quantity_units>0),
+  basis_units numeric(38,0) NOT NULL CHECK (basis_units>=0),
+  proceeds_units numeric(38,0) NOT NULL CHECK (proceeds_units>=0),
+  realized_gain_units numeric(38,0) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (id),
+  UNIQUE (tenant_id,workspace_id,id),
+  FOREIGN KEY (tenant_id,workspace_id,lot_id) REFERENCES invest_tax_lots(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,workspace_id,fill_id) REFERENCES invest_fills(tenant_id,workspace_id,id) ON DELETE RESTRICT
+);
+
 CREATE TABLE invest_portfolio_risk_state (
   tenant_id uuid NOT NULL,
   workspace_id uuid NOT NULL,
@@ -112,13 +153,14 @@ CREATE FUNCTION invest_controls_scope(tenant_id uuid, workspace_id uuid) RETURNS
     AND workspace_id = NULLIF(current_setting('app.workspace_id', true), '')::uuid
 $$;
 DO $$ DECLARE name text; BEGIN
-  FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP
+  FOREACH name IN ARRAY ARRAY['invest_market_sessions','invest_tax_lots','invest_tax_lot_events','invest_portfolio_risk_state','invest_limit_changes','invest_ic_memos','invest_ic_votes','invest_ic_memo_events'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', name);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', name);
     EXECUTE format('CREATE POLICY %I ON %I USING (invest_controls_scope(tenant_id,workspace_id)) WITH CHECK (invest_controls_scope(tenant_id,workspace_id))', name || '_scope', name);
   END LOOP;
 END $$;
 CREATE TRIGGER invest_market_sessions_immutable BEFORE UPDATE OR DELETE ON invest_market_sessions FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
+CREATE TRIGGER invest_tax_lot_events_immutable BEFORE UPDATE OR DELETE ON invest_tax_lot_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_limit_changes_immutable BEFORE UPDATE OR DELETE ON invest_limit_changes FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_ic_memo_events_immutable BEFORE UPDATE OR DELETE ON invest_ic_memo_events FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();
 CREATE TRIGGER invest_ic_votes_immutable BEFORE UPDATE OR DELETE ON invest_ic_votes FOR EACH ROW EXECUTE FUNCTION invest_immutable_row();

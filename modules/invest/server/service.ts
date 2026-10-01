@@ -36,6 +36,7 @@ export class InvestService {
     reg(investCapabilities.riskState, (input, call) => this.riskState(this.scope(call), input as { portfolioId: string }));
     reg(investCapabilities.instruments, (_input, call) => this.instruments(this.scope(call)));
     reg(investCapabilities.orders, (input, call) => this.orders(this.scope(call), input as { portfolioId?: string }));
+    reg(investCapabilities.taxLots, (input, call) => this.taxLots(this.scope(call), input as { portfolioId: string }));
     reg(investCapabilities.createPortfolio, (input, call) => this.createPortfolio(this.scope(call), this.actor(call), input as { name: string; baseAsset: string }));
     reg(investCapabilities.fundPortfolio, (input, call) => this.fundPortfolio(this.scope(call), this.actor(call), input as { portfolioId: string; units: string; reference: string }));
     reg(investCapabilities.createInstrument, (input, call) => this.createInstrument(this.scope(call), this.actor(call), input as { symbol: string; assetClass: 'equity'|'crypto'|'fixed_income'|'fund'; quantityScale: number; exchangeCode: string|null }));
@@ -111,6 +112,13 @@ export class InvestService {
     if (!state) throw new Error('Portfolio risk state not found');
     return { portfolioId: input.portfolioId, killSwitch: state.kill_switch, killReason: state.kill_reason,
       dailyLossUnits: state.daily_loss_units, riskDate: state.risk_date };
+  }
+  async taxLots(scope: InvestScope, input: { portfolioId: string }): Promise<Array<{id:string;instrumentId:string;symbol:string;acquiredUnits:string;remainingUnits:string;costBasisUnits:string;remainingBasisUnits:string;openedAt:string}>> {
+    return (await this.scoped.query<{id:string;instrumentId:string;symbol:string;acquiredUnits:string;remainingUnits:string;costBasisUnits:string;remainingBasisUnits:string;openedAt:string}>(scope, `SELECT l.id,l.instrument_id AS "instrumentId",i.symbol,l.acquired_units::text AS "acquiredUnits",
+      l.remaining_units::text AS "remainingUnits",l.cost_basis_units::text AS "costBasisUnits",l.remaining_basis_units::text AS "remainingBasisUnits",l.opened_at::text AS "openedAt"
+      FROM invest_tax_lots l JOIN invest_instruments i ON i.tenant_id=l.tenant_id AND i.workspace_id=l.workspace_id AND i.id=l.instrument_id
+      WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 AND l.remaining_units>0 ORDER BY l.opened_at,l.id`,
+      [scope.tenantId, scope.workspaceId, input.portfolioId])).rows;
   }
 
   async instruments(scope: InvestScope): Promise<Array<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>> {
@@ -539,6 +547,32 @@ export class InvestService {
         ] });
       await tx.query(`INSERT INTO invest_fills(id,tenant_id,workspace_id,order_id,quantity_units,price_units,execution_ref,occurred_at)
         VALUES($1,$2,$3,$4,$5,$6,$7,now())`, [fillId, scope.tenantId, scope.workspaceId, input.orderId, quantity, quote.toString(), `paper:${transactionId}`]);
+      if (buy) {
+        const lotId = uuidv7();
+        await tx.query(`INSERT INTO invest_tax_lots(id,tenant_id,workspace_id,portfolio_id,instrument_id,opening_fill_id,acquired_units,remaining_units,cost_basis_units,remaining_basis_units,opened_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$7,$8,$8,now())`, [lotId, scope.tenantId, scope.workspaceId, row['portfolio_id'], row['instrument_id'], fillId, quantity, notional.toString()]);
+        await tx.query(`INSERT INTO invest_tax_lot_events(id,tenant_id,workspace_id,lot_id,fill_id,event_type,quantity_units,basis_units,proceeds_units,realized_gain_units)
+          VALUES($1,$2,$3,$4,$5,'acquired',$6,$7,0,0)`, [uuidv7(), scope.tenantId, scope.workspaceId, lotId, fillId, quantity, notional.toString()]);
+      } else {
+        let remaining = BigInt(quantity);
+        const lots = await tx.query<{id:string;remaining_units:string;remaining_basis_units:string}>(`SELECT id,remaining_units::text,remaining_basis_units::text FROM invest_tax_lots
+          WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND instrument_id=$4 AND remaining_units>0 ORDER BY opened_at,id FOR UPDATE`,
+          [scope.tenantId, scope.workspaceId, row['portfolio_id'], row['instrument_id']]);
+        for (const lot of lots.rows) {
+          if (remaining === 0n) break;
+          const available = BigInt(lot.remaining_units); const consumed = available < remaining ? available : remaining;
+          const basisAvailable = BigInt(lot.remaining_basis_units);
+          const basis = consumed === available ? basisAvailable : basisAvailable * consumed / available;
+          const proceeds = notionalUnits(consumed.toString(), quote.toString(), Number(row['quantity_scale']));
+          const left = available - consumed; const basisLeft = basisAvailable - basis;
+          await tx.query(`UPDATE invest_tax_lots SET remaining_units=$4,remaining_basis_units=$5,closed_at=CASE WHEN $4::numeric=0 THEN now() ELSE NULL END
+            WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, lot.id, left.toString(), basisLeft.toString()]);
+          await tx.query(`INSERT INTO invest_tax_lot_events(id,tenant_id,workspace_id,lot_id,fill_id,event_type,quantity_units,basis_units,proceeds_units,realized_gain_units)
+            VALUES($1,$2,$3,$4,$5,'disposed',$6,$7,$8,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, lot.id, fillId, consumed.toString(), basis.toString(), proceeds.toString(), (proceeds-basis).toString()]);
+          remaining -= consumed;
+        }
+        if (remaining !== 0n) throw new Error('PAPER FIFO tax lots do not reconcile to the ledger position');
+      }
       await tx.query(`UPDATE invest_orders SET status='submitted' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);
       await this.orderEvent(tx, scope, actorId, input.orderId, 'submitted', 'approved', 'submitted', { environment: 'paper' });
       await tx.query(`UPDATE invest_orders SET status='filled' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);

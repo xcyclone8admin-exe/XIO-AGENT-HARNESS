@@ -117,6 +117,20 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
     [tenantId, workspaceId, orderId, fill.transactionId, portfolio.book_id, `position:${instrumentId}`, `EQ:PAPERX`],
   );
   expect(persisted.rows[0]).toMatchObject({ fills: 1, ledger_transactions: 1, entries: 4, cash: '95000', position: '500000' });
+  const openedLots = await service.taxLots(scope, { portfolioId: portfolio.id });
+  expect(openedLots).toHaveLength(1);
+  expect(openedLots[0]).toMatchObject({ instrumentId, acquiredUnits: '500000', remainingUnits: '500000', costBasisUnits: '5000', remainingBasisUnits: '5000' });
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  const sell = await service.propose(scope, userId, { portfolioId, instrumentId, side: 'sell', orderType: 'market', stopPriceUnits: '11000', riskBps: 50, idempotencyKey: 'paper-fifo-disposal-test' });
+  await service.approve(scope, userId, { orderId: sell.id });
+  await service.execute(scope, userId, { orderId: sell.id });
+  expect(await service.taxLots(scope, { portfolioId: portfolio.id })).toHaveLength(0);
+  const lots = await db.query<{ remaining_units: string; remaining_basis_units: string; events: number; gain: string }>(
+    `SELECT l.remaining_units::text,l.remaining_basis_units::text,count(e.id)::int AS events,
+       sum(e.realized_gain_units)::text AS gain FROM invest_tax_lots l JOIN invest_tax_lot_events e
+       ON e.tenant_id=l.tenant_id AND e.workspace_id=l.workspace_id AND e.lot_id=l.id
+       WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 GROUP BY l.id`, [tenantId, workspaceId, portfolio.id]);
+  expect(lots.rows[0]).toEqual({ remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' });
 });
 
 test('a failing fill-event insert rolls back fill and ledger posting together', async () => {
