@@ -6,7 +6,8 @@
   "xyraModule": {
     "id": "invest",
     "dependsOn": [
-      "money"
+      "money",
+      "swarm"
     ]
   },
   "exports": {
@@ -15,6 +16,7 @@
     "./server/risk": "./server/risk.ts",
     "./server/capabilities": "./server/capabilities.ts",
     "./server/service": "./server/service.ts",
+    "./server/scheduled-reconciliation": "./server/scheduled-reconciliation.ts",
     "./ui": "./ui/index.tsx"
   },
   "scripts": {
@@ -25,6 +27,7 @@
     "@xyra/core": "0.1.0",
     "@xyra/db": "0.1.0",
     "@xyra/ledger": "0.1.0",
+    "@xyra/mod-swarm": "0.1.0",
     "@xyra/sdk": "0.1.0",
     "@xyra/ui": "0.1.0",
     "lucide-react": "1.49.0",

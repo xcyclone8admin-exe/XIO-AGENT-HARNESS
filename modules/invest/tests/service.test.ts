@@ -8,6 +8,7 @@ import { PGliteLedgerWriter } from '@xyra/ledger';
 import { LEDGER_TABLES } from '@xyra/ledger/contracts';
 import investManifest from '../manifest';
 import { InvestService } from '../server/service';
+import { investCapabilities } from '../server/capabilities';
 
 const tenantId = '019a0000-0000-7000-8000-000000000501';
 const workspaceId = '019a0000-0000-7000-8000-000000000502';
@@ -25,6 +26,8 @@ function load(directory: URL, moduleId: string) {
 let db: PGlite;
 let writer: PGliteLedgerWriter;
 let service: InvestService;
+let globalKillEngaged = false;
+let globalKillReadFails = false;
 let portfolioId: string;
 let instrumentId: string;
 let orderId: string;
@@ -53,7 +56,12 @@ beforeAll(async () => {
     INSERT INTO workspaces(id,tenant_id,name) VALUES ('${workspaceId}','${tenantId}','Invest service test');
     INSERT INTO users(id,tenant_id,display_name) VALUES ('${userId}','${tenantId}','Invest owner'),('${secondUserId}','${tenantId}','Second IC member');`);
   writer = new PGliteLedgerWriter(db);
-  service = new InvestService(new LocalScopedStore(db), writer, writer);
+  service = new InvestService(new LocalScopedStore(db), writer, writer, {
+    async getKillSwitch() {
+      if (globalKillReadFails) throw new Error('simulated SWARM durable read failure');
+      return { engaged: globalKillEngaged, reason: globalKillEngaged ? 'test global halt' : null, changedBy: null, changedAt: null };
+    },
+  });
 }, 60_000);
 
 afterAll(async () => { await db?.close(); });
@@ -117,6 +125,9 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   expect(proposed.environment).toBe('paper');
   expect(proposed.quantity_units).toBe('500000');
   await service.approve(scope, userId, { orderId });
+  globalKillEngaged = true;
+  await expect(service.execute(scope,userId,{orderId,quantityUnits:'200000'})).rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_ENGAGED');
+  globalKillEngaged = false;
   const network = vi.fn();
   vi.stubGlobal('fetch', network);
   let firstFill: Awaited<ReturnType<typeof service.execute>>;
@@ -246,6 +257,21 @@ test('a failing fill-event insert rolls back fill and ledger posting together', 
   expect(rolledBack.rows[0]).toEqual({ status: 'approved', fills: 0, transactions: 0 });
 });
 
+test('global kill reader absence, engagement and read failure all block new PAPER proposals', async () => {
+  const scope={tenantId,workspaceId};
+  const unavailable=new InvestService(new LocalScopedStore(db),writer,writer);
+  await expect(unavailable.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'no-global-reader'}))
+    .rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_UNAVAILABLE');
+  globalKillEngaged=true;
+  await expect(service.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'global-halted'}))
+    .rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_ENGAGED');
+  globalKillEngaged=false; globalKillReadFails=true;
+  try {
+    await expect(service.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'global-read-failure'}))
+      .rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_UNAVAILABLE');
+  } finally { globalKillReadFails=false; }
+});
+
 test('price marks revalue ledger positions, record breaches, auto-halt and cancel open PAPER orders', async () => {
   const scope = { tenantId, workspaceId };
   const portfolio = await service.createPortfolio(scope, userId, { name: 'Daily-loss test', baseAsset: 'USD' });
@@ -312,4 +338,9 @@ test('module runtime exposes PAPER execution only and no live broker adapter or 
   expect(serviceText).toContain("'paper'");
   expect(serviceText).not.toMatch(/fetch\s*\(|https?:\/\/[^\s'"`]+|liveBroker|brokerAdapter|LIVE_TRADING/i);
   expect(Object.keys(packageJson.exports).some((key) => /live|broker/i.test(key))).toBe(false);
+  expect(investManifest.permissions).toContain('invest:signal:consume');
+  expect(investManifest.roleGrants.owner).toContain('invest:signal:consume');
+  expect(investManifest.roleGrants.admin).toContain('invest:signal:consume');
+  expect(investManifest.roleGrants.manager).not.toContain('invest:signal:consume');
+  expect(Object.values(investCapabilities).some((capability)=>capability.permission==='invest:signal:consume')).toBe(false);
 });
