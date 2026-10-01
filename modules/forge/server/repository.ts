@@ -2,7 +2,7 @@ import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
+import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
 import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
@@ -194,18 +194,33 @@ export class ForgeRepository {
     const { rows: sessions } = await this.store.query<Record<string, unknown> & { id: string; project_id: string; target_id: string; target_kind: string; created_at: string }>(this.scope(actor), 'SELECT id,project_id,target_id,target_kind,created_at FROM forge_councils ORDER BY created_at DESC');
     const output = [];
     for (const session of sessions) {
-      const { rows } = await this.store.query<Record<string, unknown> & { role: string; decision: string | null; finding_id: string | null; evidence_ids: unknown; evidence_source: string | null; submitted_by: string | null }>(this.scope(actor), 'SELECT a.role,d.decision,d.finding_id,d.evidence_ids,d.evidence_source,d.submitted_by FROM forge_council_assignments a LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.council_id=$3 ORDER BY a.role', [actor.tenantId, actor.workspaceId, session.id]);
-      const assignments = rows.map((row) => ({ role: row.role, status: row.decision ? 'submitted' : 'pending', decision: row.decision, findingId: row.finding_id, evidenceIds: row.evidence_ids ?? [], evidenceSource: row.evidence_source, submittedBy: row.submitted_by }));
+      const { rows } = await this.store.query<Record<string, unknown> & { role: string; reviewer_id: string | null; decision: string | null; finding_id: string | null; evidence_ids: unknown; evidence_source: string | null; submitted_by: string | null }>(this.scope(actor), 'SELECT a.role,re.reviewer_id,d.decision,d.finding_id,d.evidence_ids,d.evidence_source,d.submitted_by FROM forge_council_assignments a LEFT JOIN forge_council_reviewer_events re ON re.tenant_id=a.tenant_id AND re.workspace_id=a.workspace_id AND re.council_id=a.council_id AND re.role=a.role LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.council_id=$3 ORDER BY a.role', [actor.tenantId, actor.workspaceId, session.id]);
+      const assignments = rows.map((row) => ({ role: row.role, reviewerId: row.reviewer_id, status: row.decision ? 'submitted' : 'pending', decision: row.decision, findingId: row.finding_id, evidenceIds: row.evidence_ids ?? [], evidenceSource: row.evidence_source, submittedBy: row.submitted_by }));
       const submitted = assignments.filter((assignment) => assignment.status === 'submitted').length;
       output.push(ReviewCouncil.parse({ id: session.id, projectId: session.project_id, targetId: session.target_id, targetKind: session.target_kind, status: submitted === REVIEW_ROLES.length ? 'complete' : submitted ? 'in-review' : 'open', assignments, createdAt: timestamp(session.created_at) }));
     }
     return output;
   }
+  async assignCouncilReviewer(actor: ForgeActor, raw: unknown) {
+    const request = CouncilReviewerAssignment.parse(raw);
+    const council = (await this.councils(actor)).find((item) => item.id === request.councilId);
+    if (!council) throw new Error('FORGE_COUNCIL_NOT_FOUND');
+    const assignment = council.assignments.find((item) => item.role === request.role);
+    if (!assignment || assignment.status !== 'pending') throw new Error('FORGE_COUNCIL_ROLE_NOT_PENDING');
+    if (assignment.reviewerId) throw new Error('FORGE_COUNCIL_REVIEWER_ALREADY_ASSIGNED');
+    const duplicate = await this.store.query(this.scope(actor), 'SELECT 1 FROM forge_council_reviewer_events WHERE tenant_id=$1 AND workspace_id=$2 AND council_id=$3 AND reviewer_id=$4', [actor.tenantId, actor.workspaceId, request.councilId, request.reviewerId]);
+    if (duplicate.rows.length) throw new Error('FORGE_COUNCIL_REVIEWER_MUST_BE_DISTINCT_PER_ROLE');
+    await this.store.query(this.scope(actor), 'INSERT INTO forge_council_reviewer_events(id,tenant_id,workspace_id,council_id,role,reviewer_id,assigned_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uuidv7(), actor.tenantId, actor.workspaceId, request.councilId, request.role, request.reviewerId, actor.id]);
+    return (await this.councils(actor)).find((item) => item.id === request.councilId);
+  }
   async submitCouncilDecision(actor: ForgeActor, raw: unknown) {
     const request = CouncilSubmitRequest.parse(raw);
     const council = (await this.councils(actor)).find((item) => item.id === request.councilId);
     if (!council) throw new Error('FORGE_COUNCIL_NOT_FOUND');
-    if (council.assignments.find((item) => item.role === request.role)?.status !== 'pending') throw new Error('FORGE_COUNCIL_ROLE_ALREADY_SUBMITTED');
+    const assignment = council.assignments.find((item) => item.role === request.role);
+    if (assignment?.status !== 'pending') throw new Error('FORGE_COUNCIL_ROLE_ALREADY_SUBMITTED');
+    if (!assignment.reviewerId) throw new Error('FORGE_COUNCIL_REVIEWER_ASSIGNMENT_REQUIRED');
+    if (assignment.reviewerId !== actor.id) throw new Error('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
     if (request.decision === 'findings' && (!request.findingId || request.evidenceIds.length === 0)) throw new Error('FORGE_COUNCIL_FINDING_EVIDENCE_REQUIRED');
     if (request.decision === 'no-findings' && request.findingId) throw new Error('FORGE_COUNCIL_NO_FINDINGS_HAS_FINDING');
     const ids = [...new Set(request.evidenceIds)];
@@ -360,6 +375,28 @@ export class ForgeRepository {
     for (const gate of evaluation.gates) await this.store.query(this.scope(actor), 'INSERT INTO forge_gates(id,tenant_id,workspace_id,requirement_id,kind,status,hard,evidence_ids,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)', [`${uuidv7()}:${gate.id}`, actor.tenantId, actor.workspaceId, gate.requirementId, gate.kind, gate.status, gate.hard, json(gate.evidenceIds), actor.id]);
     return evaluation;
   }
+  async riskAcceptances(actor: ForgeActor) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; gate_id: string; requirement_id: string; reason: string; impact: string; mitigation: string; review_at: string; requested_by: string; created_at: string; decision: 'approved'|'rejected'|null; decision_reason: string|null; decided_by: string|null; decided_at: string|null }>(this.scope(actor), 'SELECT r.id,r.gate_id,r.requirement_id,r.reason,r.impact,r.mitigation,r.review_at,r.requested_by,r.created_at,d.decision,d.reason AS decision_reason,d.decided_by,d.created_at AS decided_at FROM forge_risk_acceptances r LEFT JOIN forge_risk_acceptance_decisions d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.acceptance_id=r.id ORDER BY r.created_at DESC');
+    return rows.map((row) => RiskAcceptanceRecord.parse({ id: row.id, gateId: row.gate_id, requirementId: row.requirement_id, reason: row.reason, impact: row.impact, mitigation: row.mitigation, reviewAt: timestamp(row.review_at), requestedBy: row.requested_by, createdAt: timestamp(row.created_at), status: row.decision ?? 'pending', decisionReason: row.decision_reason, decidedBy: row.decided_by, decidedAt: row.decided_at ? timestamp(row.decided_at) : null }));
+  }
+  async requestRiskAcceptance(actor: ForgeActor, raw: unknown) {
+    const request = RiskAcceptanceRequest.parse(raw);
+    if (Date.parse(request.reviewAt) <= Date.now()) throw new Error('FORGE_RISK_ACCEPTANCE_REVIEW_DATE_MUST_BE_FUTURE');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_risk_acceptances(id,tenant_id,workspace_id,gate_id,requirement_id,reason,impact,mitigation,review_at,requested_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.gateId, request.requirementId, request.reason, request.impact, request.mitigation, request.reviewAt, actor.id]);
+    const record = (await this.riskAcceptances(actor)).find((item) => item.id === rows[0]?.id);
+    if (!record) throw new Error('FORGE_RISK_ACCEPTANCE_CREATE_FAILED');
+    return record;
+  }
+  async decideRiskAcceptance(actor: ForgeActor, raw: unknown) {
+    const request = RiskAcceptanceDecisionRequest.parse(raw);
+    const current = (await this.riskAcceptances(actor)).find((item) => item.id === request.acceptanceId);
+    if (!current) throw new Error('FORGE_RISK_ACCEPTANCE_NOT_FOUND');
+    if (current.status !== 'pending') throw new Error('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
+    if (request.decision === 'approved' && current.requestedBy === actor.id) throw new Error('FORGE_RISK_ACCEPTANCE_REQUIRES_INDEPENDENT_APPROVER');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_risk_acceptance_decisions(id,tenant_id,workspace_id,acceptance_id,decision,reason,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,workspace_id,acceptance_id) DO NOTHING RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.acceptanceId, request.decision, request.reason, actor.id]);
+    if (!rows.length) throw new Error('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
+    return (await this.riskAcceptances(actor)).find((item) => item.id === request.acceptanceId);
+  }
   async recordPromotion(actor: ForgeActor, promotion: { id: string; commitSha: string; from: string; to: string; state: string; evidenceIds: string[]; missingGateIds: string[]; approvalId: string | null; rollbackOf: string | null; workspaceId: string; createdAt: string }) {
     if (promotion.workspaceId !== actor.workspaceId) throw new Error('FORGE_PROMOTION_WORKSPACE_MISMATCH');
     await this.store.query(this.scope(actor), 'INSERT INTO forge_promotions(id,tenant_id,workspace_id,commit_sha,from_environment,to_environment,state,evidence_ids,missing_gate_ids,approval_id,rollback_of,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12)', [promotion.id, actor.tenantId, actor.workspaceId, promotion.commitSha, promotion.from, promotion.to, promotion.state, json(promotion.evidenceIds), json(promotion.missingGateIds), promotion.approvalId, promotion.rollbackOf, actor.id]);
@@ -372,11 +409,42 @@ export class ForgeRepository {
     if (known.rows.length !== ids.length) throw new Error('FORGE_PROMOTION_EVIDENCE_NOT_FOUND');
     const evidence = known.rows.map((row) => Evidence.parse({ id: row.id, workspaceId: row.workspace_id, requirementId: row.requirement_id, kind: row.kind, source: row.source, sha256: row.sha256, verifiedAt: timestamp(row.verified_at), deterministic: row.deterministic, result: row.result }));
     const gates = deriveGateMatrix(command.requirements, evidence).gates;
-    const promotion = Promotion.parse({ id: uuidv7(), workspaceId: actor.workspaceId, commitSha: command.commitSha, from: command.from, to: command.to, state: 'proposed', evidenceIds: command.evidenceIds, missingGateIds: [], approvalId: command.approvalId, rollbackOf: null, createdAt: new Date().toISOString() });
-    const { requestPromotion } = await import('./engine');
-    const proposal = requestPromotion(promotion, gates);
+    const promotion = Promotion.parse({ id: uuidv7(), workspaceId: actor.workspaceId, commitSha: command.commitSha, from: command.from, to: command.to, state: 'proposed', evidenceIds: command.evidenceIds, missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: new Date().toISOString() });
+    let proposal: z.infer<typeof Promotion>;
+    if (command.to === 'main') {
+      const missing = gates.filter((gate) => gate.hard && gate.status !== 'pass').map((gate) => gate.id);
+      if (missing.length) throw new Error(`PROMOTION_GATES_MISSING:${missing.join(',')}`);
+      proposal = promotion;
+    } else {
+      const { requestPromotion } = await import('./engine');
+      proposal = requestPromotion(promotion, gates);
+    }
     await this.recordPromotion(actor, proposal);
     return proposal;
+  }
+  async promotionApprovalRequests(actor: ForgeActor) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; promotion_id: string; commit_sha: string; from_environment: string; requested_by: string; created_at: string; decision: 'approved'|'rejected'|null; decision_reason: string|null; decided_by: string|null; decided_at: string|null }>(this.scope(actor), 'SELECT r.id,r.promotion_id,r.commit_sha,r.from_environment,r.requested_by,r.created_at,d.decision,d.reason AS decision_reason,d.decided_by,d.created_at AS decided_at FROM forge_promotion_approval_requests r LEFT JOIN forge_promotion_approval_decisions d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.request_id=r.id ORDER BY r.created_at DESC');
+    return rows.map((row) => PromotionApprovalRecord.parse({ id: row.id, promotionId: row.promotion_id, commitSha: row.commit_sha, from: row.from_environment, to: 'main', status: row.decision ?? 'pending', requestedBy: row.requested_by, decidedBy: row.decided_by, decisionReason: row.decision_reason, createdAt: timestamp(row.created_at), decidedAt: row.decided_at ? timestamp(row.decided_at) : null }));
+  }
+  async requestPromotionApproval(actor: ForgeActor, raw: unknown) {
+    const request = PromotionApprovalRequest.parse(raw);
+    const promotion = (await this.promotions(actor)).find((item) => item.id === request.promotionId);
+    if (!promotion || promotion.to !== 'main') throw new Error('FORGE_MAIN_PROMOTION_PROPOSAL_REQUIRED');
+    if (promotion.missingGateIds.length) throw new Error('FORGE_PROMOTION_HARD_GATES_MUST_PASS');
+    const id = uuidv7();
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_promotion_approval_requests(id,tenant_id,workspace_id,promotion_id,commit_sha,from_environment,to_environment,requested_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(tenant_id,workspace_id,promotion_id) DO NOTHING RETURNING id', [id, actor.tenantId, actor.workspaceId, promotion.id, promotion.commitSha, promotion.from, promotion.to, actor.id]);
+    if (!rows.length) throw new Error('FORGE_PROMOTION_APPROVAL_ALREADY_REQUESTED');
+    return (await this.promotionApprovalRequests(actor)).find((item) => item.id === id);
+  }
+  async decidePromotionApproval(actor: ForgeActor, raw: unknown) {
+    const request = PromotionApprovalDecisionRequest.parse(raw);
+    const current = (await this.promotionApprovalRequests(actor)).find((item) => item.id === request.requestId);
+    if (!current) throw new Error('FORGE_PROMOTION_APPROVAL_NOT_FOUND');
+    if (current.status !== 'pending') throw new Error('FORGE_PROMOTION_APPROVAL_ALREADY_DECIDED');
+    if (request.decision === 'approved' && current.requestedBy === actor.id) throw new Error('FORGE_PROMOTION_APPROVAL_REQUIRES_INDEPENDENT_APPROVER');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_promotion_approval_decisions(id,tenant_id,workspace_id,request_id,decision,reason,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,workspace_id,request_id) DO NOTHING RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.requestId, request.decision, request.reason, actor.id]);
+    if (!rows.length) throw new Error('FORGE_PROMOTION_APPROVAL_ALREADY_DECIDED');
+    return (await this.promotionApprovalRequests(actor)).find((item) => item.id === request.requestId);
   }
   async promotions(actor: ForgeActor) {
     const { rows } = await this.store.query<Record<string, unknown> & { id: string; workspace_id: string; commit_sha: string; from_environment: string; to_environment: string; state: string; evidence_ids: unknown; missing_gate_ids: unknown; approval_id: string | null; rollback_of: string | null; created_at: string }>(this.scope(actor), 'SELECT id,workspace_id,commit_sha,from_environment,to_environment,state,evidence_ids,missing_gate_ids,approval_id,rollback_of,created_at FROM forge_promotions ORDER BY created_at DESC');

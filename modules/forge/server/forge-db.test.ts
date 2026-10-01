@@ -66,6 +66,8 @@ describe('Forge schema and workspace isolation', () => {
     const epic = await forge.createNode(actorA, project.id, { parentId: null, kind: 'epic', title: 'Bounded epic', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
     expect((await forge.nodes(actorA, project.id)).map((node) => node.id)).toContain(epic.id);
     expect((await forge.updateNode(actorA, { nodeId: epic.id, title: 'Updated epic' })).title).toBe('Updated epic');
+    const detailedEpic = await forge.updateNode(actorA, { nodeId: epic.id, description: 'Scope and outcome', requirements: [{ id: 'FRG-CRUD', statement: 'Edit planning details' }], acceptanceCriteria: ['Reviewable result'], dependencies: [] });
+    expect(detailedEpic).toMatchObject({ description: 'Scope and outcome', requirements: [{ id: 'FRG-CRUD', statement: 'Edit planning details' }], acceptanceCriteria: ['Reviewable result'], dependencies: [] });
     await expect(forge.requestApproval(actorA, { epicId: epic.id })).rejects.toThrow('FORGE_EPIC_MUST_BE_PROPOSED');
     await forge.updateNode(actorA, { nodeId: epic.id, state: 'proposed' });
     const request = await forge.requestApproval(actorA, { epicId: epic.id });
@@ -106,11 +108,24 @@ describe('Forge schema and workspace isolation', () => {
     expect(context.items.map((item) => item.type)).toEqual(expect.arrayContaining(['objective','requirement','architecture','decision','dependency','source','constraint','acceptance','prior-evidence']));
     expect(context.items.find((item) => item.type === 'source')?.text).toContain('approved local source contents');
     expect(context.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
+    const riskRequest = await forge.requestRiskAcceptance(actorA, { gateId: 'req:XIO-REQ-FRG-008', requirementId: 'XIO-REQ-FRG-008', reason: 'Temporary accepted residual risk', impact: 'Limited rollback window', mitigation: 'Review after follow-up tests', reviewAt: new Date(Date.now() + 86_400_000).toISOString() });
+    await expect(forge.decideRiskAcceptance(actorA, { acceptanceId: riskRequest.id, decision: 'approved', reason: 'Self approval' })).rejects.toThrow('FORGE_RISK_ACCEPTANCE_REQUIRES_INDEPENDENT_APPROVER');
+    const secondActor = { id: '019a0000-0000-7000-8000-000000000023', tenantId: tenantA, workspaceId: workspaceA };
+    expect((await forge.decideRiskAcceptance(secondActor, { acceptanceId: riskRequest.id, decision: 'approved', reason: 'Reviewed mitigation and follow-up' }))?.status).toBe('approved');
+    await expect(forge.decideRiskAcceptance(secondActor, { acceptanceId: riskRequest.id, decision: 'rejected', reason: 'Conflicting second decision' })).rejects.toThrow('FORGE_RISK_ACCEPTANCE_ALREADY_DECIDED');
     expect((await forge.gateMatrix(actorA, { requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] })).overall).toBe('pass');
     const proposal = await forge.requestPromotionRecord(actorA, { commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', evidenceIds: [evidenceRecord.id], requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] });
     expect(proposal).toMatchObject({ state: 'proposed', evidenceIds: [evidenceRecord.id], missingGateIds: [] });
     expect((await forge.promotions(actorA)).map((item) => item.id)).toContain(proposal.id);
     await expect(forge.requestPromotionRecord(actorA, { commitSha: 'd'.repeat(40), from: 'develop', to: 'staging', evidenceIds: ['019a0000-0000-7000-8000-000000000099'], requirements: [] })).rejects.toThrow('FORGE_PROMOTION_EVIDENCE_NOT_FOUND');
+    const mainProposal = await forge.requestPromotionRecord(actorA, { commitSha: 'e'.repeat(40), from: 'staging', to: 'main', evidenceIds: [evidenceRecord.id], requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'low', evidenceIds: [evidenceRecord.id] }], approvalId: '019a0000-0000-7000-8000-000000000099' });
+    expect(mainProposal.approvalId).toBeNull();
+    const mainRequest = await forge.requestPromotionApproval(actorA, { promotionId: mainProposal.id });
+    if (!mainRequest) throw new Error('main promotion approval request missing');
+    await expect(forge.decidePromotionApproval(actorA, { requestId: mainRequest.id, decision: 'approved', reason: 'Self approve attempt' })).rejects.toThrow('FORGE_PROMOTION_APPROVAL_REQUIRES_INDEPENDENT_APPROVER');
+    await expect(forge.requestPromotionApproval(actorA, { promotionId: mainProposal.id })).rejects.toThrow('FORGE_PROMOTION_APPROVAL_ALREADY_REQUESTED');
+    const approvedMainRequest = await forge.decidePromotionApproval(secondActor, { requestId: mainRequest.id, decision: 'approved', reason: 'Reviewed exact commit evidence and scope' });
+    expect(approvedMainRequest).toMatchObject({ status: 'approved', commitSha: 'e'.repeat(40), to: 'main' });
     const finding = await forge.createFindingRecord(actorA, { role: 'security', state: 'open', severity: 'medium', title: 'Review finding', evidenceIds: [evidenceRecord.id], affectedRequirements: ['XIO-REQ-FRG-007'], confidence: 0.8, reproduction: 'Repro in fixture', remediation: 'Address issue', revalidation: 'Rerun suite' });
     expect((await forge.transitionFindingRecord(actorA, { findingId: finding.id, state: 'triaged', detail: 'Assigned' })).state).toBe('triaged');
     const council = await forge.startCouncil(actorA, { projectId: project.id, targetId: epic.id, targetKind: 'epic' });
@@ -118,10 +133,19 @@ describe('Forge schema and workspace isolation', () => {
     expect(council?.status).toBe('open');
     const firstRole = council?.assignments[0]?.role;
     if (!council || !firstRole) throw new Error('test council assignment missing');
-    const partialCouncil = await forge.submitCouncilDecision(actorA, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] });
+    await expect(forge.submitCouncilDecision(actorA, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] })).rejects.toThrow('FORGE_COUNCIL_REVIEWER_ASSIGNMENT_REQUIRED');
+    await forge.assignCouncilReviewer(actorA, { councilId: council.id, role: firstRole, reviewerId: secondActor.id });
+    await expect(forge.assignCouncilReviewer(actorA, { councilId: council.id, role: council.assignments[1]!.role, reviewerId: secondActor.id })).rejects.toThrow('FORGE_COUNCIL_REVIEWER_MUST_BE_DISTINCT_PER_ROLE');
+    await expect(forge.submitCouncilDecision(actorA, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] })).rejects.toThrow('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+    const partialCouncil = await forge.submitCouncilDecision(secondActor, { councilId: council.id, role: firstRole, decision: 'findings', findingId: finding.id, evidenceIds: [evidenceRecord.id] });
     expect(partialCouncil.status).toBe('in-review');
-    expect(partialCouncil.assignments.find((item) => item.role === firstRole)).toMatchObject({ status: 'submitted', evidenceSource: 'user-submitted', submittedBy: actor });
-    for (const assignment of partialCouncil.assignments.filter((item) => item.status === 'pending')) await forge.submitCouncilDecision(actorA, { councilId: council.id, role: assignment.role, decision: 'no-findings', findingId: null, evidenceIds: [] });
+    expect(partialCouncil.assignments.find((item) => item.role === firstRole)).toMatchObject({ status: 'submitted', reviewerId: secondActor.id, evidenceSource: 'user-submitted', submittedBy: secondActor.id });
+    let reviewerSequence = 24;
+    for (const assignment of partialCouncil.assignments.filter((item) => item.status === 'pending')) {
+      const reviewerId = `019a0000-0000-7000-8000-${String(reviewerSequence++).padStart(12, '0')}`;
+      await forge.assignCouncilReviewer(actorA, { councilId: council.id, role: assignment.role, reviewerId });
+      await forge.submitCouncilDecision({ id: reviewerId, tenantId: tenantA, workspaceId: workspaceA }, { councilId: council.id, role: assignment.role, decision: 'no-findings', findingId: null, evidenceIds: [] });
+    }
     expect((await forge.councils(actorA)).find((item) => item.id === council.id)?.status).toBe('complete');
     expect(await forge.councils({ id: actor, tenantId: tenantB, workspaceId: workspaceB })).toEqual([]);
     const plannerInput = { epicId: epic.id, approval: approvedRequest, config: { maxConcurrency: 1, maxBudgetUsd: 10, resourceLocks: [], substrateVerified: false, externalAdaptersEnabled: false }, tickets: await forge.nodes(actorA, project.id), spentUsd: 0, killSwitchEngaged: false };
