@@ -6,6 +6,7 @@ export * from './state-machine';
 export * from './repository';
 
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
+import type { PreparedReviewResultSink } from '@xyra/agent-core';
 import type { ForgeRepository } from './repository';
 import { forgeCapabilities } from '../contracts';
 import { planSchedule, rollbackPromotion } from './engine';
@@ -105,6 +106,7 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.startCouncil, (input, call) => requireRepository(repository).startCouncil(actor(call), forgeCapabilities.startCouncil.input.parse(input)));
     bus.register(manifest, forgeCapabilities.assignCouncilReviewer, (input, call) => requireRepository(repository).assignCouncilReviewer(actor(call), forgeCapabilities.assignCouncilReviewer.input.parse(input)));
     bus.register(manifest, forgeCapabilities.councils, (_input, call) => requireRepository(repository).councils(actor(call)));
+    bus.register(manifest, forgeCapabilities.reviewDrafts, (_input, call) => requireRepository(repository).councilReviewDrafts(actor(call)));
     bus.register(manifest, forgeCapabilities.submitCouncilDecision, (input, call) => requireRepository(repository).submitCouncilDecision(actor(call), forgeCapabilities.submitCouncilDecision.input.parse(input)));
     bus.register(manifest, forgeCapabilities.escalations, (_input, call) => requireRepository(repository).escalations(actor(call)));
     bus.register(manifest, forgeCapabilities.resolveEscalation, (input, call) => requireRepository(repository).resolveEscalation(actor(call), forgeCapabilities.resolveEscalation.input.parse(input)));
@@ -113,6 +115,11 @@ const ForgeRegistration = {
 
 export function createForgeServer(repository: ForgeRepository): ForgeModuleServer {
   return { id: ForgeRegistration.id, capabilities: ForgeRegistration.capabilities, register: (bus, manifest) => registerForge(bus, manifest, repository) };
+}
+
+/** Server-only injection for SwarmRunQueueService.deliverPendingReviewResult. */
+export function createForgePreparedReviewResultSink(repository: ForgeRepository): PreparedReviewResultSink {
+  return { persist: (result) => repository.persistPreparedCouncilReviewDraft(result) };
 }
 
 const ForgeServer: ForgeModuleServer = {

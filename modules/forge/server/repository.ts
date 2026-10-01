@@ -1,8 +1,10 @@
 import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
+import { AgentRunAdmissionRequest, PreparedReviewBinding, parseReviewResultDraft, type PreparedAgentRunResult, type PreparedReviewBinding as PreparedReviewBindingType } from '@xyra/agent-core';
+import { hashApprovalInput, hashApprovalScope, VerifiedCapabilityApproval } from '@xyra/contracts';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, Gate, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceDecisionRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
+import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilReviewDraft, CouncilReviewerAssignment, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, Gate, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, ReviewRole, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceDecisionRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix, evaluateGates } from './engine';
 import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
@@ -247,12 +249,118 @@ export class ForgeRepository {
     const { rows: sessions } = await this.store.query<Record<string, unknown> & { id: string; project_id: string; target_id: string; target_kind: string; created_at: string }>(this.scope(actor), 'SELECT id,project_id,target_id,target_kind,created_at FROM forge_councils ORDER BY created_at DESC');
     const output = [];
     for (const session of sessions) {
-      const { rows } = await this.store.query<Record<string, unknown> & { role: string; reviewer_id: string | null; decision: string | null; finding_id: string | null; evidence_ids: unknown; evidence_source: string | null; submitted_by: string | null }>(this.scope(actor), 'SELECT a.role,re.reviewer_id,d.decision,d.finding_id,d.evidence_ids,d.evidence_source,d.submitted_by FROM forge_council_assignments a LEFT JOIN forge_council_reviewer_events re ON re.tenant_id=a.tenant_id AND re.workspace_id=a.workspace_id AND re.council_id=a.council_id AND re.role=a.role LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.council_id=$3 ORDER BY a.role', [actor.tenantId, actor.workspaceId, session.id]);
-      const assignments = rows.map((row) => ({ role: row.role, reviewerId: row.reviewer_id, status: row.decision ? 'submitted' : 'pending', decision: row.decision, findingId: row.finding_id, evidenceIds: row.evidence_ids ?? [], evidenceSource: row.evidence_source, submittedBy: row.submitted_by }));
+      const { rows } = await this.store.query<Record<string, unknown> & { assignment_id: string; role: string; reviewer_id: string | null; decision: string | null; finding_id: string | null; evidence_ids: unknown; evidence_source: string | null; submitted_by: string | null }>(this.scope(actor), 'SELECT a.id AS assignment_id,a.role,re.reviewer_id,d.decision,d.finding_id,d.evidence_ids,d.evidence_source,d.submitted_by FROM forge_council_assignments a LEFT JOIN forge_council_reviewer_events re ON re.tenant_id=a.tenant_id AND re.workspace_id=a.workspace_id AND re.council_id=a.council_id AND re.role=a.role LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE a.tenant_id=$1 AND a.workspace_id=$2 AND a.council_id=$3 ORDER BY a.role', [actor.tenantId, actor.workspaceId, session.id]);
+      const assignments = rows.map((row) => ({ assignmentId: row.assignment_id, role: row.role, reviewerId: row.reviewer_id, status: row.decision ? 'submitted' : 'pending', decision: row.decision, findingId: row.finding_id, evidenceIds: row.evidence_ids ?? [], evidenceSource: row.evidence_source, submittedBy: row.submitted_by }));
       const submitted = assignments.filter((assignment) => assignment.status === 'submitted').length;
       output.push(ReviewCouncil.parse({ id: session.id, projectId: session.project_id, targetId: session.target_id, targetKind: session.target_kind, status: submitted === REVIEW_ROLES.length ? 'complete' : submitted ? 'in-review' : 'open', assignments, createdAt: timestamp(session.created_at) }));
     }
     return output;
+  }
+  /** Server-only host seam. Call after resolving a reviewer assignment and before SWARM admission. */
+  async pinCouncilReviewBinding(actor: ForgeActor, raw: PreparedReviewBindingType) {
+    const binding = PreparedReviewBinding.parse(raw);
+    ReviewRole.parse(binding.role);
+    if (actor.id !== binding.reviewerPrincipalId) throw new Error('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+    const bindingSha256 = await hashApprovalInput(binding);
+    const scope = this.scope(actor);
+    const pinned = await this.store.withServerScope(scope, 'forge_review_result', undefined, async (tx) => {
+      const assignment = await tx.query<Record<string, unknown> & { target_id: string; reviewer_id: string | null; decision_id: string | null }>(
+        'SELECT c.target_id,re.reviewer_id,d.id AS decision_id FROM forge_councils c JOIN forge_council_assignments a ON a.tenant_id=c.tenant_id AND a.workspace_id=c.workspace_id AND a.council_id=c.id LEFT JOIN forge_council_reviewer_events re ON re.tenant_id=a.tenant_id AND re.workspace_id=a.workspace_id AND re.council_id=a.council_id AND re.role=a.role LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE c.tenant_id=$1 AND c.workspace_id=$2 AND c.id=$3 AND a.id=$4 AND a.role=$5',
+        [actor.tenantId, actor.workspaceId, binding.councilId, binding.assignmentId, binding.role]);
+      const row = assignment.rows[0];
+      if (!row || row.target_id !== binding.targetId) throw new Error('FORGE_COUNCIL_REVIEW_BINDING_SUBJECT_MISMATCH');
+      if (row.reviewer_id !== actor.id) throw new Error('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+      if (row.decision_id) throw new Error('FORGE_COUNCIL_ROLE_ALREADY_SUBMITTED');
+      const existing = await tx.query<Record<string, unknown> & { id: string; binding_sha256: string }>(
+        'SELECT id,binding_sha256 FROM forge_council_review_bindings WHERE tenant_id=$1 AND workspace_id=$2 AND council_id=$3 AND role=$4',
+        [actor.tenantId, actor.workspaceId, binding.councilId, binding.role]);
+      if (existing.rows[0]) {
+        if (existing.rows[0].binding_sha256 !== bindingSha256) throw new Error('FORGE_COUNCIL_REVIEW_BINDING_IMMUTABLE');
+        return existing.rows[0].id;
+      }
+      const id = uuidv7();
+      await tx.query('INSERT INTO forge_council_review_bindings(id,tenant_id,workspace_id,council_id,assignment_id,role,target_id,reviewer_principal_id,repository_id,review_contract_id,review_contract_sha256,subject_commit_sha,artifacts,binding_sha256,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15)',
+        [id, actor.tenantId, actor.workspaceId, binding.councilId, binding.assignmentId, binding.role, binding.targetId, binding.reviewerPrincipalId, binding.repositoryId, binding.reviewContractId, binding.reviewContractSha256, binding.subjectCommitSha, json(binding.artifacts), bindingSha256, actor.id]);
+      return id;
+    });
+    return { id: pinned, bindingSha256 };
+  }
+  /** Trusted sink callback for completed SWARM runs. Drafts are immutable, partial evidence and never council decisions. */
+  async persistPreparedCouncilReviewDraft(envelope: PreparedAgentRunResult): Promise<{ evidenceIds: readonly string[] }> {
+    const { binding, actor, draft } = await this.validatePreparedCouncilReviewEnvelope(envelope);
+    const scope = this.scope(actor);
+    const result = await this.store.withServerScope(scope, 'forge_review_result', undefined, async (tx) => {
+      const assignment = await tx.query<Record<string, unknown> & { target_id: string; reviewer_id: string | null; decision_id: string | null }>(
+        'SELECT c.target_id,re.reviewer_id,d.id AS decision_id FROM forge_councils c JOIN forge_council_assignments a ON a.tenant_id=c.tenant_id AND a.workspace_id=c.workspace_id AND a.council_id=c.id LEFT JOIN forge_council_reviewer_events re ON re.tenant_id=a.tenant_id AND re.workspace_id=a.workspace_id AND re.council_id=a.council_id AND re.role=a.role LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE c.tenant_id=$1 AND c.workspace_id=$2 AND c.id=$3 AND a.id=$4 AND a.role=$5',
+        [actor.tenantId, actor.workspaceId, binding.councilId, binding.assignmentId, binding.role]);
+      const assignmentRow = assignment.rows[0];
+      if (!assignmentRow || assignmentRow.target_id !== binding.targetId) throw new Error('FORGE_COUNCIL_REVIEW_BINDING_SUBJECT_MISMATCH');
+      if (assignmentRow.reviewer_id !== actor.id) throw new Error('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+      if (assignmentRow.decision_id) throw new Error('FORGE_COUNCIL_ROLE_ALREADY_SUBMITTED');
+      const pinned = await tx.query<Record<string, unknown> & { id: string; binding_sha256: string }>(
+        'SELECT id,binding_sha256 FROM forge_council_review_bindings WHERE tenant_id=$1 AND workspace_id=$2 AND council_id=$3 AND assignment_id=$4 AND role=$5 AND reviewer_principal_id=$6',
+        [actor.tenantId, actor.workspaceId, binding.councilId, binding.assignmentId, binding.role, actor.id]);
+      if (!pinned.rows[0] || pinned.rows[0].binding_sha256 !== await hashApprovalInput(binding)) throw new Error('FORGE_COUNCIL_REVIEW_BINDING_MISMATCH');
+      const existing = await tx.query<Record<string, unknown> & { output_digest: string; binding_sha256: string; evidence_ids: unknown }>(
+        'SELECT output_digest,binding_sha256,evidence_ids FROM forge_council_review_drafts WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3',
+        [actor.tenantId, actor.workspaceId, envelope.runId]);
+      if (existing.rows[0]) {
+        if (existing.rows[0].output_digest !== envelope.outputDigest || existing.rows[0].binding_sha256 !== pinned.rows[0].binding_sha256) throw new Error('FORGE_COUNCIL_REVIEW_RUN_IDEMPOTENCY_CONFLICT');
+        return parseUuidArray(existing.rows[0].evidence_ids);
+      }
+      const now = new Date().toISOString();
+      const evidenceId = uuidv7();
+      const draftId = uuidv7();
+      const requirementId = 'XIO-REQ-FRG-007';
+      await tx.query('INSERT INTO forge_evidence(id,tenant_id,workspace_id,requirement_id,kind,source,sha256,deterministic,result,verified_at,created_by,metadata) VALUES($1,$2,$3,$4,\'review\',$5,$6,false,\'partial\',$7,$8,$9::jsonb)',
+        [evidenceId, actor.tenantId, actor.workspaceId, requirementId, `swarm-review-draft:${envelope.runId}`, envelope.outputDigest, now, actor.id,
+          json({ status: 'awaiting-validation', decisionDraft: draft.decision, councilId: binding.councilId, assignmentId: binding.assignmentId, role: binding.role, subjectCommitSha: binding.subjectCommitSha, repositoryId: binding.repositoryId, reviewContractId: binding.reviewContractId, reviewContractSha256: binding.reviewContractSha256, artifacts: binding.artifacts })]);
+      await tx.query('INSERT INTO forge_council_review_drafts(id,tenant_id,workspace_id,council_id,assignment_id,role,run_id,reviewer_principal_id,target_id,repository_id,review_contract_id,review_contract_sha256,subject_commit_sha,artifacts,binding_sha256,output_digest,decision,summary,findings,evidence_ids,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19::jsonb,$20::jsonb,$8)',
+        [draftId, actor.tenantId, actor.workspaceId, binding.councilId, binding.assignmentId, binding.role, envelope.runId, actor.id, binding.targetId, binding.repositoryId, binding.reviewContractId, binding.reviewContractSha256, binding.subjectCommitSha, json(binding.artifacts), pinned.rows[0].binding_sha256, envelope.outputDigest, draft.decision, draft.summary, json(draft.findings), json([evidenceId])]);
+      await tx.query('INSERT INTO forge_council_review_draft_evidence(tenant_id,workspace_id,draft_id,evidence_id,created_by) VALUES($1,$2,$3,$4,$5)', [actor.tenantId, actor.workspaceId, draftId, evidenceId, actor.id]);
+      return [evidenceId];
+    });
+    return { evidenceIds: result };
+  }
+  async councilReviewDrafts(actor: ForgeActor) {
+    const { rows } = await this.store.withServerScope(this.scope(actor), 'forge_review_result', undefined, (tx) => tx.query<Record<string, unknown> & { id: string; council_id: string; assignment_id: string; target_id: string; role: string; reviewer_principal_id: string; run_id: string; repository_id: string; review_contract_id: string; review_contract_sha256: string; subject_commit_sha: string; artifacts: unknown; output_digest: string; decision: string; summary: string; findings: unknown; evidence_ids: unknown; created_at: string }>('SELECT id,council_id,assignment_id,target_id,role,reviewer_principal_id,run_id,repository_id,review_contract_id,review_contract_sha256,subject_commit_sha,artifacts,output_digest,decision,summary,findings,evidence_ids,created_at FROM forge_council_review_drafts ORDER BY created_at DESC'));
+    return rows.map((row) => CouncilReviewDraft.parse({ id: row.id, councilId: row.council_id, assignmentId: row.assignment_id, targetId: row.target_id, role: row.role, reviewerPrincipalId: row.reviewer_principal_id, runId: row.run_id, repositoryId: row.repository_id, reviewContractId: row.review_contract_id, reviewContractSha256: row.review_contract_sha256, subjectCommitSha: row.subject_commit_sha, artifacts: row.artifacts, outputDigest: row.output_digest, decision: row.decision, summary: row.summary, findings: row.findings, evidenceIds: row.evidence_ids, createdAt: timestamp(row.created_at) }));
+  }
+  private async validatePreparedCouncilReviewEnvelope(envelope: PreparedAgentRunResult) {
+    if (envelope.result.runId !== envelope.runId || envelope.result.termination !== 'COMPLETED') throw new Error('FORGE_COUNCIL_REVIEW_RUN_NOT_COMPLETED');
+    const authority = envelope.authority;
+    const actor: ForgeActor = { id: authority.principalId, tenantId: authority.tenantId, workspaceId: authority.workspaceId };
+    const binding = PreparedReviewBinding.parse(authority.reviewBinding);
+    ReviewRole.parse(binding.role);
+    if (binding.reviewerPrincipalId !== actor.id) throw new Error('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+    const approvedInput = AgentRunAdmissionRequest.parse(authority.approvedInput);
+    const approval = VerifiedCapabilityApproval.parse(authority.verifiedApproval);
+    if (approvedInput.runId !== envelope.runId || !approvedInput.review || approvedInput.review.councilId !== binding.councilId ||
+      approvedInput.review.assignmentId !== binding.assignmentId || approvedInput.review.role !== binding.role) throw new Error('FORGE_COUNCIL_REVIEW_APPROVED_INPUT_MISMATCH');
+    if (approval.capabilityId !== 'swarm.runs.enqueue' || approval.principalId !== actor.id || approval.tenantId !== actor.tenantId ||
+      approval.workspaceId !== actor.workspaceId || Date.parse(approval.expiresAt) <= Date.now() ||
+      approval.inputDigest !== await hashApprovalInput(approvedInput)) throw new Error('FORGE_COUNCIL_REVIEW_APPROVAL_INVALID');
+    const { scopeHash, ...scopeBinding } = approval;
+    if (scopeHash !== await hashApprovalScope(scopeBinding)) throw new Error('FORGE_COUNCIL_REVIEW_APPROVAL_INVALID');
+    const output = envelope.result.output;
+    if (typeof output !== 'string' || envelope.outputDigest !== await hashApprovalInput(output)) throw new Error('FORGE_COUNCIL_REVIEW_OUTPUT_DIGEST_INVALID');
+    if (envelope.artifactDigests.length !== envelope.result.artifacts.length) throw new Error('FORGE_COUNCIL_REVIEW_ARTIFACT_DIGEST_INVALID');
+    for (let index = 0; index < envelope.result.artifacts.length; index += 1) {
+      const artifact = envelope.result.artifacts[index];
+      const digest = envelope.artifactDigests[index];
+      if (!artifact || !digest || artifact.id !== digest.id || digest.sha256 !== await hashApprovalInput(artifact.content)) throw new Error('FORGE_COUNCIL_REVIEW_ARTIFACT_DIGEST_INVALID');
+    }
+    let parsedOutput: unknown;
+    try { parsedOutput = JSON.parse(output) as unknown; } catch { throw new Error('FORGE_COUNCIL_REVIEW_DRAFT_INVALID'); }
+    const draft = parseReviewResultDraft(parsedOutput, binding);
+    const assignment = await this.store.query<Record<string, unknown> & { target_id: string; target_kind: string; reviewer_id: string | null; decision_id: string | null }>(this.scope(actor),
+      'SELECT c.target_id,c.target_kind,re.reviewer_id,d.id AS decision_id FROM forge_councils c JOIN forge_council_assignments a ON a.tenant_id=c.tenant_id AND a.workspace_id=c.workspace_id AND a.council_id=c.id LEFT JOIN forge_council_reviewer_events re ON re.tenant_id=a.tenant_id AND re.workspace_id=a.workspace_id AND re.council_id=a.council_id AND re.role=a.role LEFT JOIN forge_council_decisions d ON d.tenant_id=a.tenant_id AND d.workspace_id=a.workspace_id AND d.council_id=a.council_id AND d.role=a.role WHERE c.tenant_id=$1 AND c.workspace_id=$2 AND c.id=$3 AND a.id=$4 AND a.role=$5',
+      [actor.tenantId, actor.workspaceId, binding.councilId, binding.assignmentId, binding.role]);
+    const row = assignment.rows[0];
+    if (!row || row.target_id !== binding.targetId) throw new Error('FORGE_COUNCIL_REVIEW_BINDING_SUBJECT_MISMATCH');
+    if (row.reviewer_id !== actor.id) throw new Error('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+    if (row.decision_id) throw new Error('FORGE_COUNCIL_ROLE_ALREADY_SUBMITTED');
+    return { binding, actor, draft };
   }
   async assignCouncilReviewer(actor: ForgeActor, raw: unknown) {
     const request = CouncilReviewerAssignment.parse(raw);
@@ -564,4 +672,12 @@ export class ForgeRepository {
     await this.store.query(this.scope(actor), 'UPDATE forge_nodes SET state=$4,updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3', [actor.tenantId, actor.workspaceId, current.epic_id, nextState]);
     return ApprovalRecord.parse({ id: current.id, epicId: current.epic_id, workspaceId: current.workspace_id, scopeHash: current.scope_hash, status: raw.decision, approvedBy: raw.decision === 'approved' ? actor.id : null, createdAt: timestamp(current.created_at), expiresAt: timestamp(current.expires_at) });
   }
+}
+
+function parseUuidArray(value: unknown): string[] {
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    try { parsed = JSON.parse(parsed) as unknown; } catch { return []; }
+  }
+  return Array.isArray(parsed) ? parsed.map((item) => z.uuid().parse(item)) : [];
 }

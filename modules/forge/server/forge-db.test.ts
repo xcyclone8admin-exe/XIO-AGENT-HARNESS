@@ -1,6 +1,8 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { uuidv7 } from '@xyra/core';
+import type { PreparedAgentRunResult } from '@xyra/agent-core';
+import { hashApprovalInput, hashApprovalScope } from '@xyra/contracts';
 import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole, type Migration } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -262,5 +264,44 @@ describe('Forge schema and workspace isolation', () => {
     expect((await scoped.query(scopeA, 'SELECT id FROM forge_node_archive_events WHERE node_id=$1', [secondTicket.id])).rows).toHaveLength(1);
     expect((await scoped.query(scopeB, 'SELECT id FROM forge_nodes WHERE project_id=$1', [project.id])).rows).toEqual([]);
     expect((await call<{ id: string }[]>('forge.nodes.list', { projectId: project.id })).map((node) => node.id)).toEqual(expect.arrayContaining([epic.id, spec.id, plan.id, wave.id, firstTicket.id, secondTicket.id, subtask.id]));
+  });
+
+  it('persists authenticated review output as an immutable unverified draft without completing the council role', async () => {
+    const owner = { id: actor, tenantId: tenantA, workspaceId: workspaceA };
+    const reviewer = { id: '019a0000-0000-7000-8000-000000000088', tenantId: tenantA, workspaceId: workspaceA };
+    const project = await forge.createProject(owner, { name: 'Review receipt project', description: '', requirements: [] });
+    const epic = await forge.createNode(owner, project.id, { parentId: null, kind: 'epic', title: 'Review subject', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    const council = await forge.startCouncil(owner, { projectId: project.id, targetId: epic.id, targetKind: 'epic' });
+    if (!council) throw new Error('council creation failed');
+    const assignment = council.assignments[0];
+    if (!assignment) throw new Error('council assignment missing');
+    await forge.assignCouncilReviewer(owner, { councilId: council.id, role: assignment.role, reviewerId: reviewer.id });
+    const binding = { councilId: council.id, assignmentId: assignment.assignmentId, targetId: epic.id, repositoryId: 'xyra/forge', reviewContractId: 'wp-forge-cycle-3', reviewContractSha256: 'a'.repeat(64), role: assignment.role, reviewerPrincipalId: reviewer.id, subjectCommitSha: 'b'.repeat(40), artifacts: [] };
+    await expect(forge.pinCouncilReviewBinding(owner, binding)).rejects.toThrow('FORGE_COUNCIL_REVIEWER_IDENTITY_MISMATCH');
+    const pin = await forge.pinCouncilReviewBinding(reviewer, binding);
+    expect(await forge.pinCouncilReviewBinding(reviewer, binding)).toEqual(pin);
+    await expect(forge.pinCouncilReviewBinding(reviewer, { ...binding, subjectCommitSha: 'c'.repeat(40) })).rejects.toThrow('FORGE_COUNCIL_REVIEW_BINDING_IMMUTABLE');
+    const runId = uuidv7();
+    const approvedInput = { runId, profileId: uuidv7(), prompt: 'Review the pinned Forge subject.', review: { councilId: council.id, assignmentId: assignment.assignmentId, role: assignment.role } };
+    const approvalBinding = { version: 1 as const, approvalId: uuidv7(), decisionId: uuidv7(), tenantId: tenantA, workspaceId: workspaceA, principalId: reviewer.id, requestedBy: actor, approverId: actor, capabilityId: 'swarm.runs.enqueue', inputDigest: await hashApprovalInput(approvedInput), issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    const verifiedApproval = { ...approvalBinding, scopeHash: await hashApprovalScope(approvalBinding) };
+    const output = JSON.stringify({ schemaVersion: 1, decision: 'no-findings', summary: 'No candidate findings; human validation is still required.', findings: [] });
+    const envelope = {
+      runId,
+      authority: { principalId: reviewer.id, tenantId: tenantA, workspaceId: workspaceA, verifiedApproval, approvedInput, reviewBinding: binding },
+      outputDigest: await hashApprovalInput(output), artifactDigests: [],
+      result: { runId, termination: 'COMPLETED', output, counters: {}, events: [], artifacts: [] },
+    } as unknown as PreparedAgentRunResult;
+    const stored = await forge.persistPreparedCouncilReviewDraft(envelope);
+    expect(stored.evidenceIds).toHaveLength(1);
+    expect(await forge.persistPreparedCouncilReviewDraft(envelope)).toEqual(stored);
+    const drafts = await forge.councilReviewDrafts(owner);
+    expect(drafts).toHaveLength(1);
+    expect(await forge.councilReviewDrafts({ id: reviewer.id, tenantId: tenantB, workspaceId: workspaceB })).toEqual([]);
+    expect(drafts[0]).toMatchObject({ runId, councilId: council.id, assignmentId: assignment.assignmentId, reviewerPrincipalId: reviewer.id, decision: 'no-findings', evidenceIds: stored.evidenceIds });
+    expect((await forge.evidence(owner)).find((item) => item.id === stored.evidenceIds[0])).toMatchObject({ kind: 'review', result: 'partial', deterministic: false, requirementId: 'XIO-REQ-FRG-007' });
+    expect((await forge.councils(owner)).find((item) => item.id === council.id)?.assignments.find((item) => item.role === assignment.role)).toMatchObject({ status: 'pending', decision: null, evidenceSource: null });
+    const tampered = { ...envelope, outputDigest: await hashApprovalInput(`${output} `) } as PreparedAgentRunResult;
+    await expect(forge.persistPreparedCouncilReviewDraft(tampered)).rejects.toThrow('FORGE_COUNCIL_REVIEW_OUTPUT_DIGEST_INVALID');
   });
 });
