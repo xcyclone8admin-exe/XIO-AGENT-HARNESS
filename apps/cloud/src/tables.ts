@@ -1,5 +1,6 @@
 import { SERVER_STAMPED_FIELDS, type ColumnSpec, type ModuleManifest } from '@xyra/contracts';
 import coreManifest from '@xyra/mod-core/manifest';
+import brainManifest from '../../../modules/brain/manifest';
 import opsManifest from '@xyra/mod-ops/manifest';
 import swarmManifest from '@xyra/mod-swarm/manifest';
 
@@ -55,7 +56,7 @@ function derive(manifests: readonly ModuleManifest[]): ReadonlyMap<string, Table
  * as `constructor` must never resolve to a rule (CLD-R-012). The generated registry feed replaces
  * the manifest list when more modules sync.
  */
-export const MANIFESTS: readonly ModuleManifest[] = [coreManifest, opsManifest, swarmManifest];
+export const MANIFESTS: readonly ModuleManifest[] = [coreManifest, brainManifest, opsManifest, swarmManifest];
 export const TABLE_RULES: ReadonlyMap<string, TableRule> = derive(MANIFESTS);
 
 export function ruleFor(table: string): TableRule | undefined {
