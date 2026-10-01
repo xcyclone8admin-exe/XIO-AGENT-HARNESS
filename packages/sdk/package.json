@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./module-ui": "./src/module-ui.ts"
+    "./module-ui": "./src/module-ui.ts",
+    "./use-capability": "./src/use-capability.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json"
