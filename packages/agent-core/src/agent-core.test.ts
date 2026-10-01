@@ -1,4 +1,4 @@
-import { defineCapability, type Principal } from '@xyra/contracts';
+import { defineCapability, hashApprovalInput, hashApprovalScope, type Principal } from '@xyra/contracts';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import {
@@ -23,6 +23,7 @@ import {
   decideRunAccess,
   decideDelegation,
   regressionReasons,
+  parseReviewResultDraft,
   resolveRuntimeConfiguration,
   type AgentProfile as AgentProfileType,
   type AgentRunInput,
@@ -225,6 +226,32 @@ describe('AgentProfile and delegation contracts', () => {
 });
 
 describe('provider routing and bounded loop', () => {
+  it('parses typed review drafts only against immutable bound artifact references', () => {
+    const binding = {
+      councilId: IDS.profile,
+      assignmentId: IDS.run,
+      targetId: IDS.user,
+      repositoryId: 'repo/example',
+      reviewContractId: 'review-v1',
+      reviewContractSha256: 'a'.repeat(64),
+      role: 'security',
+      reviewerPrincipalId: IDS.agent,
+      subjectCommitSha: 'b'.repeat(40),
+      artifacts: [{ id: IDS.profile, sha256: 'c'.repeat(64) }],
+    };
+    const noFindings = { schemaVersion: 1, decision: 'no-findings', summary: 'No issues found in the reviewed material.', findings: [] };
+    expect(parseReviewResultDraft(noFindings, binding)).toEqual(noFindings);
+    const finding = {
+      severity: 'high', title: 'Authorization can be bypassed', affectedRequirements: ['REQ-SEC-1'], confidence: 0.94,
+      reproduction: 'Call the endpoint without the required role.', remediation: 'Enforce the role check before reading state.',
+      revalidation: 'Repeat the request with and without the role.', evidenceArtifactIds: [IDS.profile],
+    };
+    expect(parseReviewResultDraft({ ...noFindings, decision: 'findings', findings: [finding] }, binding).findings).toEqual([finding]);
+    expect(() => parseReviewResultDraft({ ...noFindings, decision: 'findings', findings: [] }, binding)).toThrow();
+    expect(() => parseReviewResultDraft({ ...noFindings, findings: [finding] }, binding)).toThrow();
+    expect(() => parseReviewResultDraft({ ...noFindings, decision: 'findings', findings: [{ ...finding, evidenceArtifactIds: [IDS.agent] }] }, binding)).toThrow('REVIEW_RESULT_ARTIFACT_OUTSIDE_BINDING');
+  });
+
   it('retries a transient failure twice before selecting a compatible fallback', async () => {
     let primaryCalls = 0;
     let fallbackCalls = 0;
@@ -732,5 +759,49 @@ describe('in-process agent runner seam', () => {
     expect(() => runner.prepare({ ...input, verifiedApproval: null, spawn: { ...input.spawn, budgets: { ...input.spawn.budgets, maxActions: 4 } } })).toThrow('RUN_BUDGET_ESCALATION');
     expect(() => runner.prepare({ ...input, verifiedApproval: null, route: undefined as never })).toThrow();
     expect(() => new AgentRunner({ router: routerWith([provider('primary', async () => response())]), capabilities: [], capabilityCaller: undefined as never })).toThrow('AGENT_RUNNER_HOST_DEPENDENCIES_REQUIRED');
+  });
+
+  it('carries authenticated reviewer authority and exact commit/artifact binding through result delivery', async () => {
+    const runner = new AgentRunner({ router: routerWith([provider('primary', async () => response())]), capabilities: [], capabilityCaller: { call: async () => [] } });
+    const input = runInput();
+    const review = { councilId: IDS.profile, assignmentId: IDS.run, role: 'ADVERSARY' };
+    const approvedInput = { runId: IDS.run, profileId: IDS.profile, prompt: input.prompt, review };
+    const baseProof = {
+      version: 1 as const,
+      approvalId: '019a0000-0000-7000-8000-000000000101',
+      decisionId: '019a0000-0000-7000-8000-000000000102',
+      tenantId: IDS.tenant,
+      workspaceId: IDS.workspace,
+      principalId: IDS.agent,
+      requestedBy: IDS.user,
+      approverId: '019a0000-0000-7000-8000-000000000103',
+      capabilityId: 'swarm.runs.enqueue',
+      inputDigest: await hashApprovalInput(approvedInput),
+      issuedAt: '2026-09-30T00:00:00.000Z',
+      expiresAt: '2027-09-30T00:00:00.000Z',
+    };
+    const verifiedApproval = { ...baseProof, scopeHash: await hashApprovalScope(baseProof) };
+    const reviewBinding = {
+      councilId: review.councilId,
+      assignmentId: review.assignmentId,
+      targetId: '019a0000-0000-7000-8000-000000000104',
+      repositoryId: 'project/repository',
+      reviewContractId: 'council-review-v1',
+      reviewContractSha256: 'e'.repeat(64),
+      role: review.role,
+      reviewerPrincipalId: IDS.agent,
+      subjectCommitSha: 'a'.repeat(40),
+      artifacts: [{ id: '019a0000-0000-7000-8000-000000000105', sha256: 'b'.repeat(64) }],
+    };
+    const prepared = runner.prepare({ ...input, verifiedApproval, approvedInput, reviewBinding });
+    const delivered = await runner.runPreparedWithAuthority(prepared);
+    expect(delivered).toMatchObject({
+      runId: IDS.run,
+      authority: { principalId: IDS.agent, tenantId: IDS.tenant, workspaceId: IDS.workspace, reviewBinding },
+      outputDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+      result: { termination: 'COMPLETED' },
+    });
+    expect(() => runner.prepare({ ...input, verifiedApproval, approvedInput, reviewBinding: { ...reviewBinding, reviewerPrincipalId: IDS.user } })).toThrow('REVIEW_REVIEWER_PRINCIPAL_MISMATCH');
+    expect(() => runner.prepare({ ...input, verifiedApproval, approvedInput, reviewBinding: { ...reviewBinding, role: 'RESEARCHER' } })).toThrow('RUN_REVIEW_BINDING_MISMATCH');
   });
 });

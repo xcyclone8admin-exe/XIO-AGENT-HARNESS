@@ -361,7 +361,10 @@ mod tests {
         let mut raw = base();
         raw.env = vec![(
             "XYRA_RUN_ID".into(),
-            "sk-live-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345".into(),
+            // Opaque, high-entropy-looking, but not shaped like any real provider's key prefix:
+            // this exercises the length/charset heuristic in `looks_like_secret`, not the
+            // name-contains-KEY/TOKEN heuristic (that path has its own test above).
+            "qT3mZ9vLk2pXoR7cHnB4wY8sD1gU6fA0eJ5iN2hM9".into(),
         )];
         assert_eq!(
             InvocationRequest::parse(raw, &allow_list()).unwrap_err(),

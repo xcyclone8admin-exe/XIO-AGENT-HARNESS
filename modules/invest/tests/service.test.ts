@@ -8,6 +8,8 @@ import { PGliteLedgerWriter } from '@xyra/ledger';
 import { LEDGER_TABLES } from '@xyra/ledger/contracts';
 import investManifest from '../manifest';
 import { InvestService } from '../server/service';
+import { investCapabilities } from '../server/capabilities';
+import type { TrustedFlowStepContext } from '../server/scheduled-reconciliation';
 
 const tenantId = '019a0000-0000-7000-8000-000000000501';
 const workspaceId = '019a0000-0000-7000-8000-000000000502';
@@ -25,6 +27,8 @@ function load(directory: URL, moduleId: string) {
 let db: PGlite;
 let writer: PGliteLedgerWriter;
 let service: InvestService;
+let globalKillEngaged = false;
+let globalKillReadFails = false;
 let portfolioId: string;
 let instrumentId: string;
 let orderId: string;
@@ -53,7 +57,12 @@ beforeAll(async () => {
     INSERT INTO workspaces(id,tenant_id,name) VALUES ('${workspaceId}','${tenantId}','Invest service test');
     INSERT INTO users(id,tenant_id,display_name) VALUES ('${userId}','${tenantId}','Invest owner'),('${secondUserId}','${tenantId}','Second IC member');`);
   writer = new PGliteLedgerWriter(db);
-  service = new InvestService(new LocalScopedStore(db), writer, writer);
+  service = new InvestService(new LocalScopedStore(db), writer, writer, {
+    async getKillSwitch() {
+      if (globalKillReadFails) throw new Error('simulated SWARM durable read failure');
+      return { engaged: globalKillEngaged, reason: globalKillEngaged ? 'test global halt' : null, changedBy: null, changedAt: null };
+    },
+  });
 }, 60_000);
 
 afterAll(async () => { await db?.close(); });
@@ -117,6 +126,9 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   expect(proposed.environment).toBe('paper');
   expect(proposed.quantity_units).toBe('500000');
   await service.approve(scope, userId, { orderId });
+  globalKillEngaged = true;
+  await expect(service.execute(scope,userId,{orderId,quantityUnits:'200000'})).rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_ENGAGED');
+  globalKillEngaged = false;
   const network = vi.fn();
   vi.stubGlobal('fetch', network);
   let firstFill: Awaited<ReturnType<typeof service.execute>>;
@@ -125,13 +137,21 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
     firstFill = await service.execute(scope, userId, { orderId, quantityUnits: '200000' });
     expect(firstFill.order.status).toBe('partially_filled');
     await expect(service.execute(scope,userId,{orderId,quantityUnits:'300001'})).rejects.toThrow(/exceeds remaining/);
-    fill = await service.execute(scope, userId, { orderId });
+    const cancelled = await service.cancel(scope,userId,{orderId});
+    expect(cancelled.status).toBe('cancelled');
+    const repeatedCancel = await service.cancel(scope,userId,{orderId});
+    expect(repeatedCancel).toMatchObject({status:'cancelled',filled_units:'200000'});
+    const events = await db.query<{count:number}>(`SELECT count(*)::int AS count FROM invest_order_events WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3 AND event_type='cancelled'`,[tenantId,workspaceId,orderId]);
+    expect(events.rows[0]?.count).toBe(1);
+    const latestFill = await db.query<{id:string;execution_ref:string}>(`SELECT id,execution_ref FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3 ORDER BY created_at DESC LIMIT 1`,[tenantId,workspaceId,orderId]);
+    fill = {order:cancelled,fillId:latestFill.rows[0]!.id,transactionId:latestFill.rows[0]!.execution_ref.slice('paper:'.length),environment:'paper'};
   }
   finally { vi.unstubAllGlobals(); }
   expect(network).not.toHaveBeenCalled();
-  expect(fill).toMatchObject({ order: { id: orderId, status: 'filled' }, environment: 'paper' });
-  expect(fill.order.filled_units).toBe('500000');
-  await expect(service.orders(scope,{portfolioId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:orderId,quantity_units:'500000',filled_units:'500000'})]));
+  expect(fill.order).toMatchObject({ id: orderId, status: 'cancelled' });
+  const expectedFilledUnits = '200000';
+  expect(fill.order.filled_units).toBe(expectedFilledUnits);
+  await expect(service.orders(scope,{portfolioId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:orderId,quantity_units:'500000',filled_units:expectedFilledUnits})]));
 
   const persisted = await db.query<{ fills: number; ledger_transactions: number; entries: number; cash: string; position: string }>(
     `SELECT (SELECT count(*)::int FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3) AS fills,
@@ -141,10 +161,12 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
       (SELECT units::text FROM ledger_balances WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$5 AND account_id=(SELECT id FROM ledger_accounts WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$5 AND code=$6) AND asset=$7) AS position`,
     [tenantId, workspaceId, orderId, fill.transactionId, portfolio.book_id, `position:${instrumentId}`, `EQ:PAPERX`],
   );
-  expect(persisted.rows[0]).toMatchObject({ fills: 2, ledger_transactions: 1, entries: 4, cash: '95000', position: '500000' });
+  expect(persisted.rows[0]).toMatchObject({ fills: expectedFilledUnits === '200000' ? 1 : 2, ledger_transactions: expectedFilledUnits === '200000' ? 1 : 1, entries: 4, cash: expectedFilledUnits === '200000' ? '98000' : '95000', position: expectedFilledUnits });
   const openedLots = await service.taxLots(scope, { portfolioId: portfolio.id });
-  expect(openedLots).toHaveLength(2);
-  expect(openedLots.map((lot)=>[lot.instrumentId,lot.acquiredUnits,lot.remainingUnits,lot.costBasisUnits,lot.remainingBasisUnits])).toEqual([
+  expect(openedLots).toHaveLength(expectedFilledUnits === '200000' ? 1 : 2);
+  expect(openedLots.map((lot)=>[lot.instrumentId,lot.acquiredUnits,lot.remainingUnits,lot.costBasisUnits,lot.remainingBasisUnits])).toEqual(expectedFilledUnits === '200000' ? [
+    [instrumentId,'200000','200000','2000','2000'],
+  ] : [
     [instrumentId,'200000','200000','2000','2000'],[instrumentId,'300000','300000','3000','3000'],
   ]);
   await new Promise((resolve) => setTimeout(resolve, 1_100));
@@ -157,8 +179,10 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
        sum(e.realized_gain_units)::text AS gain FROM invest_tax_lots l JOIN invest_tax_lot_events e
        ON e.tenant_id=l.tenant_id AND e.workspace_id=l.workspace_id AND e.lot_id=l.id
        WHERE l.tenant_id=$1 AND l.workspace_id=$2 AND l.portfolio_id=$3 GROUP BY l.id`, [tenantId, workspaceId, portfolio.id]);
-  expect(lots.rows).toHaveLength(2);
-  expect(lots.rows).toEqual([
+  expect(lots.rows).toHaveLength(expectedFilledUnits === '200000' ? 1 : 2);
+  expect(lots.rows).toEqual(expectedFilledUnits === '200000' ? [
+    { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
+  ] : [
     { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
     { remaining_units: '0', remaining_basis_units: '0', events: 2, gain: '0' },
   ]);
@@ -175,6 +199,10 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   expect(mismatched).toMatchObject({status:'needs_review',discrepancyCount:2});
   const diffs = await db.query<{kind:string;expected_units:string;observed_units:string;owner_id:string}>(`SELECT kind,expected_units::text,observed_units::text,owner_id FROM invest_reconciliation_discrepancies WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 ORDER BY kind`, [tenantId,workspaceId,mismatched.runId]);
   expect(diffs.rows).toEqual([{kind:'cash_mismatch',expected_units:'100000',observed_units:'99000',owner_id:userId},{kind:'unknown_position',expected_units:'0',observed_units:'20',owner_id:userId}]);
+  await expect(service.reconciliationQueue(scope)).resolves.toEqual(expect.arrayContaining([
+    expect.objectContaining({run_id:mismatched.runId,kind:'cash_mismatch',expected_units:'100000',observed_units:'99000',difference_units:'-1000',owner_id:userId}),
+    expect.objectContaining({run_id:mismatched.runId,kind:'unknown_position',expected_units:'0',observed_units:'20',difference_units:'20',owner_id:userId}),
+  ]));
   await db.query(`UPDATE invest_portfolio_risk_state SET risk_date=risk_date-1,kill_switch=true,kill_reason='prior day halt'
     WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,[tenantId,workspaceId,portfolio.id]);
   await service.fundPortfolio(scope,userId,{portfolioId:portfolio.id,units:'1000',reference:'post-midnight PAPER capital contribution'});
@@ -218,7 +246,32 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   await expect(service.runBacktest(scope,userId,backtestInput)).resolves.toMatchObject({runId:backtest.runId});
   await expect(service.backtestRuns(scope,{instrumentId})).resolves.toEqual(expect.arrayContaining([expect.objectContaining({id:backtest.runId,data_version:1,strategy_key:strategy.id,strategy_version:1,net_pnl_units:'948'})]));
   await expect(service.runBacktest(scope,userId,{...backtestInput,bars:[...historicalBars.slice(0,2),{...historicalBars[2]!,closeUnits:'12999'}]})).rejects.toThrow(/data version already exists/);
+  const differentScale = await service.createInstrument(scope,userId,{symbol:'SCALETEST',assetClass:'equity',quantityScale:4,exchangeCode:null});
+  await expect(service.runBacktest(scope,userId,{...backtestInput,instrumentId:differentScale.id,dataVersion:1})).rejects.toThrow(/strategy version already exists with different configuration/);
   await expect(db.query(`UPDATE invest_backtest_runs SET net_pnl_units=0 WHERE id=$1`,[backtest.runId])).rejects.toThrow(/append-only/);
+});
+
+test('cancel and fill serialize on the locked order row', async () => {
+  const scope = {tenantId,workspaceId};
+  await new Promise((resolve)=>setTimeout(resolve,1_100));
+  const order=await service.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'paper-cancel-fill-race'});
+  await service.approve(scope,userId,{orderId:order.id});
+  await service.execute(scope,userId,{orderId:order.id,quantityUnits:'100000'});
+  const [cancelled,filled]=await Promise.allSettled([service.cancel(scope,userId,{orderId:order.id}),service.execute(scope,userId,{orderId:order.id})]);
+  const final= (await service.orders(scope,{portfolioId})).find((candidate)=>candidate.id===order.id);
+  expect(final).toBeDefined();
+  expect(['cancelled','filled']).toContain(final?.status);
+  const count=await db.query<{fills:number;cancellations:number;filledUnits:string}>(`SELECT
+      (SELECT count(*)::int FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3) AS fills,
+      (SELECT count(*)::int FROM invest_order_events WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3 AND event_type='cancelled') AS cancellations,
+      COALESCE((SELECT sum(quantity_units) FROM invest_fills WHERE tenant_id=$1 AND workspace_id=$2 AND order_id=$3),0)::text AS "filledUnits"`,[tenantId,workspaceId,order.id]);
+  if(final?.status==='cancelled') {
+    expect(cancelled.status).toBe('fulfilled'); expect(filled.status).toBe('rejected');
+    expect(count.rows[0]).toMatchObject({fills:1,cancellations:1,filledUnits:'100000'});
+  } else {
+    expect(cancelled.status).toBe('rejected'); expect(filled.status).toBe('fulfilled');
+    expect(count.rows[0]).toMatchObject({fills:2,cancellations:0});
+  }
 });
 
 test('a failing fill-event insert rolls back fill and ledger posting together', async () => {
@@ -244,6 +297,69 @@ test('a failing fill-event insert rolls back fill and ledger posting together', 
      FROM invest_orders o WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3`, [tenantId, workspaceId, retryOrder.id],
   );
   expect(rolledBack.rows[0]).toEqual({ status: 'approved', fills: 0, transactions: 0 });
+});
+
+test('trusted FLOW daily custody handler reconciles persisted inputs once and reports absent connector', async () => {
+  const scope={tenantId,workspaceId};
+  const statementDate=new Date().toISOString().slice(0,10);
+  const snapshot=await service.summary(scope,{portfolioId});
+  const statement={ id:'019a0000-0000-7000-8000-000000000711',ownerId:userId,portfolioId,sourceName:'Persisted custody inbox',
+    sourceRef:'custody://daily/fixture/1',statementDate,cashUnits:(BigInt(snapshot.cashUnits)-1n).toString(),
+    positions:snapshot.positions.map((position)=>({symbol:position.symbol,units:position.quantityUnits})) };
+  const input={...statement,statementHash:hashStatement(statement)};
+  const matching={...statement,id:'019a0000-0000-7000-8000-000000000715',sourceRef:'custody://daily/fixture/2',cashUnits:snapshot.cashUnits};
+  const matchingInput={...matching,statementHash:hashStatement(matching)};
+  const invalidInput={...matchingInput,id:'019a0000-0000-7000-8000-000000000716',sourceRef:'custody://daily/fixture/invalid',statementHash:'0'.repeat(64)};
+  let eligible=[input,invalidInput];
+  const inbox={listEligible:vi.fn(async()=>eligible),acknowledgeProcessed:vi.fn(async()=>{})};
+  const scheduledService=new InvestService(new LocalScopedStore(db),writer,writer,{
+    async getKillSwitch(){return{engaged:false,reason:null,changedBy:null,changedAt:null};},
+  },inbox);
+  const runId='019a0000-0000-7000-8000-000000000712';
+  const context:TrustedFlowStepContext={tenantId,workspaceId,principalId:userId,workflowId:'019a0000-0000-7000-8000-000000000713',runId,
+    trigger:'schedule',stepId:'custody-daily',stepIndex:0,attempt:0,scheduledFor:new Date().toISOString(),dispatchId:`${runId}:0:0`};
+  await expect(scheduledService.dispatchScheduledCustody(context)).rejects.toThrow(/content hash/);
+  const partial=await db.query<{status:string;attempts:number}>(`SELECT status,attempts FROM invest_custody_dispatches WHERE tenant_id=$1 AND workspace_id=$2 AND workflow_id=$3`,[tenantId,workspaceId,context.workflowId]);
+  expect(partial.rows).toEqual([{status:'failed',attempts:1}]);
+  const preserved=await db.query<{count:number}>(`SELECT count(*)::int AS count FROM invest_reconciliation_runs WHERE tenant_id=$1 AND workspace_id=$2 AND source_ref=$3`,[tenantId,workspaceId,statement.sourceRef]);
+  expect(preserved.rows[0]?.count).toBe(1);
+  eligible=[input,matchingInput];
+  const first=await scheduledService.dispatchScheduledCustody(context);
+  expect(first).toMatchObject({status:'completed',idempotent:false,inputs:[
+    {statementId:statement.id,reconciliation:'needs_review',discrepancyCount:1},
+    {statementId:matching.id,reconciliation:'matched',discrepancyCount:0},
+  ]});
+  const second=await scheduledService.dispatchScheduledCustody(context);
+  expect(second).toEqual({...first,idempotent:true});
+  expect(inbox.listEligible).toHaveBeenCalledTimes(2);
+  expect(inbox.acknowledgeProcessed).toHaveBeenCalledTimes(2);
+  const rows=await db.query<{status:string;attempts:number;discrepancies:number}>(`SELECT d.status,d.attempts,
+      (SELECT count(*)::int FROM invest_reconciliation_discrepancies x WHERE x.tenant_id=d.tenant_id AND x.workspace_id=d.workspace_id AND x.run_id=(d.result->'inputs'->0->>'runId')::uuid) AS discrepancies
+    FROM invest_custody_dispatches d WHERE d.tenant_id=$1 AND d.workspace_id=$2 AND d.workflow_id=$3`,[tenantId,workspaceId,context.workflowId]);
+  expect(rows.rows).toEqual([{status:'completed',attempts:2,discrepancies:1}]);
+
+  const missingAdapter=new InvestService(new LocalScopedStore(db),writer,writer,{
+    async getKillSwitch(){return{engaged:false,reason:null,changedBy:null,changedAt:null};},
+  });
+  const unavailableContext={...context,workflowId:'019a0000-0000-7000-8000-000000000714'};
+  await expect(missingAdapter.dispatchScheduledCustody(unavailableContext)).rejects.toThrow('INVEST_CUSTODY_CONNECTOR_UNAVAILABLE');
+  await expect(db.query<{status:string;error_code:string}>(`SELECT status,error_code FROM invest_custody_dispatches WHERE tenant_id=$1 AND workspace_id=$2 AND workflow_id=$3`,
+    [tenantId,workspaceId,unavailableContext.workflowId])).resolves.toMatchObject({rows:[{status:'connector_unavailable',error_code:'INVEST_CUSTODY_CONNECTOR_UNAVAILABLE'}]});
+});
+
+test('global kill reader absence, engagement and read failure all block new PAPER proposals', async () => {
+  const scope={tenantId,workspaceId};
+  const unavailable=new InvestService(new LocalScopedStore(db),writer,writer);
+  await expect(unavailable.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'no-global-reader'}))
+    .rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_UNAVAILABLE');
+  globalKillEngaged=true;
+  await expect(service.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'global-halted'}))
+    .rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_ENGAGED');
+  globalKillEngaged=false; globalKillReadFails=true;
+  try {
+    await expect(service.propose(scope,userId,{portfolioId,instrumentId,side:'buy',orderType:'market',stopPriceUnits:'9000',riskBps:50,idempotencyKey:'global-read-failure'}))
+      .rejects.toThrow('INVEST_GLOBAL_KILL_SWITCH_UNAVAILABLE');
+  } finally { globalKillReadFails=false; }
 });
 
 test('price marks revalue ledger positions, record breaches, auto-halt and cancel open PAPER orders', async () => {
@@ -312,4 +428,9 @@ test('module runtime exposes PAPER execution only and no live broker adapter or 
   expect(serviceText).toContain("'paper'");
   expect(serviceText).not.toMatch(/fetch\s*\(|https?:\/\/[^\s'"`]+|liveBroker|brokerAdapter|LIVE_TRADING/i);
   expect(Object.keys(packageJson.exports).some((key) => /live|broker/i.test(key))).toBe(false);
+  expect(investManifest.permissions).toContain('invest:signal:consume');
+  expect(investManifest.roleGrants.owner).toContain('invest:signal:consume');
+  expect(investManifest.roleGrants.admin).toContain('invest:signal:consume');
+  expect(investManifest.roleGrants.manager).not.toContain('invest:signal:consume');
+  expect(Object.values(investCapabilities).some((capability)=>capability.permission==='invest:signal:consume')).toBe(false);
 });

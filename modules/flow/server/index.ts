@@ -19,7 +19,7 @@ export function registerFlow(repository: FlowRepository, bus: CapabilityBusLike,
   bus.register(manifest, c.createWorkflow, async (input, call) => repository.createWorkflow(scope(call), c.createWorkflow.input.parse(input)));
   bus.register(manifest, c.trigger, async (input, call) => {
     const request = c.trigger.input.parse(input);
-    return repository.triggerRun(scope(call), request.workflowId, request.trigger);
+    return repository.triggerRun(scope(call), request.workflowId, request.trigger, request.scheduledFor ? { scheduledFor: request.scheduledFor } : undefined);
   });
   bus.register(manifest, c.advance, async (input, call) => repository.advanceRun(scope(call), c.advance.input.parse(input).runId));
   bus.register(manifest, c.cancel, async (input, call) => repository.cancelRun(scope(call), c.cancel.input.parse(input).runId));

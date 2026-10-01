@@ -67,16 +67,16 @@ export function evaluateGates(rawGates: readonly unknown[], riskAcceptances: rea
   for (const gate of gates) if (gate.kind === 'deterministic' && gate.status === 'pass' && gate.evidenceIds.length === 0) throw new Error(`DETERMINISTIC_GATE_WITHOUT_EVIDENCE:${gate.id}`);
   const acceptances = riskAcceptances.map((acceptance) => {
     const parsed = RiskAcceptance.parse(acceptance);
-    if (parsed.approval.status !== 'approved' || Date.parse(parsed.approval.expiresAt) <= Date.now()) throw new Error(`INVALID_RISK_ACCEPTANCE:${parsed.gateId}`);
+    if (Date.parse(parsed.reviewAt) <= Date.now()) throw new Error(`INVALID_RISK_ACCEPTANCE:${parsed.gateId}`);
     return parsed;
   });
   const acceptedGateIds = new Set(acceptances.map((acceptance) => acceptance.gateId));
   for (const acceptance of acceptances) {
     const gate = gates.find((candidate) => candidate.id === acceptance.gateId);
-    if (!gate || !gate.hard || gate.status !== 'fail') throw new Error(`RISK_ACCEPTANCE_NOT_APPLICABLE:${acceptance.gateId}`);
+    if (!gate || gate.kind !== 'human' || !gate.hard || gate.status !== 'fail') throw new Error(`RISK_ACCEPTANCE_NOT_APPLICABLE:${acceptance.gateId}`);
   }
-  const deterministicFailure = gates.some((gate) => gate.kind === 'deterministic' && gate.hard && gate.status === 'fail' && !acceptedGateIds.has(gate.id));
-  const failedHard = gates.some((gate) => gate.hard && gate.status === 'fail' && !acceptedGateIds.has(gate.id));
+  const deterministicFailure = gates.some((gate) => gate.kind === 'deterministic' && gate.hard && gate.status === 'fail');
+  const failedHard = gates.some((gate) => gate.hard && gate.status === 'fail' && (gate.kind !== 'human' || !acceptedGateIds.has(gate.id)));
   const pendingHard = gates.some((gate) => gate.hard && gate.status !== 'pass' && !(gate.status === 'fail' && acceptedGateIds.has(gate.id)));
   return GateEvaluation.parse({ gates, overall: deterministicFailure || failedHard ? 'fail' : pendingHard ? 'blocked' : 'pass', aiJudgmentAllowed: false, deterministicBeforeJudgment: true });
 }

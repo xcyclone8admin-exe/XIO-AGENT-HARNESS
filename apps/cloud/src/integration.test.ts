@@ -29,6 +29,8 @@ const AGENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const PROJECT = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const DEVICE_A = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const DEVICE_B = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const SIGNAL_SOURCE = '12121212-1212-4121-8121-121212121212';
+const SIGNAL_KEY = '13131313-1313-4131-8131-131313131313';
 const INTERNAL = 'internal-token-for-tests';
 const URL_BASE = 'http://cloud.test';
 
@@ -39,6 +41,150 @@ const fixtureDpopReplays = new Set<string>();
 const deviceKeyPairs = new Map<string, CryptoKeyPair>();
 const fixtureSyncStores = new Map<string, MemorySyncStore>();
 const fixtureErasureFences = new Set<string>();
+let signalSigningKeyPair: CryptoKeyPair;
+let signalSourceConfig: Record<string, any>;
+const fixtureInvestEvents = new Map<string, Record<string, any>>();
+const fixtureInvestClaims = new Map<string, Record<string, any>>();
+const fixtureInvestRates = new Map<string, number>();
+
+async function investSignalService(request: Request): Promise<Response> {
+  const route = new URL(request.url).pathname;
+  let input: Record<string, any>;
+  try {
+    input = (await request.json()) as Record<string, any>;
+  } catch {
+    return Response.json({ code: 'INVALID_REQUEST' }, { status: 400 });
+  }
+  if (route === '/source-key') {
+    return input['sourceId'] === SIGNAL_SOURCE && input['keyId'] === SIGNAL_KEY
+      ? Response.json(signalSourceConfig)
+      : Response.json({ code: 'UNKNOWN_KEY' }, { status: 404 });
+  }
+  if (route === '/accept') {
+    const body = input['body'] as Record<string, any>;
+    const source = input['source'] as Record<string, any>;
+    const digest = input['payloadDigest'];
+    const rateBucket = `${source['sourceId']}:${Math.floor(Date.now() / 60_000)}`;
+    const requests = (fixtureInvestRates.get(rateBucket) ?? 0) + 1;
+    fixtureInvestRates.set(rateBucket, requests);
+    if (requests > source['maxEventsPerMinute']) return Response.json({ kind: 'rate_limited' });
+    const key = `${source['tenantId']}:${source['workspaceId']}:${source['sourceId']}:${body['eventId']}`;
+    const previous = fixtureInvestEvents.get(key);
+    if (previous) {
+      if (previous['payloadDigest'] !== digest)
+        return Response.json({ code: 'SIGNAL_EVENT_ID_REUSED' }, { status: 409 });
+      return Response.json({
+        kind: 'duplicate',
+        jobId: previous['jobId'],
+        receivedAt: previous['envelope']['receivedAt'],
+        envelope: previous['envelope'],
+      });
+    }
+    const envelope = {
+      ...body,
+      sourceId: source['sourceId'],
+      tenantId: source['tenantId'],
+      workspaceId: source['workspaceId'],
+      receivedAt: new Date().toISOString(),
+      payloadDigest: digest,
+      verification: { signature: 'verified', keyId: source['keyId'] },
+    };
+    const event = {
+      id: crypto.randomUUID(),
+      source,
+      body,
+      envelope,
+      payloadDigest: digest,
+      jobId: crypto.randomUUID(),
+      status: 'pending',
+      fence: 0,
+    };
+    fixtureInvestEvents.set(key, event);
+    return Response.json({
+      kind: 'accepted',
+      jobId: event['jobId'],
+      receivedAt: envelope['receivedAt'],
+      envelope,
+    });
+  }
+  if (route === '/claim') {
+    const identity = input['identity'] as Record<string, string>;
+    const claim = input['input'] as Record<string, string>;
+    const replayKey = `${identity['tenantId']}:${identity['workspaceId']}:${identity['principalId']}:${identity['deviceId']}:${claim['idempotencyKey']}`;
+    const prior = fixtureInvestClaims.get(replayKey);
+    if (prior) {
+      const event = prior['event'] as Record<string, any>;
+      if (event['status'] !== 'claimed' || Date.parse(prior['lease']['expiresAt']) <= Date.now())
+        return Response.json({ code: 'SIGNAL_CLAIM_CLOSED' }, { status: 409 });
+      return Response.json({ status: 'claimed', lease: prior['lease'], signal: event['envelope'] });
+    }
+    const event = [...fixtureInvestEvents.values()].find((candidate) => {
+      const scope = candidate['source'];
+      return (
+        scope['tenantId'] === identity['tenantId'] &&
+        scope['workspaceId'] === identity['workspaceId'] &&
+        Date.parse(candidate['body']['expiresAt']) > Date.now() &&
+        (candidate['status'] === 'pending' ||
+          (candidate['status'] === 'claimed' && Date.parse(candidate['leaseExpiresAt']) <= Date.now()))
+      );
+    });
+    if (!event) return Response.json({ status: 'empty' });
+    event['status'] = 'claimed';
+    event['deviceId'] = identity['deviceId'];
+    event['leaseId'] = crypto.randomUUID();
+    event['fence'] += 1;
+    event['leaseExpiresAt'] = new Date(
+      Math.min(Date.now() + 30_000, Date.parse(event['body']['expiresAt'])),
+    ).toISOString();
+    const lease = { leaseId: event['leaseId'], fence: event['fence'], expiresAt: event['leaseExpiresAt'] };
+    fixtureInvestClaims.set(replayKey, { event, lease });
+    return Response.json({ status: 'claimed', lease, signal: event['envelope'] });
+  }
+  if (route === '/ack') {
+    const identity = input['identity'] as Record<string, string>;
+    const ack = input['input'] as Record<string, string>;
+    const event = [...fixtureInvestEvents.values()].find(
+      (candidate) =>
+        candidate['source']['tenantId'] === identity['tenantId'] &&
+        candidate['source']['workspaceId'] === identity['workspaceId'] &&
+        candidate['body']['eventId'] === ack['eventId'] &&
+        candidate['leaseId'] === ack['leaseId'],
+    );
+    if (
+      !event ||
+      event['deviceId'] !== identity['deviceId'] ||
+      event['payloadDigest'] !== ack['payloadDigest']
+    )
+      return Response.json({ code: 'SIGNAL_LEASE_INVALID' }, { status: 409 });
+    if (event['status'] === 'acked') {
+      if (event['ackIdempotencyKey'] !== ack['idempotencyKey'] || event['decisionId'] !== ack['decisionId'])
+        return Response.json({ code: 'SIGNAL_ACK_IDEMPOTENCY_REUSED' }, { status: 409 });
+      return Response.json({
+        status: 'acked',
+        eventId: ack['eventId'],
+        payloadDigest: ack['payloadDigest'],
+        decisionId: ack['decisionId'],
+        acknowledgedAt: event['ackedAt'],
+        replayed: true,
+      });
+    }
+    if (event['status'] !== 'claimed' || Date.parse(event['leaseExpiresAt']) <= Date.now())
+      return Response.json({ code: 'SIGNAL_LEASE_EXPIRED' }, { status: 409 });
+    event['status'] = 'acked';
+    event['ackIdempotencyKey'] = ack['idempotencyKey'];
+    event['decisionId'] = ack['decisionId'];
+    event['ackedAt'] = new Date().toISOString();
+    return Response.json({
+      status: 'acked',
+      eventId: ack['eventId'],
+      payloadDigest: ack['payloadDigest'],
+      decisionId: ack['decisionId'],
+      acknowledgedAt: event['ackedAt'],
+      replayed: false,
+    });
+  }
+  return Response.json({ code: 'NOT_FOUND' }, { status: 404 });
+}
 
 const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64url');
 async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
@@ -81,7 +227,11 @@ async function mint(sub: string, over: Record<string, unknown> = {}, key = priva
     }),
   );
   const sig = new Uint8Array(
-    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, new TextEncoder().encode(`${head}.${body}`)),
+    await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      key,
+      new TextEncoder().encode(`${head}.${body}`),
+    ),
   );
   return `${head}.${body}.${b64(sig)}`;
 }
@@ -102,7 +252,11 @@ async function dpop(token: string, method: string, route: string): Promise<strin
   url.search = '';
   url.hash = '';
   const header = b64(
-    JSON.stringify({ typ: 'dpop+jwt', alg: 'ES256', jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } }),
+    JSON.stringify({
+      typ: 'dpop+jwt',
+      alg: 'ES256',
+      jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
+    }),
   );
   const ath = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))));
   const body = b64(
@@ -115,7 +269,11 @@ async function dpop(token: string, method: string, route: string): Promise<strin
     }),
   );
   const signature = new Uint8Array(
-    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, new TextEncoder().encode(`${header}.${body}`)),
+    await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      pair.privateKey,
+      new TextEncoder().encode(`${header}.${body}`),
+    ),
   );
   return `${header}.${body}.${b64(signature)}`;
 }
@@ -128,6 +286,50 @@ async function protectedHeaders(
   return {
     authorization: `Bearer ${token}`,
     dpop: await dpop(token, method, route),
+  };
+}
+
+async function signedInvestSignal(
+  body: Record<string, unknown>,
+  timestamp = Math.floor(Date.now() / 1000),
+  corrupt = false,
+): Promise<Response> {
+  const raw = JSON.stringify(body);
+  const prefix = new TextEncoder().encode(`${timestamp}.`);
+  const rawBytes = new TextEncoder().encode(raw);
+  const message = new Uint8Array(prefix.byteLength + rawBytes.byteLength);
+  message.set(prefix);
+  message.set(rawBytes, prefix.byteLength);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, signalSigningKeyPair.privateKey, message),
+  );
+  if (corrupt) signature[0] = signature[0]! ^ 0xff;
+  return (await mf.dispatchFetch(`${URL_BASE}/v1/webhooks/invest/signals`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-xyra-source-id': SIGNAL_SOURCE,
+      'x-xyra-key-id': SIGNAL_KEY,
+      'x-xyra-timestamp': String(timestamp),
+      'x-xyra-signature': `v1=${b64(signature)}`,
+    },
+    body: raw,
+  })) as unknown as Response;
+}
+
+function signalBody(over: Record<string, unknown> = {}): Record<string, unknown> {
+  const now = Date.now();
+  return {
+    protocol: 'xyra.invest.signal.v1',
+    eventId: `evt-${crypto.randomUUID()}`,
+    occurredAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 5 * 60_000).toISOString(),
+    algorithmId: 'paper-alpha',
+    signalId: crypto.randomUUID(),
+    symbol: 'ACME',
+    side: 'buy',
+    quantity: '1.25',
+    ...over,
   };
 }
 
@@ -259,7 +461,9 @@ async function rawChunkedPut(url: string, body: string): Promise<Response> {
       (response) => {
         const chunks: Buffer[] = [];
         response.on('data', (chunk: Buffer) => chunks.push(chunk));
-        response.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })));
+        response.on('end', () =>
+          resolve(new Response(Buffer.concat(chunks), { status: response.statusCode ?? 500 })),
+        );
         response.on('error', reject);
       },
     );
@@ -275,9 +479,30 @@ beforeAll(async () => {
     shell: true,
     stdio: 'pipe',
   });
-  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+    'sign',
+    'verify',
+  ]);
   privateKey = pair.privateKey;
   const jwk = JSON.stringify(await crypto.subtle.exportKey('jwk', pair.publicKey));
+  signalSigningKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+    'sign',
+    'verify',
+  ]);
+  const signalPublicJwk = await crypto.subtle.exportKey('jwk', signalSigningKeyPair.publicKey);
+  signalSourceConfig = {
+    tenantId: T1,
+    workspaceId: W1,
+    sourceId: SIGNAL_SOURCE,
+    keyId: SIGNAL_KEY,
+    signingAlg: 'ES256',
+    publicJwk: signalPublicJwk,
+    allowedAlgorithmIds: ['paper-alpha'],
+    allowedSymbols: ['ACME'],
+    maxAgeSeconds: 300,
+    maxLifetimeSeconds: 900,
+    maxEventsPerMinute: 100,
+  };
   mf = new Miniflare(
     convertV4MiniflareOptions({
       modules: true,
@@ -290,6 +515,7 @@ beforeAll(async () => {
       kvNamespaces: ['CACHE'],
       queueProducers: { JOBS: 'jobs' },
       serviceBindings: {
+        CLOUD_TEST_INVEST_SIGNALS: investSignalService,
         CLOUD_TEST_ERASURE: async (request: Request) => {
           const body = (await request.json()) as {
             tenantId: string;
@@ -427,26 +653,31 @@ describe('auth on the real Worker', () => {
       const result = await call('POST', route, null, {});
       expect(result).toMatchObject({ status: 503, json: { code: 'AUTH_NOT_CONFIGURED' } });
     }
-    expect(
-      await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(60_000) }),
-    ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
+    expect(await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(60_000) })).toMatchObject(
+      { status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } },
+    );
   });
   it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
     await seed(U1, { role: 'owner' });
     expect((await call('POST', '/v1/auth/logout', null)).status).toBe(401);
     const noSession = await mint(U1);
     expect(await call('POST', '/v1/auth/logout', noSession)).toMatchObject({
-      status: 409, json: { code: 'SESSION_NOT_FOUND' },
+      status: 409,
+      json: { code: 'SESSION_NOT_FOUND' },
     });
     const withSession = await mint(U1, { sid: uuid(8850) });
     expect(await call('POST', '/v1/auth/logout', withSession)).toMatchObject({
-      status: 503, json: { code: 'AUTH_NOT_CONFIGURED' },
+      status: 503,
+      json: { code: 'AUTH_NOT_CONFIGURED' },
     });
   });
   it('fails closed without or with bad credentials', async () => {
     expect((await call('GET', '/v1/sync/pull', null)).status).toBe(401);
     expect((await call('GET', '/v1/sync/pull', 'a.b.c')).status).toBe(401);
-    const other = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+    const other = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+      'sign',
+      'verify',
+    ]);
     const forged = await mint(U1, {}, other.privateKey);
     expect(await call('GET', '/v1/sync/pull', forged)).toMatchObject({
       status: 401,
@@ -512,7 +743,14 @@ describe('sync on workerd', () => {
       'POST',
       '/v1/sync/push',
       token,
-      pushBody([task(id, { fields: { title: { value: 'stale-resurrection', hlc: hlc(Date.now() + 1), baseHlc: null } } })], 'erasure-stale-0001'),
+      pushBody(
+        [
+          task(id, {
+            fields: { title: { value: 'stale-resurrection', hlc: hlc(Date.now() + 1), baseHlc: null } },
+          }),
+        ],
+        'erasure-stale-0001',
+      ),
     );
     expect(replay.status).toBe(409);
     expect(replay.json?.['code']).toBe('ERASURE_SOURCE_FENCED');
@@ -525,10 +763,18 @@ describe('sync on workerd', () => {
     const body = pushBody([task(uuid(1))], 'idem-roundtrip-0001');
     const first = await call('POST', '/v1/sync/push', token, body);
     expect(first.json).toMatchObject({ accepted: 1, replayed: false });
-    expect(first.json?.['changeOutcomes']).toEqual([{
-      index: 0, changeId: uuid(1), table: 'ops_tasks', rowId: uuid(1), outcome: 'committed',
-      appliedFields: ['project_id', 'title'], unchangedFields: [], conflictedFields: [],
-    }]);
+    expect(first.json?.['changeOutcomes']).toEqual([
+      {
+        index: 0,
+        changeId: uuid(1),
+        table: 'ops_tasks',
+        rowId: uuid(1),
+        outcome: 'committed',
+        appliedFields: ['project_id', 'title'],
+        unchangedFields: [],
+        conflictedFields: [],
+      },
+    ]);
     const replay = await call('POST', '/v1/sync/push', token, body);
     expect(replay.json).toMatchObject({ accepted: 1, replayed: true });
     expect(replay.json?.['changeOutcomes']).toEqual(first.json?.['changeOutcomes']);
@@ -552,17 +798,43 @@ describe('sync on workerd', () => {
     const initial = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'outcome-seed-0001'));
     expect(initial.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed' });
     const duplicate = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'outcome-repeat-0001'));
-    expect(duplicate.json).toMatchObject({ accepted: 0, changeOutcomes: [{
-      index: 0, changeId: id, table: 'ops_tasks', rowId: id, outcome: 'unchanged',
-      appliedFields: [], unchangedFields: ['project_id', 'title'], conflictedFields: [],
-    }] });
-    const rejected = await call('POST', '/v1/sync/push', token, pushBody([
-      task(uuid(23), { fields: { status: { value: 'forged', hlc: hlc(Date.now()), baseHlc: null } } }),
-    ], 'outcome-rejected-0001'));
-    expect(rejected.json?.['changeOutcomes']).toEqual([{
-      index: 0, changeId: uuid(23), table: 'ops_tasks', rowId: uuid(23), outcome: 'rejected',
-      appliedFields: [], unchangedFields: [], conflictedFields: [], rejectionCode: 'GUARDED_FIELD',
-    }]);
+    expect(duplicate.json).toMatchObject({
+      accepted: 0,
+      changeOutcomes: [
+        {
+          index: 0,
+          changeId: id,
+          table: 'ops_tasks',
+          rowId: id,
+          outcome: 'unchanged',
+          appliedFields: [],
+          unchangedFields: ['project_id', 'title'],
+          conflictedFields: [],
+        },
+      ],
+    });
+    const rejected = await call(
+      'POST',
+      '/v1/sync/push',
+      token,
+      pushBody(
+        [task(uuid(23), { fields: { status: { value: 'forged', hlc: hlc(Date.now()), baseHlc: null } } })],
+        'outcome-rejected-0001',
+      ),
+    );
+    expect(rejected.json?.['changeOutcomes']).toEqual([
+      {
+        index: 0,
+        changeId: uuid(23),
+        table: 'ops_tasks',
+        rowId: uuid(23),
+        outcome: 'rejected',
+        appliedFields: [],
+        unchangedFields: [],
+        conflictedFields: [],
+        rejectionCode: 'GUARDED_FIELD',
+      },
+    ]);
   });
   it('rejects cross-tenant rows and guarded fields per row', async () => {
     await seed(U1);
@@ -762,16 +1034,23 @@ describe('blob references on workerd', () => {
     await seed(U1, { role: 'owner' });
     const token = await mint(U1);
     const response = await call('POST', '/v2/brain/ingestions', token, {
-      protocolVersion: 'cloud-ingest-v2', sourceId: uuid(8801), mode: 'text_only',
+      protocolVersion: 'cloud-ingest-v2',
+      sourceId: uuid(8801),
+      mode: 'text_only',
     });
     expect(response).toMatchObject({
       status: 503,
       json: { code: 'INGESTION_STORAGE_UNAVAILABLE' },
     });
     const obsolete = await call('POST', '/v1/blob-reference-sets', token, {
-      protocolVersion: 'cloud-erasure-v1', sourceId: uuid(8801), objectRefIds: [],
+      protocolVersion: 'cloud-erasure-v1',
+      sourceId: uuid(8801),
+      objectRefIds: [],
     });
-    expect(obsolete).toMatchObject({ status: 426, json: { code: 'UPDATE_REQUIRED', protocolVersion: 'cloud-ingest-v2' } });
+    expect(obsolete).toMatchObject({
+      status: 426,
+      json: { code: 'UPDATE_REQUIRED', protocolVersion: 'cloud-ingest-v2' },
+    });
   });
 
   it('enforces TTL cap, length, membership and kill-switch at redemption', async () => {
@@ -780,7 +1059,10 @@ describe('blob references on workerd', () => {
     const token = await mint(U1);
     expect((await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 301 })).status).toBe(403);
     const untrackedIngestion = await ref(token, {
-      mode: 'PUT', name: 'ingestion.txt', expiresInSec: 120, ingestionId: uuid(7701),
+      mode: 'PUT',
+      name: 'ingestion.txt',
+      expiresInSec: 120,
+      ingestionId: uuid(7701),
     });
     expect(untrackedIngestion).toMatchObject({
       status: 503,
@@ -830,8 +1112,12 @@ describe('development Worker configuration without R2', () => {
 
     const original = mf;
     const exportedSigningJwk = await crypto.subtle.exportKey('jwk', privateKey);
-    const signingJwk = JSON.stringify({ kty: exportedSigningJwk.kty, crv: exportedSigningJwk.crv,
-      x: exportedSigningJwk.x, y: exportedSigningJwk.y });
+    const signingJwk = JSON.stringify({
+      kty: exportedSigningJwk.kty,
+      crv: exportedSigningJwk.crv,
+      x: exportedSigningJwk.x,
+      y: exportedSigningJwk.y,
+    });
     const noR2 = new Miniflare(
       convertV4MiniflareOptions({
         modules: true,
@@ -865,7 +1151,9 @@ describe('development Worker configuration without R2', () => {
               body['cursor'],
               body['limit'],
             );
-            return result.ok ? Response.json(result.response) : Response.json({ code: result.code }, { status: 400 });
+            return result.ok
+              ? Response.json(result.response)
+              : Response.json({ code: result.code }, { status: 400 });
           },
         },
       }),
@@ -918,22 +1206,38 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     await seed(U1, { role: 'owner' });
     const token = await mint(U1);
     const request = {
-      protocolVersion: 'cloud-erasure-v1', erasureId: uuid(9101), attemptId: uuid(9102), approvalId: uuid(9103),
-      source: { kind: 'brain_source', id: uuid(9104) }, sourceVersion: `cloud-ingest-v2:sha256:${'a'.repeat(64)}`,
+      protocolVersion: 'cloud-erasure-v1',
+      erasureId: uuid(9101),
+      attemptId: uuid(9102),
+      approvalId: uuid(9103),
+      source: { kind: 'brain_source', id: uuid(9104) },
+      sourceVersion: `cloud-ingest-v2:sha256:${'a'.repeat(64)}`,
     };
-    expect(await call('POST', '/v1/erasures', token, { ...request, tenantId: T2 }))
-      .toMatchObject({ status: 400, json: { code: 'INVALID_ERASURE_REQUEST' } });
-    expect(await call('POST', '/v1/erasures', token, request))
-      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
-    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, token))
-      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
-    expect(await call('POST', `/v1/erasures/${uuid(9101)}/claim-local-purge`, token,
-      { protocolVersion: 'cloud-erasure-v1', attemptId: uuid(9102), reservationId: uuid(9105) }))
-      .toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
+    expect(await call('POST', '/v1/erasures', token, { ...request, tenantId: T2 })).toMatchObject({
+      status: 400,
+      json: { code: 'INVALID_ERASURE_REQUEST' },
+    });
+    expect(await call('POST', '/v1/erasures', token, request)).toMatchObject({
+      status: 503,
+      json: { code: 'ERASURE_STORAGE_UNAVAILABLE' },
+    });
+    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, token)).toMatchObject({
+      status: 503,
+      json: { code: 'ERASURE_STORAGE_UNAVAILABLE' },
+    });
+    expect(
+      await call('POST', `/v1/erasures/${uuid(9101)}/claim-local-purge`, token, {
+        protocolVersion: 'cloud-erasure-v1',
+        attemptId: uuid(9102),
+        reservationId: uuid(9105),
+      }),
+    ).toMatchObject({ status: 503, json: { code: 'ERASURE_STORAGE_UNAVAILABLE' } });
     await seed(U2, { role: 'viewer' });
     const viewer = await mint(U2);
-    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, viewer))
-      .toMatchObject({ status: 403, json: { code: 'PERMISSION_DENIED' } });
+    expect(await call('GET', `/v1/erasures/${uuid(9101)}`, viewer)).toMatchObject({
+      status: 403,
+      json: { code: 'PERMISSION_DENIED' },
+    });
   });
 
   it('CLD-R-001 rejects a lease body that tries to replace verified claims', async () => {
@@ -1120,8 +1424,12 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       (await call('POST', '/v1/sync/push', token, pushBody([initial(a, 'old', older)]))).json?.['accepted'],
     ).toBe(1);
     const win = await call('POST', '/v1/sync/push', token, pushBody([update(a, 'new', newer, null)]));
-    expect(win.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed',
-      appliedFields: ['title'], unchangedFields: [], conflictedFields: [] });
+    expect(win.json?.['changeOutcomes'][0]).toMatchObject({
+      outcome: 'committed',
+      appliedFields: ['title'],
+      unchangedFields: [],
+      conflictedFields: [],
+    });
     expect(win.json?.['conflictHistory']).toContainEqual(
       expect.objectContaining({ rowId: a, losingValue: 'old' }),
     );
@@ -1132,15 +1440,23 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
       pushBody([update(a, 'next', hlc(base, 3), newer)]),
     );
     expect(sequential.json?.['conflicts']).toBe(0);
-    expect(sequential.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'committed',
-      appliedFields: ['title'], unchangedFields: [], conflictedFields: [] });
+    expect(sequential.json?.['changeOutcomes'][0]).toMatchObject({
+      outcome: 'committed',
+      appliedFields: ['title'],
+      unchangedFields: [],
+      conflictedFields: [],
+    });
     const b = uuid(406);
     expect(
       (await call('POST', '/v1/sync/push', token, pushBody([initial(b, 'new', newer)]))).json?.['accepted'],
     ).toBe(1);
     const lose = await call('POST', '/v1/sync/push', token, pushBody([update(b, 'old', older, null)]));
-    expect(lose.json?.['changeOutcomes'][0]).toMatchObject({ outcome: 'conflict',
-      appliedFields: [], unchangedFields: [], conflictedFields: ['title'] });
+    expect(lose.json?.['changeOutcomes'][0]).toMatchObject({
+      outcome: 'conflict',
+      appliedFields: [],
+      unchangedFields: [],
+      conflictedFields: ['title'],
+    });
     expect(lose.json?.['conflictHistory']).toContainEqual(
       expect.objectContaining({ rowId: b, losingValue: 'old' }),
     );
@@ -1408,7 +1724,115 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     await hub('/internal/maintenance', {});
     const next = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
     expect(next.status, `lease reacquire response: ${JSON.stringify(next)}`).toBe(200);
-    expect(next.json?.['lease'], `lease missing from successful reacquire: ${JSON.stringify(next)}`).toBeTruthy();
+    expect(
+      next.json?.['lease'],
+      `lease missing from successful reacquire: ${JSON.stringify(next)}`,
+    ).toBeTruthy();
     expect(next.json?.['lease'].fence).toBeGreaterThan(first.json?.['lease'].fence);
   }, 20_000);
+
+  it('accepts only raw-body-signed, allowlisted advisory signals and durably deduplicates provider event IDs', async () => {
+    const body = signalBody();
+    const valid = await signedInvestSignal(body);
+    expect(valid.status).toBe(202);
+    const accepted = (await valid.json()) as Record<string, any>;
+    expect(accepted['accepted']).toBe(true);
+    expect(accepted['eventId']).toBe(body['eventId']);
+    expect(accepted).not.toHaveProperty('tenantId');
+    expect(accepted).not.toHaveProperty('verification');
+
+    const duplicate = await signedInvestSignal(body);
+    expect(duplicate.status).toBe(202);
+    expect(await duplicate.json()).toEqual(accepted);
+
+    const conflicting = await signedInvestSignal({ ...body, quantity: '2' });
+    expect(conflicting.status).toBe(409);
+    expect(await conflicting.json()).toMatchObject({ code: 'SIGNAL_EVENT_ID_REUSED' });
+
+    expect((await signedInvestSignal(signalBody({ verification: { signature: 'verified' } }))).status).toBe(
+      400,
+    );
+    expect((await signedInvestSignal(signalBody(), Math.floor(Date.now() / 1000) - 301)).status).toBe(401);
+    expect((await signedInvestSignal(signalBody(), Math.floor(Date.now() / 1000), true)).status).toBe(401);
+    expect((await signedInvestSignal(signalBody({ symbol: 'OTHER' }))).status).toBe(403);
+    expect((await signedInvestSignal(signalBody({ algorithmId: 'live-exec' }))).status).toBe(403);
+    expect((await signedInvestSignal(signalBody({ tenantId: T2 }))).status).toBe(400);
+  });
+
+  it('requires current owner/admin permission and fences signal claim/ack to the claiming device', async () => {
+    await setKill(false);
+    for (const event of fixtureInvestEvents.values())
+      if (event['status'] === 'pending') event['status'] = 'acked';
+    const body = signalBody();
+    expect((await signedInvestSignal(body)).status).toBe(202);
+
+    const manager = '48484848-4848-4484-8484-484848484848';
+    await seed(manager, { role: 'manager' });
+    const managerToken = await mint(manager);
+    expect(
+      await call('POST', '/v1/invest/signals/claim', managerToken, {
+        protocol: 'xyra.invest.signal.consume.v1',
+        idempotencyKey: crypto.randomUUID(),
+      }),
+    ).toMatchObject({ status: 403, json: { code: 'PERMISSION_DENIED' } });
+
+    await seed(U1, { role: 'owner' });
+    const tokenA = await mint(U1, { device_id: DEVICE_A });
+    const claimRequest = { protocol: 'xyra.invest.signal.consume.v1', idempotencyKey: crypto.randomUUID() };
+    const first = await call('POST', '/v1/invest/signals/claim', tokenA, claimRequest);
+    expect(first.status).toBe(200);
+    expect(first.json).toMatchObject({
+      status: 'claimed',
+      signal: {
+        eventId: expect.stringMatching(/^evt-/),
+        payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        tenantId: T1,
+        workspaceId: W1,
+        sourceId: SIGNAL_SOURCE,
+        verification: { signature: 'verified', keyId: SIGNAL_KEY },
+      },
+    });
+    const repeated = await call('POST', '/v1/invest/signals/claim', tokenA, claimRequest);
+    expect(repeated.json?.['lease']).toEqual(first.json?.['lease']);
+
+    const tokenB = await mint(U1, { device_id: DEVICE_B });
+    const otherDevice = await call('POST', '/v1/invest/signals/claim', tokenB, {
+      protocol: 'xyra.invest.signal.consume.v1',
+      idempotencyKey: crypto.randomUUID(),
+    });
+    expect(otherDevice).toMatchObject({ status: 200, json: { status: 'empty' } });
+
+    const signal = first.json?.['signal'];
+    const lease = first.json?.['lease'];
+    const ack = {
+      protocol: 'xyra.invest.signal.consume.v1',
+      eventId: signal['eventId'],
+      payloadDigest: signal['payloadDigest'],
+      leaseId: lease['leaseId'],
+      decisionId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+    };
+    expect(await call('POST', '/v1/invest/signals/ack', tokenB, ack)).toMatchObject({
+      status: 409,
+      json: { code: 'SIGNAL_LEASE_INVALID' },
+    });
+    const acknowledged = await call('POST', '/v1/invest/signals/ack', tokenA, ack);
+    expect(acknowledged).toMatchObject({ status: 200, json: { status: 'acked', replayed: false } });
+    expect(await call('POST', '/v1/invest/signals/ack', tokenA, ack)).toMatchObject({
+      status: 200,
+      json: { status: 'acked', replayed: true },
+    });
+    expect(
+      await call('POST', '/v1/invest/signals/ack', tokenA, { ...ack, decisionId: crypto.randomUUID() }),
+    ).toMatchObject({
+      status: 409,
+      json: { code: 'SIGNAL_ACK_IDEMPOTENCY_REUSED' },
+    });
+    expect(
+      await call('POST', '/v1/invest/signals/ack', tokenA, {
+        ...ack,
+        verification: { signature: 'verified', keyId: SIGNAL_KEY },
+      }),
+    ).toMatchObject({ status: 400, json: { code: 'SIGNAL_ACK_INVALID' } });
+  });
 });

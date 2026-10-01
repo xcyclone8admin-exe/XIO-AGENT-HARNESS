@@ -1,14 +1,18 @@
+import type { StepContext } from '../contracts';
+export type { StepContext } from '../contracts';
+
 /**
  * FLOW ships no privileged step handlers. A step handler is a pure function the HOST registers;
  * FLOW's engine only ever calls whatever the host explicitly wired in. The one handler defined
  * here is intentionally inert (echoes its input) so a workflow is runnable and testable without
  * FLOW ever touching a real process, provider, or network call itself (no fabricated execution).
+ *
+ * Every field on StepContext is derived server-side by FlowRepository from the run's locked
+ * current-event row and its workflow definition — never from the step's own `input` (workflow
+ * JSON) and never from a caller-supplied value. A handler that needs to make a trusted downstream
+ * call (e.g. a server-only method on another module) can rely on this context instead of trusting
+ * anything the workflow author configured.
  */
-export interface StepContext {
-  readonly runId: string;
-  readonly stepId: string;
-  readonly attempt: number;
-}
 export type StepHandler = (input: Record<string, unknown>, context: StepContext) => Promise<Record<string, unknown>>;
 
 export class StepHandlerRegistry {

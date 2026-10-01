@@ -1,4 +1,5 @@
 import { databaseUrl, withNeonTransaction } from './neon';
+import { markInvestSignalNotificationSucceeded } from './invest-signals';
 import type { Env } from './index';
 import type { WorkspaceHub } from './hub';
 
@@ -11,6 +12,10 @@ interface RevocationJobMessage {
   readonly jobId: string;
   readonly tenantId: string;
   readonly workspaceId: string;
+}
+
+interface QueueNotification extends RevocationJobMessage {
+  readonly payloadDigest?: string;
 }
 
 export function parseRevocationJob(value: unknown): RevocationJobMessage | null {
@@ -27,6 +32,26 @@ export function parseRevocationJob(value: unknown): RevocationJobMessage | null 
   )
     return null;
   return row as unknown as RevocationJobMessage;
+}
+
+function parseQueueNotification(value: unknown): QueueNotification | null {
+  const basic = parseRevocationJob(value);
+  if (basic) return basic;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (
+    Object.keys(row).length !== 4 ||
+    typeof row['jobId'] !== 'string' ||
+    !UUID.test(row['jobId']) ||
+    typeof row['tenantId'] !== 'string' ||
+    !UUID.test(row['tenantId']) ||
+    typeof row['workspaceId'] !== 'string' ||
+    !UUID.test(row['workspaceId']) ||
+    typeof row['payloadDigest'] !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(row['payloadDigest'])
+  )
+    return null;
+  return row as unknown as QueueNotification;
 }
 
 async function deadLetter(env: Env, body: unknown, reason: string, jobId?: string): Promise<void> {
@@ -55,7 +80,7 @@ export async function consumeQueueBatch(
 ): Promise<void> {
   const connectionString = databaseUrl(env);
   for (const message of batch.messages) {
-    const input = parseRevocationJob(message.body);
+    const input = parseQueueNotification(message.body);
     if (!input) {
       try {
         await deadLetter(env, message.body, 'INVALID_MESSAGE');
@@ -89,6 +114,7 @@ export async function consumeQueueBatch(
           if (!row) return { kind: 'missing' as const };
           if (row.status === 'succeeded') return { kind: 'done' as const };
           if (row.status === 'dead') return { kind: 'dead' as const, reason: 'PREVIOUSLY_TERMINAL' };
+          if (row.job_type === 'invest.signal.received') return { kind: 'signal' as const };
           const principalId =
             row.payload && typeof row.payload === 'object'
               ? (row.payload as Record<string, unknown>)['principalId']
@@ -128,6 +154,22 @@ export async function consumeQueueBatch(
       else if (job.kind === 'done') {
         message.ack();
         continue;
+      } else if (job.kind === 'signal') {
+        if (!input.payloadDigest) terminalReason = 'INVALID_MESSAGE';
+        else {
+          const accepted = await markInvestSignalNotificationSucceeded(
+            connectionString,
+            input.tenantId,
+            input.workspaceId,
+            input.jobId,
+            input.payloadDigest,
+          );
+          if (!accepted) terminalReason = 'INVALID_STORED_JOB';
+          else {
+            message.ack();
+            continue;
+          }
+        }
       } else {
         const response = await fetchHub(input.workspaceId).fetch(INTERNAL_ROUTE, {
           method: 'POST',

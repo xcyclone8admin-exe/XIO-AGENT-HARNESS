@@ -37,6 +37,15 @@ export default defineModule({
   },
   tables: [
     { name: 'flow_workflows', class: 'local', authority: 'local' },
+    // Durable per-run identity: one immutable row per logical run_id, inserted once by
+    // triggerRun before any flow_runs event. This is what flow_runs/flow_checkpoints/
+    // flow_approvals really have a foreign key into — flow_runs.run_id by itself repeats across
+    // every lifecycle event row for a run and cannot back a real reference (migration 0003).
+    { name: 'flow_run_registry', class: 'local', authority: 'local' },
+    // Mutable (claim/release/reclaim) concurrency fence for a scheduled dispatcher; server-only —
+    // no capability exposes it, so it is reachable only through FlowRepository.claimStep /
+    // advanceClaimedRun by a trusted host caller (migration 0004).
+    { name: 'flow_step_claims', class: 'local', authority: 'local' },
     {
       name: 'flow_runs',
       class: 'append',
@@ -47,7 +56,7 @@ export default defineModule({
       readPermission: 'flow:run:read',
       allowedFields: ['run_id', 'workflow_id', 'trigger', 'state', 'step_index', 'attempt', 'detail', 'ended_at'],
       columns: {
-        run_id: { type: 'uuid', requiredOnInsert: true },
+        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_run_registry' } },
         workflow_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_workflows' } },
         trigger: { type: 'text', requiredOnInsert: true },
         state: { type: 'text', requiredOnInsert: true },
@@ -70,7 +79,7 @@ export default defineModule({
       readPermission: 'flow:run:read',
       allowedFields: ['run_id', 'step_index', 'step_id', 'status', 'attempt', 'output', 'error'],
       columns: {
-        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_runs' } },
+        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_run_registry' } },
         step_index: { type: 'integer', requiredOnInsert: true, min: '0' },
         step_id: { type: 'text', requiredOnInsert: true },
         status: { type: 'text', requiredOnInsert: true },
@@ -91,7 +100,7 @@ export default defineModule({
       readPermission: 'flow:run:read',
       allowedFields: ['run_id', 'step_index', 'attempt', 'decision', 'reason'],
       columns: {
-        run_id: { type: 'uuid', requiredOnInsert: true },
+        run_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'flow_run_registry' } },
         step_index: { type: 'integer', requiredOnInsert: true, min: '0' },
         attempt: { type: 'integer', requiredOnInsert: true, min: '0' },
         decision: { type: 'text', requiredOnInsert: true },

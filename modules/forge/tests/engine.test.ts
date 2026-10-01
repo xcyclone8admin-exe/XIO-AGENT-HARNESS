@@ -125,6 +125,14 @@ describe('review, gates, promotion and hard execution boundary', () => {
     expect(() => AdapterConfig.parse({ id: 'factory', enabled: true, endpoint: 'local', lastStatus: 'disabled' })).toThrow();
   });
 
+  it('applies approved risk only to eligible human hard gates, never deterministic failures', () => {
+    const acceptance = { gateId: 'human:change-review', reason: 'Accepted residual risk', impact: 'Limited scope', mitigation: 'Manual follow-up', reviewAt: new Date(Date.now() + 60_000).toISOString(), approvedBy: userId };
+    const humanFailure = { id: 'human:change-review', requirementId: 'XIO-REQ-FRG-008', kind: 'human' as const, status: 'fail' as const, hard: true, evidenceIds: [] };
+    expect(evaluateGates([humanFailure], [acceptance]).overall).toBe('pass');
+    expect(evaluateGates([humanFailure, { ...goodGate, id: 'deterministic:check', status: 'fail' as const }], [acceptance]).overall).toBe('fail');
+    expect(() => evaluateGates([{ ...humanFailure, kind: 'deterministic' as const }], [acceptance])).toThrow('RISK_ACCEPTANCE_NOT_APPLICABLE');
+  });
+
   it('refuses missing gates and production approval and requires rollback evidence', () => {
     const promotion = { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'proposed', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time };
     expect(() => requestPromotion(promotion, [{ ...goodGate, status: 'pending' }])).toThrow('PROMOTION_GATES_MISSING');
