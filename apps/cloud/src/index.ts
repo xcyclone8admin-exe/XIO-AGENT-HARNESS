@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { signBlobAccess, tenantWorkspaceKey, verifyBlobAccess } from './blobs';
 import { verifyAccessToken } from './auth';
-import { MAX_PUSH_BYTES, PullRequest, SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from '@xyra/contracts';
+import { cloudBrainContentDigest, MAX_PUSH_BYTES, PullRequest, SYNC_PROTOCOL_VERSION, SYNC_SCHEMA_VERSION } from '@xyra/contracts';
 import type { WorkspaceHub } from './hub';
 import { parseLeaseInput } from './leases';
 import {
@@ -23,6 +23,8 @@ import { runScheduledMaintenance } from './cron';
 import { drainSyncOutbox } from './sync-outbox';
 import {
   blobReferenceSnapshotDigest,
+  CloudBlobReferenceIssueRequest,
+  CloudBlobReferenceIssueResult,
   CloudIngestionBeginResult,
   CloudIngestionFinalizeRequest,
   CloudIngestionFinalizationReceipt,
@@ -692,8 +694,10 @@ app.post('/v2/brain/ingestions/:ingestionId/finalize', async (c) => {
         const target = versions.rows.find((row) => row.row_id === parsed.data.sourceVersionId);
         if (!target) return { error: 'SOURCE_VERSION_UNAVAILABLE' as const };
         const targetFields = parseFields(target.fields);
-        const digest = targetFields['content_hash']?.value;
-        if (typeof digest !== 'string' || digest !== parsed.data.contentDigest)
+        const contentText = targetFields['content_text']?.value;
+        if (typeof contentText !== 'string') return { error: 'SOURCE_CONTENT_UNAVAILABLE' as const };
+        const digest = await cloudBrainContentDigest(contentText);
+        if (digest !== parsed.data.contentDigest)
           return { error: 'SOURCE_CONTENT_DIGEST_MISMATCH' as const };
         const versionValue = targetFields['version']?.value;
         const maxVersion = Math.max(...snapshot.versions.map(({ version }) => version));
@@ -726,8 +730,10 @@ app.post('/v2/brain/ingestions/:ingestionId/finalize', async (c) => {
             WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source' AND source_id=$3`,
           [current.claims.tenantId, current.claims.activeWorkspaceId, ingestion.source_id]);
         const referenceStateVersion = Number(next.rows[0]?.version ?? 1);
-        const sourceVersion = await erasureSourceSnapshotVersion(ingestion.source_id, parsed.data.sourceVersionId,
-          current.claims.tenantId, current.claims.activeWorkspaceId, digest, objectRefIds, referenceStateVersion);
+        const sourceVersion = await erasureSourceSnapshotVersion({ sourceId: ingestion.source_id,
+          sourceVersionId: parsed.data.sourceVersionId, tenantId: current.claims.tenantId,
+          workspaceId: current.claims.activeWorkspaceId, contentDigest: digest,
+          objectRefIds, referenceStateVersion });
         const referenceSetDigest = await blobReferenceSnapshotDigest(ingestion.source_id, parsed.data.sourceVersionId, objectRefIds);
         const old = await client.query(`UPDATE cloud_erasure_reference_sets SET current=false,invalidated_at=now()
           WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source' AND source_id=$3 AND current=true`,
@@ -869,14 +875,15 @@ app.post('/v1/blobs/ref', async (c) => {
   }
   if (!request || typeof request !== 'object') return c.json({ code: 'INVALID_BLOB_REQUEST' }, 400);
   const body = request as Record<string, unknown>;
-  const mode = body.mode === 'GET' || body.mode === 'PUT' ? body.mode : null;
-  const name = typeof body.name === 'string' ? body.name : null;
-  const expiresInSec = typeof body.expiresInSec === 'number' ? body.expiresInSec : 0;
-  const ingestionId = typeof body.ingestionId === 'string' ? body.ingestionId : undefined;
+  const issueRequest = body.ingestionId === undefined ? null : CloudBlobReferenceIssueRequest.safeParse(body);
+  if (issueRequest && !issueRequest.success) return c.json({ code: 'INVALID_BLOB_REQUEST' }, 400);
+  const mode = issueRequest?.success ? issueRequest.data.mode : body.mode === 'GET' || body.mode === 'PUT' ? body.mode : null;
+  const name = issueRequest?.success ? issueRequest.data.name : typeof body.name === 'string' ? body.name : null;
+  const expiresInSec = issueRequest?.success ? issueRequest.data.expiresInSec : typeof body.expiresInSec === 'number' ? body.expiresInSec : 0;
+  const ingestionId = issueRequest?.success ? issueRequest.data.ingestionId : undefined;
   if (
     !mode ||
     !name ||
-    (body.ingestionId !== undefined && (!ingestionId || !/^[0-9a-f-]{36}$/i.test(ingestionId) || mode !== 'PUT')) ||
     !Number.isInteger(expiresInSec) ||
     expiresInSec < 30 ||
     expiresInSec > MAX_BLOB_TTL_SEC
@@ -989,7 +996,11 @@ app.post('/v1/blobs/ref', async (c) => {
   );
   // The storage key is an internal locator. Callers need only the opaque reference ID
   // (when durably registered) and the signed relative access path.
-  return c.json({ mode, expiresAtMs, url: `/v1/blobs/access/${token}`,
+  const url = `/v1/blobs/access/${token}`;
+  if (ingestionId) return c.json(CloudBlobReferenceIssueResult.parse({
+    objectRefId, mode: 'PUT', expiresAtMs, url, referenceStatus: 'tracked',
+  }));
+  return c.json({ mode, expiresAtMs, url,
     ...(mode === 'PUT' ? { objectRefId, referenceStatus: objectRefId ? (ingestionId ? 'tracked' : 'registration_required') : 'references_unknown' } : {}) });
 });
 

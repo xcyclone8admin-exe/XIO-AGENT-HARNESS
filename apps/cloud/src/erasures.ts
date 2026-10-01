@@ -1,5 +1,10 @@
 import { z } from 'zod';
 import {
+  canonicalCloudIngestionJson,
+  cloudBrainSourceVersion,
+  cloudReferenceSetDigest,
+  CloudBlobReferenceIssueRequest as SharedBlobReferenceIssueRequest,
+  CloudBlobReferenceIssueResult as SharedBlobReferenceIssueResult,
   CloudBrainIngestionBeginRequest as SharedIngestionBeginRequest,
   CloudBrainIngestionBeginResult as SharedIngestionBeginResult,
   CloudBrainIngestionFinalizeRequest as SharedIngestionFinalizeRequest,
@@ -62,6 +67,8 @@ export const CloudIngestionFinalizeRequest = SharedIngestionFinalizeRequest.tran
 }));
 export const CloudIngestionFinalizationReceipt = SharedIngestionFinalizationReceipt;
 export const CloudIngestionStatus = SharedIngestionStatus;
+export const CloudBlobReferenceIssueRequest = SharedBlobReferenceIssueRequest;
+export const CloudBlobReferenceIssueResult = SharedBlobReferenceIssueResult;
 
 export type ErasureStatus =
   | 'eligible'
@@ -90,23 +97,12 @@ export interface SourceVersionSnapshot {
   readonly versions: readonly SourceVersionEntry[];
 }
 
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, item]) => item !== undefined)
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
-    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
-
 /** BRAIN's agreed opaque precondition encoding; caller values never replace the server snapshot. */
 export async function sourceVersionDigest(snapshot: SourceVersionSnapshot): Promise<string> {
   const versions = [...snapshot.versions]
     .sort((left, right) => left.version - right.version || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
     .map(({ id, version, contentHash }) => ({ id, version, contentHash }));
-  const body = canonical({ sourceId: snapshot.sourceId, versions });
+  const body = canonicalCloudIngestionJson({ sourceId: snapshot.sourceId, versions });
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
   return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
@@ -116,42 +112,33 @@ export async function blobReferenceSnapshotDigest(sourceId: string, sourceVersio
   const ids = [...new Set(normalized)].sort();
   if (ids.length !== objectRefIds.length) throw new Error('DUPLICATE_OBJECT_REFERENCE');
   if (normalized.some((id, index) => id !== objectRefIds[index])) throw new Error('NON_CANONICAL_OBJECT_REFERENCE');
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(canonical({ sourceId, sourceVersionId, objectRefIds: ids })),
-  );
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return cloudReferenceSetDigest({ sourceId, sourceVersionId, objectRefIds: ids });
 }
 
 /** v2 destructive precondition: synced content/version, normalized refs, and Cloud's state fence. */
 export async function erasureSourceSnapshotVersion(
-  sourceId: string,
-  sourceVersionId: string,
-  tenantId: string,
-  workspaceId: string,
-  contentDigest: string,
-  objectRefIds: readonly string[],
-  referenceStateVersion: number,
+  input: {
+    readonly sourceId: string;
+    readonly sourceVersionId: string;
+    readonly tenantId: string;
+    readonly workspaceId: string;
+    readonly contentDigest: string;
+    readonly objectRefIds: readonly string[];
+    readonly referenceStateVersion: number;
+  },
 ): Promise<string> {
-  if (!Number.isSafeInteger(referenceStateVersion) || referenceStateVersion < 1)
+  if (!Number.isSafeInteger(input.referenceStateVersion) || input.referenceStateVersion < 1)
     throw new Error('INVALID_REFERENCE_STATE_VERSION');
-  if (!/^[0-9a-f]{64}$/.test(contentDigest)) throw new Error('INVALID_CONTENT_DIGEST');
-  const normalized = objectRefIds.map((id) => id.toLowerCase());
+  if (!/^[0-9a-f]{64}$/.test(input.contentDigest)) throw new Error('INVALID_CONTENT_DIGEST');
+  const normalized = input.objectRefIds.map((id) => id.toLowerCase());
   const ids = [...new Set(normalized)].sort();
-  if (ids.length !== objectRefIds.length) throw new Error('DUPLICATE_OBJECT_REFERENCE');
-  if (normalized.some((id, index) => id !== objectRefIds[index])) throw new Error('NON_CANONICAL_OBJECT_REFERENCE');
-  const body = canonical({
-    protocolVersion: 'cloud-ingest-v2',
-    sourceId,
-    sourceVersionId,
-    tenantId,
-    workspaceId,
-    contentDigest,
-    objectRefIds: ids,
-    referenceStateVersion,
+  if (ids.length !== input.objectRefIds.length) throw new Error('DUPLICATE_OBJECT_REFERENCE');
+  if (normalized.some((id, index) => id !== input.objectRefIds[index])) throw new Error('NON_CANONICAL_OBJECT_REFERENCE');
+  return cloudBrainSourceVersion({
+    protocolVersion: 'cloud-ingest-v2', sourceId: input.sourceId, sourceVersionId: input.sourceVersionId,
+    tenantId: input.tenantId, workspaceId: input.workspaceId, contentDigest: input.contentDigest,
+    objectRefIds: ids, referenceStateVersion: input.referenceStateVersion,
   });
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
-  return `cloud-ingest-v2:sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
 export type SyncedField = { readonly value: unknown };

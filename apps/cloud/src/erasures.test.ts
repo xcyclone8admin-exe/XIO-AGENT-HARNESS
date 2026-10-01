@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CLOUD_INGESTION_V2_TEST_VECTORS,
+  cloudBrainContentDigest,
+  cloudBrainSourceVersion,
+  cloudReferenceSetDigest,
+} from '@xyra/contracts';
+import {
   AbortErasureRequest,
   blobReferenceSnapshotDigest,
+  CloudBlobReferenceIssueRequest,
+  CloudBlobReferenceIssueResult,
   CloudIngestionFinalizeRequest,
   CloudIngestionFinalizationReceipt,
   CloudIngestionStatus,
@@ -107,27 +115,20 @@ describe('Cloud/BRAIN erasure wire and source snapshot', () => {
     const one = '66666666-6666-4666-8666-666666666666';
     const two = '77777777-7777-4777-8777-777777777777';
     expect(await blobReferenceSnapshotDigest(SOURCE, VERSION_A, [one, two]))
-      .toBe(await blobReferenceSnapshotDigest(SOURCE, VERSION_A, [two, one]));
+      .toBe(await cloudReferenceSetDigest({ sourceId: SOURCE, sourceVersionId: VERSION_A, objectRefIds: [one, two] }));
     expect(await blobReferenceSnapshotDigest(SOURCE, VERSION_A, [one, two]))
       .not.toBe(await blobReferenceSnapshotDigest(SOURCE, VERSION_B, [one, two]));
     await expect(blobReferenceSnapshotDigest(SOURCE, VERSION_A, [one, one]))
       .rejects.toThrow('DUPLICATE_OBJECT_REFERENCE');
     const referenceDigest = await blobReferenceSnapshotDigest(SOURCE, VERSION_A, [one, two]);
-    const expectedRefBody = JSON.stringify({ objectRefIds: [one, two], sourceId: SOURCE, sourceVersionId: VERSION_A });
-    const expectedRefHash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(expectedRefBody)))]
-      .map((byte) => byte.toString(16).padStart(2, '0')).join('');
-    expect(referenceDigest).toBe(expectedRefHash);
+    expect(referenceDigest).toBe(await cloudReferenceSetDigest({ sourceId: SOURCE, sourceVersionId: VERSION_A, objectRefIds: [one, two] }));
     expect(referenceDigest).toMatch(/^[0-9a-f]{64}$/);
-    const digestOne = await erasureSourceSnapshotVersion(SOURCE, VERSION_A, OPERATION, ATTEMPT, 'a'.repeat(64), [one, two], 1);
-    expect(digestOne).toBe(await erasureSourceSnapshotVersion(SOURCE, VERSION_A, OPERATION, ATTEMPT, 'a'.repeat(64), [two, one], 1));
-    expect(digestOne).not.toBe(await erasureSourceSnapshotVersion(SOURCE, VERSION_A, OPERATION, ATTEMPT, 'a'.repeat(64), [two, one], 2));
+    const sourceVersionInput = { sourceId: SOURCE, sourceVersionId: VERSION_A, tenantId: OPERATION, workspaceId: ATTEMPT,
+      contentDigest: 'a'.repeat(64), objectRefIds: [one, two], referenceStateVersion: 1 };
+    const digestOne = await erasureSourceSnapshotVersion(sourceVersionInput);
+    expect(digestOne).toBe(await cloudBrainSourceVersion({ protocolVersion: 'cloud-ingest-v2', ...sourceVersionInput }));
+    expect(digestOne).not.toBe(await erasureSourceSnapshotVersion({ ...sourceVersionInput, referenceStateVersion: 2 }));
     expect(digestOne).toMatch(/^cloud-ingest-v2:sha256:[0-9a-f]{64}$/);
-    const sourceVersionBody = JSON.stringify({ contentDigest: 'a'.repeat(64), objectRefIds: [one, two],
-      protocolVersion: 'cloud-ingest-v2', referenceStateVersion: 1, sourceId: SOURCE,
-      sourceVersionId: VERSION_A, tenantId: OPERATION, workspaceId: ATTEMPT });
-    const expectedSourceVersionHash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sourceVersionBody)))]
-      .map((byte) => byte.toString(16).padStart(2, '0')).join('');
-    expect(digestOne).toBe(`cloud-ingest-v2:sha256:${expectedSourceVersionHash}`);
     expect(CloudIngestionStartRequest.safeParse({ protocolVersion: 'cloud-ingest-v2', sourceId: SOURCE, mode: 'text_only' }).success).toBe(true);
     expect(CloudIngestionStartRequest.parse({ protocolVersion: 'cloud-ingest-v2', sourceId: SOURCE.toUpperCase(), mode: 'text_only' }).sourceId).toBe(SOURCE);
     expect(CloudIngestionStartRequest.safeParse({ protocolVersion: 'cloud-ingest-v2', sourceId: SOURCE, mode: 'text_only', ingestionId: OPERATION }).success).toBe(false);
@@ -147,5 +148,29 @@ describe('Cloud/BRAIN erasure wire and source snapshot', () => {
       sourceVersionId: VERSION_A, invalidatedAt: new Date().toISOString() }).success).toBe(true);
     expect(CloudIngestionStatus.safeParse({ protocolVersion: 'cloud-ingest-v2', status: 'pending', ingestionId: OPERATION, sourceId: SOURCE,
       startedAt: new Date().toISOString(), tenantId: ATTEMPT }).success).toBe(false);
+  });
+
+  it('matches the shared digest vectors used by the SDK', async () => {
+    const vectors = CLOUD_INGESTION_V2_TEST_VECTORS;
+    expect(await cloudBrainContentDigest('XYRA source text\r\nsecond line')).toBe(vectors.contentDigest);
+    expect(await cloudReferenceSetDigest({ sourceId: vectors.sourceId, sourceVersionId: vectors.sourceVersionId,
+      objectRefIds: [...vectors.objectRefIds] })).toBe(vectors.referenceSetDigest);
+    expect(await cloudBrainSourceVersion({ protocolVersion: 'cloud-ingest-v2', sourceId: vectors.sourceId,
+      sourceVersionId: vectors.sourceVersionId, tenantId: vectors.tenantId, workspaceId: vectors.workspaceId,
+      contentDigest: vectors.contentDigest, objectRefIds: [...vectors.objectRefIds],
+      referenceStateVersion: vectors.referenceStateVersion })).toBe(vectors.sourceVersion);
+  });
+
+  it('uses the strict shared tracked-upload issue schemas', () => {
+    const objectRefId = '88888888-8888-4888-8888-888888888888';
+    const request = { mode: 'PUT', name: 'source.txt', expiresInSec: 300, ingestionId: OPERATION };
+    expect(CloudBlobReferenceIssueRequest.safeParse(request).success).toBe(true);
+    expect(CloudBlobReferenceIssueRequest.safeParse({ ...request, mode: 'GET' }).success).toBe(false);
+    expect(CloudBlobReferenceIssueRequest.safeParse({ ...request, extra: true }).success).toBe(false);
+    const result = { objectRefId, mode: 'PUT', expiresAtMs: Date.now() + 300_000,
+      url: '/v1/blobs/access/eyJleHAiOiJzaWduZWQifQ.signature', referenceStatus: 'tracked' };
+    expect(CloudBlobReferenceIssueResult.safeParse(result).success).toBe(true);
+    expect(CloudBlobReferenceIssueResult.safeParse({ ...result, key: 'tenant/workspace/object' }).success).toBe(false);
+    expect(CloudBlobReferenceIssueResult.safeParse({ ...result, referenceStatus: 'references_unknown' }).success).toBe(false);
   });
 });
