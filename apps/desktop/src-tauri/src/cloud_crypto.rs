@@ -1,7 +1,7 @@
 //! DPoP device-key lifecycle and proof construction. Private key material and session tokens
 //! stay inside the native host and are held in Windows Credential Manager via `keyring`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 
 const SERVICE: &str = "systems.xyra.agentos.cloud";
 const DEVICE_KEY_ID: &str = "dpop-device-key-pkcs8";
+const TPM_KEY_METADATA_ID: &str = "dpop-device-key-tpm-p256-v1";
+const DEVICE_ID_ID: &str = "cloud-device-id-v1";
 const SESSION_ID: &str = "cloud-session-v1";
 const PENDING_AUTH_ID: &str = "cloud-auth-pending-v1";
 /// Windows generic credentials cap the stored secret at 2560 bytes; keyring encodes text as
@@ -30,7 +32,10 @@ pub struct WindowsCredentialStore;
 
 impl WindowsCredentialStore {
     fn entry(logical_id: &str) -> Result<keyring::Entry, String> {
-        if !matches!(logical_id, DEVICE_KEY_ID | SESSION_ID | PENDING_AUTH_ID) {
+        if !matches!(
+            logical_id,
+            DEVICE_KEY_ID | TPM_KEY_METADATA_ID | DEVICE_ID_ID | SESSION_ID | PENDING_AUTH_ID
+        ) {
             return Err("CLOUD_SECRET_ID_NOT_ALLOWED".into());
         }
         keyring::Entry::new(SERVICE, logical_id).map_err(|_| "CLOUD_KEYCHAIN_UNAVAILABLE".into())
@@ -66,6 +71,30 @@ impl CredentialStore for WindowsCredentialStore {
 #[derive(Clone)]
 pub struct DeviceKey {
     store: Arc<dyn CredentialStore>,
+    algorithm: Arc<Mutex<DpopAlgorithm>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DpopAlgorithm {
+    #[serde(rename = "EdDSA")]
+    EdDsa,
+    #[serde(rename = "ES256")]
+    Es256,
+}
+
+impl DpopAlgorithm {
+    fn as_jws_name(self) -> &'static str {
+        match self {
+            Self::EdDsa => "EdDSA",
+            Self::Es256 => "ES256",
+        }
+    }
+}
+
+impl Default for DpopAlgorithm {
+    fn default() -> Self {
+        Self::EdDsa
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,6 +102,8 @@ pub struct PublicJwk {
     pub kty: String,
     pub crv: String,
     pub x: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub y: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -88,6 +119,8 @@ struct StoredSession {
     refresh_token: Option<String>,
     expires_at_ms: Option<u64>,
     sid: Option<String>,
+    #[serde(default)]
+    key_algorithm: Option<DpopAlgorithm>,
     #[serde(default)]
     reauth_required: bool,
 }
@@ -108,8 +141,141 @@ pub enum StoredSessionStatus {
 }
 
 impl DeviceKey {
+    #[cfg(test)]
     pub fn new(store: Arc<dyn CredentialStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            // Test and compatibility constructor for previously enrolled EdDSA identities.
+            algorithm: Arc::new(Mutex::new(DpopAlgorithm::EdDsa)),
+        }
+    }
+
+    pub fn production(store: Arc<dyn CredentialStore>) -> Result<Self, String> {
+        let algorithm = if let Some(pending) = store.get(PENDING_AUTH_ID)? {
+            let pending: serde_json::Value =
+                serde_json::from_str(&pending).map_err(|_| "CLOUD_AUTH_STATE_CORRUPT")?;
+            match pending
+                .get("key_algorithm")
+                .and_then(|value| value.as_str())
+            {
+                Some("ES256") => DpopAlgorithm::Es256,
+                Some("EdDSA") | None => DpopAlgorithm::EdDsa,
+                _ => return Err("CLOUD_AUTH_STATE_CORRUPT".into()),
+            }
+        } else if let Some(value) = store.get(SESSION_ID)? {
+            let stored: StoredSession =
+                serde_json::from_str(&value).map_err(|_| "CLOUD_SESSION_CORRUPT")?;
+            // Sessions written before key_algorithm was introduced were EdDSA-bound.
+            stored.key_algorithm.unwrap_or(DpopAlgorithm::EdDsa)
+        } else {
+            DpopAlgorithm::Es256
+        };
+        Ok(Self {
+            store,
+            algorithm: Arc::new(Mutex::new(algorithm)),
+        })
+    }
+
+    fn algorithm(&self) -> DpopAlgorithm {
+        *self
+            .algorithm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn mark_lost_identity_reauth(&self, error: String) -> String {
+        if matches!(
+            error.as_str(),
+            "CLOUD_TPM_KEY_LOST_REAUTH_REQUIRED" | "CLOUD_DEVICE_ID_LOST"
+        ) && self.store.get(SESSION_ID).ok().flatten().is_some()
+        {
+            let _ = self.mark_reauth_required();
+            "CLOUD_REAUTH_REQUIRED".into()
+        } else {
+            error
+        }
+    }
+
+    pub fn current_algorithm(&self) -> DpopAlgorithm {
+        self.algorithm()
+    }
+
+    fn device_id(&self) -> Result<String, String> {
+        if let Some(device_id) = self.store.get(DEVICE_ID_ID)? {
+            if is_uuid(&device_id) {
+                return Ok(device_id);
+            }
+            return Err("CLOUD_DEVICE_ID_CORRUPT".into());
+        }
+        if self.store.get(SESSION_ID)?.is_some() || self.store.get(PENDING_AUTH_ID)?.is_some() {
+            return Err("CLOUD_DEVICE_ID_LOST".into());
+        }
+        let mut bytes = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| "CLOUD_RANDOM_UNAVAILABLE")?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let device_id = format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        );
+        self.store.set(DEVICE_ID_ID, &device_id)?;
+        Ok(device_id)
+    }
+
+    fn tpm_p256_public_key(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let metadata = self.store.get(TPM_KEY_METADATA_ID)?;
+        if metadata
+            .as_deref()
+            .is_some_and(|value| value != TPM_KEY_METADATA_VALUE)
+        {
+            return Err("CLOUD_TPM_KEY_METADATA_INVALID".into());
+        }
+        let allow_create = metadata.is_none() && self.store.get(SESSION_ID)?.is_none();
+        #[cfg(windows)]
+        {
+            let (x, y) = cng_tpm::public_key(allow_create)?;
+            if metadata.is_none() {
+                self.store
+                    .set(TPM_KEY_METADATA_ID, TPM_KEY_METADATA_VALUE)?;
+            }
+            Ok((x, y))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = allow_create;
+            Err("CLOUD_TPM_UNAVAILABLE".into())
+        }
+    }
+
+    fn tpm_p256_sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        let metadata = self.store.get(TPM_KEY_METADATA_ID)?;
+        if metadata.as_deref() != Some(TPM_KEY_METADATA_VALUE) {
+            return Err("CLOUD_TPM_KEY_UNAVAILABLE".into());
+        }
+        #[cfg(windows)]
+        {
+            let signature = cng_tpm::sign(message)?;
+            let (x, y) = self.tpm_p256_public_key()?;
+            let mut point = Vec::with_capacity(65);
+            point.push(0x04);
+            point.extend_from_slice(&x);
+            point.extend_from_slice(&y);
+            ring::signature::UnparsedPublicKey::new(
+                &ring::signature::ECDSA_P256_SHA256_FIXED,
+                point,
+            )
+            .verify(message, &signature)
+            .map_err(|_| "CLOUD_TPM_SIGNATURE_INVALID")?;
+            Ok(signature)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = message;
+            Err("CLOUD_TPM_UNAVAILABLE".into())
+        }
     }
 
     fn private_key(&self) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -139,31 +305,70 @@ impl DeviceKey {
     }
 
     pub fn public_identity(&self) -> Result<DevicePublicIdentity, String> {
-        let (_private, key_pair) = self.key_pair()?;
-        let x = URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref());
-        let public_jwk = PublicJwk {
-            kty: "OKP".into(),
-            crv: "Ed25519".into(),
-            x,
+        let public_jwk = match self.algorithm() {
+            DpopAlgorithm::EdDsa => {
+                let (_private, key_pair) = self.key_pair()?;
+                PublicJwk {
+                    kty: "OKP".into(),
+                    crv: "Ed25519".into(),
+                    x: URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref()),
+                    y: None,
+                }
+            }
+            DpopAlgorithm::Es256 => {
+                let (x, y) = self
+                    .tpm_p256_public_key()
+                    .map_err(|error| self.mark_lost_identity_reauth(error))?;
+                PublicJwk {
+                    kty: "EC".into(),
+                    crv: "P-256".into(),
+                    x: URL_SAFE_NO_PAD.encode(x),
+                    y: Some(URL_SAFE_NO_PAD.encode(y)),
+                }
+            }
         };
-        let canonical = format!(
-            "{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{}\"}}",
-            public_jwk.x
-        );
+        let canonical = match (&public_jwk.kty[..], &public_jwk.crv[..], &public_jwk.y) {
+            ("OKP", "Ed25519", None) => format!(
+                "{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{}\"}}",
+                public_jwk.x
+            ),
+            ("EC", "P-256", Some(y)) => format!(
+                "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+                public_jwk.x, y
+            ),
+            _ => return Err("CLOUD_DEVICE_KEY_INVALID".into()),
+        };
         let thumbprint = URL_SAFE_NO_PAD.encode(ring::digest::digest(
             &ring::digest::SHA256,
             canonical.as_bytes(),
         ));
+        let device_id = if self.algorithm() == DpopAlgorithm::EdDsa
+            && self.store.get(DEVICE_ID_ID)?.is_none()
+            && self.store.get(SESSION_ID)?.is_some()
+        {
+            // Preserve proofs for pre-v1 sessions, whose device id was the EdDSA thumbprint.
+            thumbprint.clone()
+        } else {
+            self.device_id()
+                .map_err(|error| self.mark_lost_identity_reauth(error))?
+        };
         Ok(DevicePublicIdentity {
-            device_id: thumbprint.clone(),
+            device_id,
             public_jwk,
             thumbprint,
         })
     }
 
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
-        let (_private, key_pair) = self.key_pair()?;
-        Ok(key_pair.sign(message).as_ref().to_vec())
+        match self.algorithm() {
+            DpopAlgorithm::EdDsa => {
+                let (_private, key_pair) = self.key_pair()?;
+                Ok(key_pair.sign(message).as_ref().to_vec())
+            }
+            DpopAlgorithm::Es256 => self
+                .tpm_p256_sign(message)
+                .map_err(|error| self.mark_lost_identity_reauth(error)),
+        }
     }
 
     pub fn dpop_proof(
@@ -188,7 +393,7 @@ impl DeviceKey {
 
         let header = serde_json::json!({
             "typ": "dpop+jwt",
-            "alg": "EdDSA",
+            "alg": self.algorithm().as_jws_name(),
             "jwk": identity.public_jwk,
         });
         let mut claims = serde_json::Map::new();
@@ -218,6 +423,7 @@ impl DeviceKey {
             refresh_token: Some(session.refresh_token.clone()),
             expires_at_ms: Some(session.expires_at_ms),
             sid: session.sid.clone(),
+            key_algorithm: Some(self.algorithm()),
             reauth_required: false,
         })
         .map_err(|_| "CLOUD_SESSION_STORE_FAILED")?;
@@ -247,7 +453,12 @@ impl DeviceKey {
     }
 
     pub fn clear_session(&self) -> Result<(), String> {
-        self.store.delete(SESSION_ID)
+        self.store.delete(SESSION_ID)?;
+        *self
+            .algorithm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = DpopAlgorithm::Es256;
+        Ok(())
     }
 
     pub fn stored_session_status(&self) -> Result<StoredSessionStatus, String> {
@@ -275,6 +486,7 @@ impl DeviceKey {
             refresh_token: None,
             expires_at_ms: None,
             sid: None,
+            key_algorithm: Some(self.algorithm()),
             reauth_required: true,
         })
         .map_err(|_| "CLOUD_SESSION_STORE_FAILED")?;
@@ -302,6 +514,189 @@ impl DeviceKey {
     pub fn rotate_session(&self, rotated: &SessionTokens) -> Result<(), String> {
         // One keychain item makes pair replacement atomic from the application's point of view.
         self.store_session(rotated)
+    }
+}
+
+const TPM_KEY_METADATA_VALUE: &str =
+    "v1;provider=Microsoft Platform Crypto Provider;key=systems.xyra.agentos.cloud.dpop.es256.v1;export=disabled";
+
+fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|index| bytes[*index] == b'-')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index)
+                || byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(byte)
+        })
+        && matches!(bytes[14], b'4')
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+}
+
+#[cfg(windows)]
+mod cng_tpm {
+    use ring::digest::{digest, SHA256};
+    use std::sync::Mutex;
+    use windows_sys::core::w;
+    use windows_sys::Win32::Security::Cryptography::{
+        NCryptCreatePersistedKey, NCryptExportKey, NCryptFinalizeKey, NCryptFreeObject,
+        NCryptOpenKey, NCryptOpenStorageProvider, NCryptSetProperty, BCRYPT_ECCPUBLIC_BLOB,
+        BCRYPT_ECDSA_PUBLIC_P256_MAGIC, MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_ALLOW_SIGNING_FLAG,
+        NCRYPT_ECDSA_P256_ALGORITHM, NCRYPT_EXPORT_POLICY_PROPERTY, NCRYPT_KEY_USAGE_PROPERTY,
+        NCRYPT_SILENT_FLAG,
+    };
+
+    const KEY_NAME: windows_sys::core::PCWSTR = w!("systems.xyra.agentos.cloud.dpop.es256.v1");
+    const NTE_BAD_KEYSET: u32 = 0x8009_0016;
+    static KEY_CREATION: Mutex<()> = Mutex::new(());
+
+    struct NcryptObject(usize);
+
+    impl Drop for NcryptObject {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { NCryptFreeObject(self.0) };
+            }
+        }
+    }
+
+    fn provider() -> Result<NcryptObject, String> {
+        let mut handle = 0;
+        let status =
+            unsafe { NCryptOpenStorageProvider(&mut handle, MS_PLATFORM_CRYPTO_PROVIDER, 0) };
+        if status != 0 || handle == 0 {
+            return Err("CLOUD_TPM_UNAVAILABLE".into());
+        }
+        Ok(NcryptObject(handle))
+    }
+
+    fn open_key(provider: &NcryptObject) -> Result<NcryptObject, u32> {
+        let mut handle = 0;
+        let status =
+            unsafe { NCryptOpenKey(provider.0, &mut handle, KEY_NAME, 0, NCRYPT_SILENT_FLAG) };
+        if status != 0 || handle == 0 {
+            return Err(status as u32);
+        }
+        Ok(NcryptObject(handle))
+    }
+
+    fn create_key(provider: &NcryptObject) -> Result<NcryptObject, String> {
+        let mut handle = 0;
+        let status = unsafe {
+            NCryptCreatePersistedKey(
+                provider.0,
+                &mut handle,
+                NCRYPT_ECDSA_P256_ALGORITHM,
+                KEY_NAME,
+                0,
+                0,
+            )
+        };
+        if status != 0 || handle == 0 {
+            return Err("CLOUD_TPM_KEY_CREATE_FAILED".into());
+        }
+        let key = NcryptObject(handle);
+        let non_exportable: u32 = 0;
+        let signing_only = NCRYPT_ALLOW_SIGNING_FLAG;
+        for (property, value) in [
+            (NCRYPT_EXPORT_POLICY_PROPERTY, &non_exportable),
+            (NCRYPT_KEY_USAGE_PROPERTY, &signing_only),
+        ] {
+            let status = unsafe {
+                NCryptSetProperty(
+                    key.0,
+                    property,
+                    (value as *const u32).cast(),
+                    std::mem::size_of::<u32>() as u32,
+                    NCRYPT_SILENT_FLAG,
+                )
+            };
+            if status != 0 {
+                return Err("CLOUD_TPM_KEY_POLICY_FAILED".into());
+            }
+        }
+        let status = unsafe { NCryptFinalizeKey(key.0, NCRYPT_SILENT_FLAG) };
+        if status != 0 {
+            return Err("CLOUD_TPM_KEY_FINALIZE_FAILED".into());
+        }
+        Ok(key)
+    }
+
+    fn open_or_create(allow_create: bool) -> Result<(NcryptObject, NcryptObject), String> {
+        let provider = provider()?;
+        match open_key(&provider) {
+            Ok(key) => Ok((provider, key)),
+            Err(status) if status == NTE_BAD_KEYSET => {
+                if !allow_create {
+                    return Err("CLOUD_TPM_KEY_LOST_REAUTH_REQUIRED".into());
+                }
+                let _guard = KEY_CREATION
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match open_key(&provider) {
+                    Ok(key) => Ok((provider, key)),
+                    Err(status) if status == NTE_BAD_KEYSET => match create_key(&provider) {
+                        Ok(key) => Ok((provider, key)),
+                        Err(error) => match open_key(&provider) {
+                            Ok(key) => Ok((provider, key)),
+                            Err(_) => Err(error),
+                        },
+                    },
+                    Err(_) => Err("CLOUD_TPM_KEY_OPEN_FAILED".into()),
+                }
+            }
+            Err(_) => Err("CLOUD_TPM_KEY_OPEN_FAILED".into()),
+        }
+    }
+
+    pub fn public_key(allow_create: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let (_provider, key) = open_or_create(allow_create)?;
+        let mut blob = [0u8; 72];
+        let mut written = 0;
+        let status = unsafe {
+            NCryptExportKey(
+                key.0,
+                0,
+                BCRYPT_ECCPUBLIC_BLOB,
+                std::ptr::null(),
+                blob.as_mut_ptr(),
+                blob.len() as u32,
+                &mut written,
+                NCRYPT_SILENT_FLAG,
+            )
+        };
+        if status != 0 || written != blob.len() as u32 {
+            return Err("CLOUD_TPM_PUBLIC_KEY_READ_FAILED".into());
+        }
+        let magic = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+        let key_bytes = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+        if magic != BCRYPT_ECDSA_PUBLIC_P256_MAGIC || key_bytes != 32 {
+            return Err("CLOUD_TPM_PUBLIC_KEY_INVALID".into());
+        }
+        Ok((blob[8..40].to_vec(), blob[40..72].to_vec()))
+    }
+
+    pub fn sign(message: &[u8]) -> Result<Vec<u8>, String> {
+        let (_provider, key) = open_or_create(false)?;
+        let hashed = digest(&SHA256, message);
+        let mut signature = [0u8; 64];
+        let mut written = 0;
+        let status = unsafe {
+            windows_sys::Win32::Security::Cryptography::NCryptSignHash(
+                key.0,
+                std::ptr::null(),
+                hashed.as_ref().as_ptr(),
+                hashed.as_ref().len() as u32,
+                signature.as_mut_ptr(),
+                signature.len() as u32,
+                &mut written,
+                NCRYPT_SILENT_FLAG,
+            )
+        };
+        if status != 0 || written != signature.len() as u32 {
+            return Err("CLOUD_TPM_SIGN_FAILED".into());
+        }
+        Ok(signature.to_vec())
     }
 }
 
@@ -340,7 +735,9 @@ mod tests {
         assert_eq!(first.public_jwk.kty, "OKP");
         assert_eq!(first.public_jwk.crv, "Ed25519");
         assert!(!serde_json::to_string(&first).unwrap().contains("private"));
-        assert_eq!(store.0.lock().unwrap().len(), 1);
+        let persisted = store.0.lock().unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert!(persisted.contains_key(DEVICE_ID_ID));
     }
 
     #[test]
@@ -425,5 +822,44 @@ mod tests {
             "CLOUD_SESSION_TOO_LARGE"
         );
         assert_eq!(key.load_session().unwrap(), Some(initial));
+    }
+
+    #[test]
+    fn production_key_selection_uses_es256_for_new_and_preserves_existing_algorithm() {
+        let empty = Arc::new(MemoryStore::default());
+        assert_eq!(
+            DeviceKey::production(empty).unwrap().current_algorithm(),
+            DpopAlgorithm::Es256
+        );
+
+        let legacy = Arc::new(MemoryStore::default());
+        legacy
+            .set(
+                SESSION_ID,
+                r#"{"access_token":"a","refresh_token":"r","expires_at_ms":100,"sid":null}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            DeviceKey::production(legacy).unwrap().current_algorithm(),
+            DpopAlgorithm::EdDsa
+        );
+
+        let pending = Arc::new(MemoryStore::default());
+        pending
+            .set(PENDING_AUTH_ID, r#"{"key_algorithm":"ES256"}"#)
+            .unwrap();
+        assert_eq!(
+            DeviceKey::production(pending).unwrap().current_algorithm(),
+            DpopAlgorithm::Es256
+        );
+    }
+
+    #[test]
+    fn newly_allocated_device_id_is_a_stable_rfc4122_v4_uuid() {
+        let store = Arc::new(MemoryStore::default());
+        let key = DeviceKey::new(store.clone());
+        let first = key.device_id().unwrap();
+        assert!(is_uuid(&first));
+        assert_eq!(first, DeviceKey::new(store).device_id().unwrap());
     }
 }
