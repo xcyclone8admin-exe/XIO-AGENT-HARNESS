@@ -6,3 +6,4 @@ export * from './connectors';
 export * from './platform';
 export * from './sync';
 export * from './fields';
+export * from './erasure';
