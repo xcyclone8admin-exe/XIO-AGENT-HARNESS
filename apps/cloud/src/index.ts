@@ -894,6 +894,10 @@ app.post('/v1/blobs/ref', async (c) => {
   if (!key) return c.json({ code: 'INVALID_BLOB_NAME' }, 400);
   let objectRefId: string | null = null;
   const registryDatabase = databaseUrl(c.env);
+  // Ingestion-v2 issuance is only successful when the object identity is durably
+  // registered against the collecting ingestion. Legacy generic refs remain usable,
+  // but cannot be mistaken for a finalized ingestion reference.
+  if (ingestionId && !registryDatabase) return c.json({ code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' }, 503);
   if (mode === 'PUT' && registryDatabase) {
     try {
       const registration = await withNeonTransaction(registryDatabase,
@@ -977,6 +981,7 @@ app.post('/v1/blobs/ref', async (c) => {
       return c.json({ code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' }, 503);
     }
   }
+  if (ingestionId && !objectRefId) return c.json({ code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' }, 503);
   const expiresAtMs = Date.now() + expiresInSec * 1000;
   const token = await signBlobAccess(
     { key, principalId: current.claims.principalId, mode, expiresAtMs, ...(ingestionId ? { ingestionId } : {}) },

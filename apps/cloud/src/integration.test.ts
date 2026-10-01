@@ -734,6 +734,13 @@ describe('blob references on workerd', () => {
     await seed(U1);
     const token = await mint(U1);
     expect((await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 301 })).status).toBe(403);
+    const untrackedIngestion = await ref(token, {
+      mode: 'PUT', name: 'ingestion.txt', expiresInSec: 120, ingestionId: uuid(7701),
+    });
+    expect(untrackedIngestion).toMatchObject({
+      status: 503,
+      json: { code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' },
+    });
     const put = await ref(token, { mode: 'PUT', name: 'a.txt', expiresInSec: 120 });
     expect(put.status).toBe(200);
     expect(put.json).not.toHaveProperty('key');
