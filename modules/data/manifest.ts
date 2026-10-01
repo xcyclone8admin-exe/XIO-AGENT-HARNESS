@@ -1,43 +1,47 @@
+import type { ColumnSpec } from '@xyra/contracts';
 import { defineModule } from '@xyra/contracts';
+import type { z } from 'zod';
 
-const DATASET_COLUMNS = {
-  id: { type: 'uuid' },
-  name: { type: 'text' },
-  kind: { type: 'text' },
-  created_by: { type: 'uuid' },
+type ColumnSpecInput = z.input<typeof ColumnSpec>;
+
+const DATASET_COLUMNS: Record<string, ColumnSpecInput> = {
+  id: { type: 'uuid', requiredOnInsert: true },
+  name: { type: 'text', requiredOnInsert: true, minLength: 1, maxLength: 200 },
+  kind: { type: 'text', requiredOnInsert: true, enum: ['sheet', 'derived'] },
+  created_by: { type: 'uuid', requiredOnInsert: true },
   created_at: { type: 'timestamptz' },
   updated_at: { type: 'timestamptz' },
-} as const;
+};
 
-const SHEET_CELL_COLUMNS = {
-  dataset_id: { type: 'uuid' },
-  row_index: { type: 'integer' },
-  col_index: { type: 'integer' },
-  formula: { type: 'text' },
-  value: { type: 'text' },
+const SHEET_CELL_COLUMNS: Record<string, ColumnSpecInput> = {
+  dataset_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'data_datasets' } },
+  row_index: { type: 'integer', requiredOnInsert: true, min: '0', max: '1000000' },
+  col_index: { type: 'integer', requiredOnInsert: true, min: '0', max: '16384' },
+  formula: { type: 'text', nullable: true },
+  value: { type: 'text', nullable: true },
   updated_at: { type: 'timestamptz' },
-} as const;
+};
 
-const PIPELINE_COLUMNS = {
-  id: { type: 'uuid' },
-  name: { type: 'text' },
-  steps: { type: 'jsonb' },
-  schedule_cron: { type: 'text' },
+const PIPELINE_COLUMNS: Record<string, ColumnSpecInput> = {
+  id: { type: 'uuid', requiredOnInsert: true },
+  name: { type: 'text', requiredOnInsert: true, minLength: 1, maxLength: 200 },
+  steps: { type: 'jsonb', requiredOnInsert: true },
+  schedule_cron: { type: 'text', nullable: true },
   schedule_enabled: { type: 'boolean' },
-  created_by: { type: 'uuid' },
+  created_by: { type: 'uuid', requiredOnInsert: true },
   created_at: { type: 'timestamptz' },
-} as const;
+};
 
-const PIPELINE_RUN_COLUMNS = {
-  id: { type: 'uuid' },
-  pipeline_id: { type: 'uuid' },
-  idempotency_key: { type: 'text' },
-  status: { type: 'text' },
+const PIPELINE_RUN_COLUMNS: Record<string, ColumnSpecInput> = {
+  id: { type: 'uuid', requiredOnInsert: true },
+  pipeline_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'data_pipelines' } },
+  idempotency_key: { type: 'text', requiredOnInsert: true, minLength: 1, maxLength: 200 },
+  status: { type: 'text', requiredOnInsert: true, enum: ['running', 'completed', 'failed'] },
   checkpoint: { type: 'jsonb' },
-  result: { type: 'jsonb' },
+  result: { type: 'jsonb', nullable: true },
   started_at: { type: 'timestamptz' },
-  completed_at: { type: 'timestamptz' },
-} as const;
+  completed_at: { type: 'timestamptz', nullable: true },
+};
 
 export default defineModule({
   id: 'data',
@@ -134,7 +138,13 @@ export default defineModule({
       receivedAtField: 'created_at',
       writePermission: 'data:pipeline:run',
       readPermission: 'data:lineage:read',
-      columns: { id: { type: 'uuid' }, output_dataset_id: { type: 'uuid' }, input_dataset_id: { type: 'uuid' }, pipeline_run_id: { type: 'uuid' }, created_at: { type: 'timestamptz' } },
+      columns: {
+        id: { type: 'uuid', requiredOnInsert: true },
+        output_dataset_id: { type: 'uuid', requiredOnInsert: true, references: { table: 'data_datasets' } },
+        input_dataset_id: { type: 'uuid', nullable: true, references: { table: 'data_datasets' } },
+        pipeline_run_id: { type: 'uuid', nullable: true, references: { table: 'data_pipeline_runs' } },
+        created_at: { type: 'timestamptz' },
+      },
     },
     {
       name: 'data_sql_audit_log',
@@ -143,7 +153,13 @@ export default defineModule({
       receivedAtField: 'executed_at',
       writePermission: 'data:sql:read',
       readPermission: 'data:sql:read',
-      columns: { id: { type: 'uuid' }, statement: { type: 'text' }, row_count: { type: 'integer' }, executed_by: { type: 'uuid' }, executed_at: { type: 'timestamptz' } },
+      columns: {
+        id: { type: 'uuid', requiredOnInsert: true },
+        statement: { type: 'text', requiredOnInsert: true },
+        row_count: { type: 'integer', requiredOnInsert: true, min: '0' },
+        executed_by: { type: 'uuid', requiredOnInsert: true },
+        executed_at: { type: 'timestamptz' },
+      },
     },
   ],
 });
