@@ -2,6 +2,7 @@ import { PreparedAgentRun, type AgentRunner, type AgentRunResult, type PreparedA
 import { hashApprovalInput, hashApprovalScope, VerifiedCapabilityApproval, type Principal, type VerifiedCapabilityApproval as VerifiedApproval } from '@xyra/contracts';
 import { uuidv7 } from '@xyra/core';
 import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
+import type { KillSwitchReader, KillSwitchSnapshot } from '../contracts';
 import { z } from 'zod';
 
 const ENQUEUE_CAPABILITY = 'swarm.runs.enqueue';
@@ -461,18 +462,7 @@ async function verifyReviewResultEnvelope(envelope: PreparedAgentRunResult): Pro
   }
 }
 
-export interface KillSwitchSnapshot {
-  readonly engaged: boolean;
-  readonly reason: string | null;
-  readonly changedBy: string | null;
-  readonly changedAt: string | null;
-}
-
 /** Narrow trusted host read/set API. Host may hydrate its in-memory signal from set's result. */
-export interface KillSwitchReader {
-  getKillSwitch(scope: Scope): Promise<KillSwitchSnapshot>;
-}
-
 export class SwarmKillSwitchService implements KillSwitchReader {
   constructor(private readonly store: LocalScopedStore, private readonly now: () => number = Date.now) {}
 

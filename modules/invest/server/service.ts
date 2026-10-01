@@ -3,7 +3,7 @@ import { HybridClock, uuidv7 } from '@xyra/core';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
 import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/ledger/contracts';
-import type { KillSwitchReader } from '@xyra/mod-swarm/server';
+import type { KillSwitchReader } from '@xyra/mod-swarm/contracts';
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
 import { allocateFifoTaxLots } from './tax-lots';

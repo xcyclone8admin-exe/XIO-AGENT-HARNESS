@@ -2,6 +2,18 @@ import { AgentProfile, AgentRunAdmissionRequest, NightShiftLeash, RunBudget, typ
 import { defineCapability } from '@xyra/contracts';
 import { z } from 'zod';
 
+/** Read-only port over the durable workspace agent kill switch; scope is always host-derived. */
+export type KillSwitchScope = { readonly tenantId: string; readonly workspaceId: string };
+export interface KillSwitchSnapshot {
+  readonly engaged: boolean;
+  readonly reason: string | null;
+  readonly changedBy: string | null;
+  readonly changedAt: string | null;
+}
+export interface KillSwitchReader {
+  getKillSwitch(scope: KillSwitchScope): Promise<KillSwitchSnapshot>;
+}
+
 const Empty = z.object({});
 const AgentRunSummary = z.object({
   runId: z.uuid(),
