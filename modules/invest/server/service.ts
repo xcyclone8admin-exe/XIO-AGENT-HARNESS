@@ -1107,6 +1107,9 @@ export class InvestService {
 function validateVerifiedInvestSignal(scope:InvestScope,signal:VerifiedInvestSignalEnvelope,lease:{leaseId:string;fence:number;expiresAt:string}):VerifiedInvestSignalEnvelope{
   if(!signal||typeof signal!=='object'||!signal.verification||typeof signal.verification!=='object'||!lease||typeof lease!=='object')
     throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
+  const exactKeys=(value:object,keys:string[])=>Object.keys(value).sort().join(',')===[...keys].sort().join(',');
+  if(!exactKeys(signal,['protocol','eventId','sourceId','tenantId','workspaceId','receivedAt','occurredAt','expiresAt','algorithmId','signalId','symbol','side','quantity','payloadDigest','verification'])||
+     !exactKeys(signal.verification,['signature','keyId'])||!exactKeys(lease,['leaseId','fence','expiresAt'])) throw new Error('INVEST_SIGNAL_CLAIM_INVALID');
   const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const event=/^[A-Za-z0-9_.:-]{1,128}$/;
   const digest=/^[0-9a-f]{64}$/;

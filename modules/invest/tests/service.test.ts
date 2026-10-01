@@ -276,6 +276,7 @@ test('Cloud signal claim becomes one immutable advisory decision before host ack
   await expect(service.consumeCloudInvestSignal(scope,{...envelope,payloadDigest:'d'.repeat(64)},claim,userId)).rejects.toThrow('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
   await expect(service.consumeCloudInvestSignal({tenantId,workspaceId:'019a0000-0000-7000-8000-000000000899'},envelope,claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
   await expect(service.consumeCloudInvestSignal(scope,{...envelope,payloadDigest:'invalid'},claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
+  await expect(service.consumeCloudInvestSignal(scope,{...envelope,extra:'forged'} as unknown as VerifiedInvestSignalV1,claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
   await expect(service.consumeCloudInvestSignal(scope,{...envelope,verification:{signature:'unverified',keyId:envelope.verification.keyId}} as unknown as VerifiedInvestSignalV1,claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
   await expect(service.consumeCloudInvestSignal(scope,{...envelope,verification:{signature:'verified',keyId:'invalid'}},claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
   await expect(service.consumeCloudInvestSignal(scope,{...envelope,expiresAt:new Date(now-1).toISOString()},claim,userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_INVALID');
