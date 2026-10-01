@@ -182,7 +182,11 @@ describe('Forge schema and workspace isolation', () => {
     expect(escalation.blockedTicketIds).toEqual(expect.arrayContaining([task.id, dependent.id]));
     expect((await forge.nodes(actorA, project.id)).filter((node) => [task.id, dependent.id].includes(node.id)).every((node) => node.state === 'blocked')).toBe(true);
     expect((await forge.escalations(actorA)).find((item) => item.id === escalation.discovery.id)?.status).toBe('open');
+    const secondEscalation = await forge.recordDiscovery(actorA, { ticketId: task.id, summary: 'A separate dependency change also needs review', evidenceIds: [evidenceRecord.id], affectedTicketIds: [] });
     expect((await forge.resolveEscalation(actorA, { escalationId: escalation.discovery.id, status: 'resolved', detail: 'Owner reviewed impact' }))?.status).toBe('resolved');
+    expect((await forge.nodes(actorA, project.id)).filter((node) => [task.id, dependent.id].includes(node.id)).every((node) => node.state === 'blocked')).toBe(true);
+    expect((await forge.resolveEscalation(actorA, { escalationId: secondEscalation.discovery.id, status: 'resolved', detail: 'Second impact reviewed' }))?.status).toBe('resolved');
+    expect((await forge.nodes(actorA, project.id)).filter((node) => [task.id, dependent.id].includes(node.id)).every((node) => node.state === 'ready')).toBe(true);
     await expect(forge.resolveEscalation(actorA, { escalationId: escalation.discovery.id, status: 'resolved', detail: 'Duplicate resolution' })).rejects.toThrow('FORGE_ESCALATION_ALREADY_RESOLVED');
     const archiveProject = await forge.createProject(actorA, { name: 'Archive lifecycle', requirements: [] });
     const archiveEpic = await forge.createNode(actorA, archiveProject.id, { parentId: null, kind: 'epic', title: 'Archived parent', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });

@@ -406,14 +406,19 @@ export class ForgeRepository {
       expanded = false;
       for (const node of projectNodes) if ((node.kind === 'ticket' || node.kind === 'subtask') && !impacted.has(node.id) && node.dependencies.some((dependency) => impacted.has(dependency))) { impacted.add(node.id); expanded = true; }
     }
-    const blockedTicketIds: string[] = [];
-    for (const node of projectNodes) {
-      if (!impacted.has(node.id) || !['ready', 'queued', 'running', 'review'].includes(node.state)) continue;
-      transitionTicket(node.state, 'blocked');
-      await this.store.query(this.scope(actor), "UPDATE forge_nodes SET state='blocked',updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3", [actor.tenantId, actor.workspaceId, node.id]);
-      blockedTicketIds.push(node.id);
-    }
+    const impactedIds = [...impacted];
+    const existingImpacts = impactedIds.length ? await this.store.query<Record<string, unknown> & { ticket_id: string; prior_state: string }>(this.scope(actor), "SELECT DISTINCT ON (i.ticket_id) i.ticket_id,i.prior_state FROM forge_escalation_ticket_impacts i JOIN forge_escalations e ON e.tenant_id=i.tenant_id AND e.workspace_id=i.workspace_id AND e.id=i.escalation_id LEFT JOIN LATERAL (SELECT status FROM forge_escalation_events WHERE tenant_id=e.tenant_id AND workspace_id=e.workspace_id AND escalation_id=e.id ORDER BY created_at DESC,id DESC LIMIT 1) d ON true WHERE i.tenant_id=$1 AND i.workspace_id=$2 AND i.ticket_id=ANY($3::uuid[]) AND COALESCE(d.status,'open')='open' ORDER BY i.ticket_id,i.created_at", [actor.tenantId, actor.workspaceId, impactedIds]) : { rows: [] };
+    const previousState = new Map(existingImpacts.rows.map((item) => [item.ticket_id, item.prior_state]));
+    const impactedNodes = projectNodes.filter((node) => impacted.has(node.id) && ['ready', 'queued', 'running', 'review'].includes(node.state));
+    const alreadyBlockedNodes = projectNodes.filter((node) => impacted.has(node.id) && node.state === 'blocked' && previousState.has(node.id));
+    const blockedTicketIds = [...impactedNodes, ...alreadyBlockedNodes].map((node) => node.id);
     await this.store.query(this.scope(actor), "INSERT INTO forge_escalations(id,tenant_id,workspace_id,ticket_id,classification,summary,evidence_ids,affected_ticket_ids,status,created_by) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,'open',$9)", [discovery.id, actor.tenantId, actor.workspaceId, ticket.id, discovery.classification, discovery.summary, json(discovery.evidenceIds), json(blockedTicketIds), actor.id]);
+    for (const node of impactedNodes) {
+      transitionTicket(node.state, 'blocked');
+      await this.store.query(this.scope(actor), 'INSERT INTO forge_escalation_ticket_impacts(id,tenant_id,workspace_id,escalation_id,ticket_id,prior_state,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uuidv7(), actor.tenantId, actor.workspaceId, discovery.id, node.id, node.state, actor.id]);
+      await this.store.query(this.scope(actor), "UPDATE forge_nodes SET state='blocked',updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3", [actor.tenantId, actor.workspaceId, node.id]);
+    }
+    for (const node of alreadyBlockedNodes) await this.store.query(this.scope(actor), 'INSERT INTO forge_escalation_ticket_impacts(id,tenant_id,workspace_id,escalation_id,ticket_id,prior_state,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uuidv7(), actor.tenantId, actor.workspaceId, discovery.id, node.id, previousState.get(node.id), actor.id]);
     return { discovery, blockedTicketIds };
   }
   async escalations(actor: ForgeActor) {
@@ -426,6 +431,11 @@ export class ForgeRepository {
     if (!current) throw new Error('FORGE_ESCALATION_NOT_FOUND');
     if (current.status !== 'open') throw new Error('FORGE_ESCALATION_ALREADY_RESOLVED');
     await this.store.query(this.scope(actor), 'INSERT INTO forge_escalation_events(id,tenant_id,workspace_id,escalation_id,status,detail,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uuidv7(), actor.tenantId, actor.workspaceId, request.escalationId, request.status, request.detail, actor.id]);
+    const { rows: impacts } = await this.store.query<Record<string, unknown> & { ticket_id: string }>(this.scope(actor), 'SELECT ticket_id FROM forge_escalation_ticket_impacts WHERE tenant_id=$1 AND workspace_id=$2 AND escalation_id=$3', [actor.tenantId, actor.workspaceId, request.escalationId]);
+    for (const impact of impacts) {
+      const { rows: blockers } = await this.store.query(this.scope(actor), "SELECT e.id FROM forge_escalation_ticket_impacts i JOIN forge_escalations e ON e.tenant_id=i.tenant_id AND e.workspace_id=i.workspace_id AND e.id=i.escalation_id LEFT JOIN LATERAL (SELECT status FROM forge_escalation_events WHERE tenant_id=e.tenant_id AND workspace_id=e.workspace_id AND escalation_id=e.id ORDER BY created_at DESC,id DESC LIMIT 1) d ON true WHERE i.tenant_id=$1 AND i.workspace_id=$2 AND i.ticket_id=$3 AND COALESCE(d.status,'open')='open'", [actor.tenantId, actor.workspaceId, impact.ticket_id]);
+      if (!blockers.length) await this.store.query(this.scope(actor), "UPDATE forge_nodes SET state='ready',updated_at=now() WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 AND kind IN ('ticket','subtask') AND state='blocked'", [actor.tenantId, actor.workspaceId, impact.ticket_id]);
+    }
     return (await this.escalations(actor)).find((item) => item.id === request.escalationId);
   }
   async recordGateEvaluation(actor: ForgeActor, evaluation: { gates: Array<{ id: string; requirementId: string; kind: 'deterministic' | 'human' | 'ai-judgment'; status: 'pass' | 'fail' | 'pending' | 'blocked'; hard: boolean; evidenceIds: string[] }> }) {
