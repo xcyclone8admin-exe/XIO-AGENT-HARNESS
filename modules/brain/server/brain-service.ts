@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson, uuidv7 } from '@xyra/core';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ClaimDraft, IngestDraft, MemoryDraft, MemoryListInput, ProcedureListInput, SearchInput, type MemoryType } from '../contracts';
+import { ClaimDraft, CloudReferenceStageInput, IngestDraft, MemoryDraft, MemoryListInput, ProcedureListInput, SearchInput, type MemoryType } from '../contracts';
 import { BrainErasureService } from './brain-erasure-service';
 import type { CloudErasureClient } from './erasure-cloud';
 import { BrainIngestionBeginInput, BrainIngestionBeginResult, BrainIngestionFinalizeInput, BrainIngestionFinalizationReceipt, BrainIngestionStatus, type CloudBrainIngestionClient } from './cloud-ingestion';
@@ -41,17 +41,20 @@ export class BrainService {
   /** Finalization is accepted only from the authenticated Cloud client and is persisted after local binding checks. */
   async finalizeCloudIngestion(scope: Scope, sourceVersionId: string, ingestionId: string, cloud: CloudBrainIngestionClient) {
     const local = await this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
-      const result = await tx.query<Record<string, unknown> & { id: string; source_id: string; content_digest: string; ingestion_id: string | null; status: string }>(
-        `SELECT id,source_id,content_digest,ingestion_id,status FROM brain_source_blob_reference_sets
+      const result = await tx.query<Record<string, unknown> & { id: string; source_id: string; content_digest: string; ingestion_id: string | null; status: string; object_ref_ids: string[] | null }>(
+        `SELECT id,source_id,content_digest,ingestion_id,status,object_ref_ids FROM brain_source_blob_reference_sets
          WHERE tenant_id=$1 AND workspace_id=$2 AND source_version_id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
       return result.rows[0];
     });
     if (!local || local.ingestion_id !== ingestionId || local.status === 'unknown') throw new Error('SOURCE_REFERENCES_UNAVAILABLE');
-    const source = await this.store.query<Record<string, unknown> & { id: string; content_hash: string }>(scope,
-      `SELECT s.id,v.content_hash FROM brain_sources s JOIN brain_source_versions v
+    const source = await this.store.query<Record<string, unknown> & { id: string; content_hash: string; cloud_object_ref_ids: string[] | null }>(scope,
+      `SELECT s.id,v.content_hash,s.cloud_object_ref_ids FROM brain_sources s JOIN brain_source_versions v
        ON (v.tenant_id,v.workspace_id,v.source_id)=(s.tenant_id,s.workspace_id,s.id)
        WHERE s.tenant_id=$1 AND s.workspace_id=$2 AND v.id=$3`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
     if (!source.rows[0] || source.rows[0].id !== local.source_id || source.rows[0].content_hash !== local.content_digest) throw new Error('SOURCE_CONTENT_VERSION_MISMATCH');
+    const stagedRefs = local.object_ref_ids;
+    if (!stagedRefs || !source.rows[0].cloud_object_ref_ids || canonicalJson(stagedRefs) !== canonicalJson(source.rows[0].cloud_object_ref_ids))
+      throw new Error('SOURCE_REFERENCES_NOT_STAGED');
     const finalize = BrainIngestionFinalizeInput.parse({ protocolVersion: 'cloud-ingest-v2', sourceVersionId, contentDigest: local.content_digest });
     await cloud.finalize(ingestionId, finalize);
     const state = BrainIngestionStatus.parse(await cloud.status(ingestionId));
@@ -67,18 +70,24 @@ export class BrainService {
     const refs = [...receipt.objectRefIds].sort();
     if (new Set(refs).size !== refs.length || canonicalJson(receipt.objectRefIds) !== canonicalJson(refs) ||
       (receipt.referenceState === 'verified_empty') !== (refs.length === 0)) throw new Error('CLOUD_INGESTION_REFERENCE_SET_INVALID');
+    if (canonicalJson(stagedRefs) !== canonicalJson(refs)) throw new Error('CLOUD_INGESTION_STAGED_REFERENCE_MISMATCH');
     const expectedReferenceDigest = await brainReferenceSetDigest(receipt.sourceId, receipt.sourceVersionId, refs);
     if (receipt.referenceSetDigest !== expectedReferenceDigest) throw new Error('CLOUD_INGESTION_REFERENCE_DIGEST_MISMATCH');
     const expectedSourceVersion = await brainSourceVersionV2({ sourceId: receipt.sourceId, sourceVersionId, tenantId: scope.tenantId,
       workspaceId: scope.workspaceId, contentDigest: receipt.contentDigest, objectRefIds: refs, referenceStateVersion: receipt.referenceStateVersion });
     if (receipt.sourceVersion !== expectedSourceVersion) throw new Error('CLOUD_INGESTION_SOURCE_VERSION_MISMATCH');
     await this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
-      const current = await tx.query<Record<string, unknown> & { content_hash: string }>(`SELECT content_hash FROM brain_source_versions
-        WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
-      const state = await tx.query<Record<string, unknown> & { content_digest: string; ingestion_id: string | null }>(`SELECT content_digest,ingestion_id
+      const current = await tx.query<Record<string, unknown> & { id: string; content_hash: string }>(`SELECT id,content_hash FROM brain_source_versions
+        WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 ORDER BY version DESC,id LIMIT 1 FOR UPDATE`,
+      [scope.tenantId, scope.workspaceId, local.source_id]);
+      const sourceRow = await tx.query<Record<string, unknown> & { cloud_object_ref_ids: string[] | null }>(`SELECT cloud_object_ref_ids FROM brain_sources
+        WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, local.source_id]);
+      const state = await tx.query<Record<string, unknown> & { content_digest: string; ingestion_id: string | null; object_ref_ids: string[] | null }>(`SELECT content_digest,ingestion_id,object_ref_ids
         FROM brain_source_blob_reference_sets WHERE tenant_id=$1 AND workspace_id=$2 AND source_version_id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, sourceVersionId]);
-      if (!current.rows[0] || current.rows[0].content_hash !== receipt.contentDigest || !state.rows[0] ||
-        state.rows[0].content_digest !== receipt.contentDigest || state.rows[0].ingestion_id !== ingestionId) throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
+      if (!current.rows[0] || current.rows[0].id !== sourceVersionId || current.rows[0].content_hash !== receipt.contentDigest ||
+        !sourceRow.rows[0] || canonicalJson(sourceRow.rows[0].cloud_object_ref_ids) !== canonicalJson(refs) || !state.rows[0] ||
+        state.rows[0].content_digest !== receipt.contentDigest || state.rows[0].ingestion_id !== ingestionId ||
+        canonicalJson(state.rows[0].object_ref_ids) !== canonicalJson(refs)) throw new Error('SOURCE_REFERENCE_SNAPSHOT_STALE');
       await tx.query(`UPDATE brain_sources SET cloud_object_ref_ids=$1::jsonb,updated_at=now() WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4`,
         [JSON.stringify(refs), scope.tenantId, scope.workspaceId, local.source_id]);
       await tx.query(`UPDATE brain_source_blob_reference_sets SET status=$1,object_ref_ids=$2::jsonb,source_version=$3,
@@ -95,6 +104,56 @@ export class BrainService {
       await tx.query(`UPDATE brain_source_blob_reference_sets SET status='unavailable',attempts=LEAST(20,attempts+1),
         last_error_code=$1,updated_at=now() WHERE tenant_id=$2 AND workspace_id=$3 AND source_version_id=$4`,
       [code.slice(0,160).replace(/[^a-zA-Z0-9_.:-]/g,'_'), scope.tenantId, scope.workspaceId, sourceVersionId]);
+    });
+  }
+
+  /**
+   * Stages only references returned by the authenticated native Cloud upload flow.
+   * This is a normal write capability, not remote proof; sync acceptance and Cloud
+   * finalization are still required before the snapshot becomes verified.
+   */
+  async stageCloudReference(scope: Scope, input: unknown) {
+    const parsed = CloudReferenceStageInput.parse(input);
+    if (parsed.mode === 'with_objects' && parsed.objectRefId !== parsed.objectRefId.toLowerCase()) throw new Error('CLOUD_OBJECT_REF_ID_INVALID');
+    return this.store.withServerScope(scope, 'brain_erasure', undefined, async (tx) => {
+      const sourceResult = await tx.query<Record<string, unknown> & { id: string; external_blob_refs: string[]; cloud_object_ref_ids: string[] | null }>(
+        `SELECT id,external_blob_refs,cloud_object_ref_ids FROM brain_sources
+         WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, parsed.sourceId]);
+      const source = sourceResult.rows[0];
+      if (!source) throw new Error('SOURCE_NOT_FOUND');
+      if (source.external_blob_refs?.length) throw new Error('SOURCE_REFERENCES_UNAVAILABLE');
+      const versionResult = await tx.query<Record<string, unknown> & { id: string; version: number; content_hash: string }>(
+        `SELECT id,version,content_hash FROM brain_source_versions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3
+         ORDER BY version DESC,id LIMIT 1 FOR UPDATE`, [scope.tenantId, scope.workspaceId, parsed.sourceId]);
+      const currentVersion = versionResult.rows[0];
+      if (!currentVersion || currentVersion.id !== parsed.sourceVersionId) throw new Error('SOURCE_VERSION_STALE');
+      const stateResult = await tx.query<Record<string, unknown> & { content_digest: string; ingestion_id: string | null; status: string; object_ref_ids: string[] | null }>(
+        `SELECT content_digest,ingestion_id,status,object_ref_ids FROM brain_source_blob_reference_sets
+         WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_version_id=$4 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, parsed.sourceId, parsed.sourceVersionId]);
+      const state = stateResult.rows[0];
+      if (!state || state.status !== 'pending' || state.ingestion_id !== parsed.ingestionId || state.content_digest !== currentVersion.content_hash)
+        throw new Error('CLOUD_INGESTION_BINDING_MISMATCH');
+      const sourceRefs = source.cloud_object_ref_ids;
+      const stateRefs = state.object_ref_ids;
+      if ((sourceRefs === null) !== (stateRefs === null) || (sourceRefs && stateRefs && canonicalJson(sourceRefs) !== canonicalJson(stateRefs)))
+        throw new Error('SOURCE_REFERENCE_SNAPSHOT_MISMATCH');
+      const refs = [...(stateRefs ?? [])];
+      if (parsed.mode === 'text_only' && refs.length) throw new Error('TEXT_ONLY_REFERENCE_SET_NOT_EMPTY');
+      if (parsed.mode === 'with_objects') {
+        if (!refs.includes(parsed.objectRefId)) refs.push(parsed.objectRefId);
+      }
+      refs.sort();
+      await tx.query(`UPDATE brain_sources SET cloud_object_ref_ids=$1::jsonb,updated_at=now()
+        WHERE tenant_id=$2 AND workspace_id=$3 AND id=$4`, [JSON.stringify(refs), scope.tenantId, scope.workspaceId, parsed.sourceId]);
+      await tx.query(`UPDATE brain_source_blob_reference_sets SET object_ref_ids=$1::jsonb,updated_at=now()
+        WHERE tenant_id=$2 AND workspace_id=$3 AND source_id=$4 AND source_version_id=$5`,
+      [JSON.stringify(refs), scope.tenantId, scope.workspaceId, parsed.sourceId, parsed.sourceVersionId]);
+      const referenceSetDigest = await brainReferenceSetDigest(parsed.sourceId, parsed.sourceVersionId, refs);
+      return { sourceId: parsed.sourceId, sourceVersionId: parsed.sourceVersionId, ingestionId: parsed.ingestionId,
+        objectRefId: parsed.mode === 'with_objects' ? parsed.objectRefId : null, objectRefIds: refs,
+        contentDigest: currentVersion.content_hash, referenceSetDigest,
+        referenceState: 'pending' as const, syncRequired: true as const };
     });
   }
 

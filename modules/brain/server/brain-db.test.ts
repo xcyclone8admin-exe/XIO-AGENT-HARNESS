@@ -30,6 +30,7 @@ let store: LocalScopedStore;
 let brain: BrainService;
 
 async function trustCloudFinalization(scope: typeof scopeA, source: { sourceId: string; versionId: string; contentDigest: string }, ingestionId = uuidv7(), overrides: Partial<CloudBrainIngestionFinalizationReceipt> = {}) {
+  await brain.stageCloudReference(scope, { mode: 'text_only', sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId });
   const refs: string[] = [];
   const receipt = {
     protocolVersion: 'cloud-ingest-v2' as const, status: 'finalized' as const, ingestionId,
@@ -88,7 +89,25 @@ describe('BRAIN schema and provenance', () => {
     await expect(trustCloudFinalization(scopeA, source, ingestionId, overrides)).rejects.toThrow('CLOUD_INGESTION_RECEIPT_BINDING_MISMATCH');
     const saved = await store.query<Record<string, unknown> & { cloud_object_ref_ids: unknown }>(scopeA,
       'SELECT cloud_object_ref_ids FROM brain_sources WHERE id=$1', [source.sourceId]);
-    expect(saved.rows[0]?.cloud_object_ref_ids).toBeNull();
+    expect(saved.rows[0]?.cloud_object_ref_ids).toEqual([]);
+  });
+
+  it('stages Cloud-issued object refs as pending and requires the current source version', async () => {
+    const ingestionId = uuidv7();
+    const source = await brain.ingest(scopeA, actor, { source: { sourceType: 'document', title: 'Cloud ref staging', trustLevel: 'user' }, cloudIngestionId: ingestionId, content: 'Cloud ref staging content.', contentType: 'text/plain' });
+    const objectRefId = '019a0000-0000-7000-8000-000000000077';
+    const staged = await brain.stageCloudReference(scopeA, { mode: 'with_objects', sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId, objectRefId });
+    expect(staged).toMatchObject({ sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId, objectRefId,
+      objectRefIds: [objectRefId], contentDigest: source.contentDigest, referenceState: 'pending', syncRequired: true });
+    expect(staged.referenceSetDigest).toBe(await brainReferenceSetDigest(source.sourceId, source.versionId, [objectRefId]));
+    expect(await brain.stageCloudReference(scopeA, { mode: 'with_objects', sourceId: source.sourceId, sourceVersionId: source.versionId, ingestionId, objectRefId }))
+      .toMatchObject({ objectRefIds: [objectRefId], referenceState: 'pending', syncRequired: true });
+    await expect(brain.stageCloudReference(scopeA, { mode: 'with_objects', sourceId: source.sourceId, sourceVersionId: uuidv7(), ingestionId, objectRefId }))
+      .rejects.toThrow('SOURCE_VERSION_STALE');
+    const rows = await store.query<Record<string, unknown> & { cloud_object_ref_ids: unknown; status: string; object_ref_ids: unknown }>(scopeA,
+      `SELECT s.cloud_object_ref_ids,r.status,r.object_ref_ids FROM brain_sources s JOIN brain_source_blob_reference_sets r
+       ON (r.tenant_id,r.workspace_id,r.source_id)=(s.tenant_id,s.workspace_id,s.id) WHERE s.id=$1 AND r.source_version_id=$2`, [source.sourceId, source.versionId]);
+    expect(rows.rows[0]).toMatchObject({ cloud_object_ref_ids: [objectRefId], status: 'pending', object_ref_ids: [objectRefId] });
   });
 
   it('measures Recall@10 against the independent labeled golden corpus', async () => {
