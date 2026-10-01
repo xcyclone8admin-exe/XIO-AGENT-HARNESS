@@ -75,6 +75,7 @@ const ForgeRegistration = {
       const request = forgeCapabilities.createNode.input.parse(input); return requireRepository(repository).createNode(actor(call), request.projectId, request.node);
     });
     bus.register(manifest, forgeCapabilities.updateNode, (input, call) => requireRepository(repository).updateNode(actor(call), forgeCapabilities.updateNode.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.archiveNode, (input, call) => requireRepository(repository).archiveNode(actor(call), forgeCapabilities.archiveNode.input.parse(input)));
     bus.register(manifest, forgeCapabilities.approvalRequest, (input, call) => requireRepository(repository).requestApproval(actor(call), forgeCapabilities.approvalRequest.input.parse(input)));
     bus.register(manifest, forgeCapabilities.approvals, (_input, call) => requireRepository(repository).approvals(actor(call)));
     bus.register(manifest, forgeCapabilities.approvalDecision, (input, call) => requireRepository(repository).decideApproval(actor(call), forgeCapabilities.approvalDecision.input.parse(input)));

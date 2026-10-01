@@ -146,6 +146,16 @@ describe('Forge schema and workspace isolation', () => {
     expect((await forge.escalations(actorA)).find((item) => item.id === escalation.discovery.id)?.status).toBe('open');
     expect((await forge.resolveEscalation(actorA, { escalationId: escalation.discovery.id, status: 'resolved', detail: 'Owner reviewed impact' }))?.status).toBe('resolved');
     await expect(forge.resolveEscalation(actorA, { escalationId: escalation.discovery.id, status: 'resolved', detail: 'Duplicate resolution' })).rejects.toThrow('FORGE_ESCALATION_ALREADY_RESOLVED');
+    const archiveProject = await forge.createProject(actorA, { name: 'Archive lifecycle', requirements: [] });
+    const archiveEpic = await forge.createNode(actorA, archiveProject.id, { parentId: null, kind: 'epic', title: 'Archived parent', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    const archiveTicket = await forge.createNode(actorA, archiveProject.id, { parentId: archiveEpic.id, kind: 'ticket', title: 'Archived child', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    await expect(forge.archiveNode(actorA, { nodeId: archiveEpic.id, reason: 'Parent still has active child' })).rejects.toThrow('FORGE_NODE_HAS_ACTIVE_DESCENDANTS');
+    const archivedTicket = await forge.archiveNode(actorA, { nodeId: archiveTicket.id, reason: 'No longer required' });
+    expect(archivedTicket.archivedAt).toBeTruthy();
+    await expect(forge.updateNode(actorA, { nodeId: archiveTicket.id, title: 'Should remain archived' })).rejects.toThrow('FORGE_NODE_ARCHIVED');
+    const archivedEpic = await forge.archiveNode(actorA, { nodeId: archiveEpic.id, reason: 'All descendants archived' });
+    expect((await forge.nodes(actorA, archiveProject.id)).filter((node) => node.archivedAt)).toHaveLength(2);
+    expect(archivedEpic.archivedAt).toBeTruthy();
   });
 
   it('derives tenant and workspace from trusted capability call context', async () => {

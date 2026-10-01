@@ -16,6 +16,7 @@ export const ForgeProjectCreate = z.object({ name: z.string().min(1).max(200), d
 export const ForgeProjectUpdate = z.object({ projectId: UUID, name: z.string().min(1).max(200).optional(), description: z.string().max(20_000).optional(), requirements: z.array(RequirementRef).max(500).optional() }).refine((value) => Object.keys(value).some((key) => key !== 'projectId'), 'At least one project field is required');
 export const HierarchyNode = z.object({
   id: UUID, tenantId: UUID, workspaceId: UUID, projectId: UUID,
+  archivedAt: z.iso.datetime({ offset: true }).nullable().default(null),
   parentId: UUID.nullable(), kind: NodeKind, title: z.string().min(1).max(500),
   description: z.string().max(20_000), state: z.string().min(1),
   priority: ForgePriority, dependencies: z.array(UUID).max(500),
@@ -23,8 +24,9 @@ export const HierarchyNode = z.object({
   ownerId: UUID.nullable(), createdBy: UUID, createdAt: z.iso.datetime({ offset: true }), updatedAt: z.iso.datetime({ offset: true }),
 });
 export type HierarchyNode = z.infer<typeof HierarchyNode>;
-export const ForgeNodeCreate = HierarchyNode.omit({ id: true, tenantId: true, workspaceId: true, projectId: true, createdBy: true, createdAt: true, updatedAt: true });
+export const ForgeNodeCreate = HierarchyNode.omit({ id: true, tenantId: true, workspaceId: true, projectId: true, archivedAt: true, createdBy: true, createdAt: true, updatedAt: true });
 export const ForgeNodeUpdate = z.object({ nodeId: UUID, title: z.string().min(1).max(500).optional(), description: z.string().max(20_000).optional(), state: z.string().min(1).optional(), priority: ForgePriority.optional(), dependencies: z.array(UUID).max(500).optional(), requirements: z.array(RequirementRef).max(500).optional(), acceptanceCriteria: z.array(z.string().min(1).max(2000)).max(100).optional(), ownerId: UUID.nullable().optional() }).refine((value) => Object.keys(value).some((key) => key !== 'nodeId'), 'At least one node field is required');
+export const ArchiveNodeRequest = z.object({ nodeId: UUID, reason: z.string().min(1).max(4000) });
 
 export const SpecDocument = z.object({
   id: z.string().regex(/^spec_[a-z0-9][a-z0-9-]{2,120}$/), template: z.string().min(1),
@@ -118,6 +120,7 @@ export const forgeCapabilities = {
   nodes: defineCapability({ id: 'forge.nodes.list', title: 'List project hierarchy', description: 'List hierarchy nodes in a project', kind: 'read', permission: 'forge:project:read', input: z.object({ projectId: UUID }), output: z.array(HierarchyNode) }),
   createNode: defineCapability({ id: 'forge.nodes.create', title: 'Create hierarchy node', description: 'Create a hierarchy node', kind: 'write', permission: 'forge:project:write', input: z.object({ projectId: UUID, node: ForgeNodeCreate }), output: HierarchyNode }),
   updateNode: defineCapability({ id: 'forge.nodes.update', title: 'Update hierarchy node', description: 'Update hierarchy metadata and state', kind: 'write', permission: 'forge:project:write', input: ForgeNodeUpdate, output: HierarchyNode }),
+  archiveNode: defineCapability({ id: 'forge.nodes.archive', title: 'Soft archive hierarchy node', description: 'Append an archive audit event and retain the node and its links', kind: 'write', permission: 'forge:project:write', input: ArchiveNodeRequest, output: HierarchyNode }),
   approvalRequest: defineCapability({ id: 'forge.approvals.request', title: 'Request project approval', description: 'Append approval request for an epic scope', kind: 'write', permission: 'forge:plan:approve', input: ApprovalRequestCreate, output: ApprovalRecord }),
   approvals: defineCapability({ id: 'forge.approvals.list', title: 'List project approvals', description: 'List approvals in the authenticated workspace', kind: 'read', permission: 'forge:project:read', input: z.object({}), output: z.array(ApprovalRecord) }),
   approvalDecision: defineCapability({ id: 'forge.approvals.decide', title: 'Decide project approval', description: 'Append an approval decision', kind: 'write', permission: 'forge:promotion:approve', input: ApprovalDecisionCreate, output: ApprovalRecord }),
