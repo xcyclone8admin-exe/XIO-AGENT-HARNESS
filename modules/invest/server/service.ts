@@ -17,6 +17,8 @@ type OrderRow = {
 };
 type PortfolioRow = { id: string; name: string; base_asset: string; book_id: string; environment: 'paper'; status: 'active'|'paused'|'closed' };
 type InvestScope = Scope & LedgerScope;
+type MandateDraft = { version: number; effectiveFrom: string; effectiveUntil: string|null; limits: Record<string, unknown>; allowedAssetClasses: Array<'equity'|'crypto'|'fixed_income'|'fund'>; allowedInstrumentIds: string[]; benchmark: string };
+type MandateDraftInput = MandateDraft & { portfolioId: string; title: string; thesis: string; sources: Array<{label:string;ref:string;sha256:string}> };
 
 /** Trusted local PAPER service. Scope and actor always come from the authenticated sidecar call. */
 export class InvestService {
@@ -31,14 +33,18 @@ export class InvestService {
     const reg = (descriptor: AnyCapability, handler: (input: unknown, call: Call) => Promise<unknown>) => bus.register(moduleManifest, descriptor, handler);
     reg(investCapabilities.portfolios, (_input, call) => this.portfolios(this.scope(call)));
     reg(investCapabilities.summary, (input, call) => this.summary(this.scope(call), input as { portfolioId: string }));
+    reg(investCapabilities.riskState, (input, call) => this.riskState(this.scope(call), input as { portfolioId: string }));
     reg(investCapabilities.instruments, (_input, call) => this.instruments(this.scope(call)));
     reg(investCapabilities.orders, (input, call) => this.orders(this.scope(call), input as { portfolioId?: string }));
     reg(investCapabilities.createPortfolio, (input, call) => this.createPortfolio(this.scope(call), this.actor(call), input as { name: string; baseAsset: string }));
     reg(investCapabilities.fundPortfolio, (input, call) => this.fundPortfolio(this.scope(call), this.actor(call), input as { portfolioId: string; units: string; reference: string }));
     reg(investCapabilities.createInstrument, (input, call) => this.createInstrument(this.scope(call), this.actor(call), input as { symbol: string; assetClass: 'equity'|'crypto'|'fixed_income'|'fund'; quantityScale: number; exchangeCode: string|null }));
-    reg(investCapabilities.recordPrice, (input, call) => this.recordPrice(this.scope(call), input as { instrumentId: string; priceUnits: string; source: string; sourceAt: string; volatilityBps: number; payloadHash: string }));
+    reg(investCapabilities.recordPrice, (input, call) => this.recordPrice(this.scope(call), this.actor(call), input as { instrumentId: string; priceUnits: string; source: string; sourceAt: string; volatilityBps: number; payloadHash: string }));
     reg(investCapabilities.recordMarketSession, (input, call) => this.recordMarketSession(this.scope(call), input as { exchangeCode: string; sessionDate: string; opensAt: string; closesAt: string; isOpen: boolean; source: string }));
-    reg(investCapabilities.createMandate, (input, call) => this.createMandate(this.scope(call), this.actor(call), input as { portfolioId: string; version: number; effectiveFrom: string; effectiveUntil: string|null; allowedAssetClasses: Array<'equity'|'crypto'|'fixed_income'|'fund'>; allowedInstrumentIds: string[]; benchmark: string; limits: unknown }));
+    reg(investCapabilities.createMandate, (input, call) => this.createMandate(this.scope(call), this.actor(call), input as MandateDraftInput));
+    reg(investCapabilities.icQueue, (_input, call) => this.icQueue(this.scope(call)));
+    reg(investCapabilities.voteMemo, (input, call) => this.voteMemo(this.scope(call), call, input as { memoId: string; vote: 'approve'|'reject'|'recuse'; reason: string }));
+    reg(investCapabilities.activateMandate, (input, call) => this.activateMandate(this.scope(call), call, input as { memoId: string }));
     reg(investCapabilities.propose, (input, call) => this.propose(this.scope(call), this.actor(call), input as { portfolioId: string; instrumentId: string; side: 'buy'|'sell'; orderType: 'market'|'limit'; limitPriceUnits?: string; stopPriceUnits: string; riskBps: number; idempotencyKey: string }));
     reg(investCapabilities.approve, (input, call) => this.approve(this.scope(call), this.actor(call), input as { orderId: string }));
     reg(investCapabilities.execute, (input, call) => this.execute(this.scope(call), this.actor(call), input as { orderId: string }));
@@ -51,6 +57,13 @@ export class InvestService {
     return { tenantId: call.principal.tenantId, workspaceId: call.workspaceId, hlc: this.clock.now() };
   }
   private actor(call: Call): string { return call.principal.delegatedBy ?? call.principal.id; }
+  private requireHumanOwner(scope: InvestScope, call: Call): string {
+    const member = call.principal.workspaces.find((workspace) => workspace.id === scope.workspaceId);
+    if (call.principal.kind !== 'user' || call.principal.delegatedBy || !member || !['owner','admin'].includes(member.role)) {
+      throw new Error('IC votes and mandate approval require a direct owner or admin action');
+    }
+    return call.principal.id;
+  }
 
   async portfolios(scope: InvestScope): Promise<PortfolioRow[]> {
     return (await this.scoped.query<PortfolioRow>(scope,
@@ -89,22 +102,106 @@ export class InvestService {
        ORDER BY o.created_at DESC LIMIT 200`, [scope.tenantId, scope.workspaceId, filter.portfolioId ?? null])).rows;
   }
 
+  async riskState(scope: InvestScope, input: { portfolioId: string }): Promise<{portfolioId:string;killSwitch:boolean;killReason:string|null;dailyLossUnits:string;riskDate:string}> {
+    const row = await this.scoped.query<{kill_switch:boolean;kill_reason:string|null;daily_loss_units:string;risk_date:string}>(scope,
+      `SELECT kill_switch,kill_reason,daily_loss_units::text,risk_date::text FROM invest_portfolio_risk_state
+       WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`,
+      [scope.tenantId, scope.workspaceId, input.portfolioId]);
+    const state = row.rows[0];
+    if (!state) throw new Error('Portfolio risk state not found');
+    return { portfolioId: input.portfolioId, killSwitch: state.kill_switch, killReason: state.kill_reason,
+      dailyLossUnits: state.daily_loss_units, riskDate: state.risk_date };
+  }
+
   async instruments(scope: InvestScope): Promise<Array<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>> {
     return (await this.scoped.query<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>(scope, `SELECT id,symbol,asset_class,quantity_scale,exchange_code FROM invest_instruments
       WHERE tenant_id=$1 AND workspace_id=$2 AND active=true ORDER BY symbol`, [scope.tenantId, scope.workspaceId])).rows;
   }
 
-  async recordPrice(scope: InvestScope, input: { instrumentId: string; priceUnits: string; source: string; sourceAt: string; volatilityBps: number; payloadHash: string }): Promise<{id:string;received_at:string}> {
+  async recordPrice(scope: InvestScope, actorId: string, input: { instrumentId: string; priceUnits: string; source: string; sourceAt: string; volatilityBps: number; payloadHash: string }): Promise<{id:string;received_at:string}> {
     const result = await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
       const insert = await tx.query<{id:string;received_at:string}>(
         `INSERT INTO invest_market_prices(id,tenant_id,workspace_id,instrument_id,price_units,source,source_at,volatility_bps,payload_hash)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(tenant_id,workspace_id,instrument_id,source,payload_hash) DO NOTHING RETURNING id,received_at::text`,
         [uuidv7(), scope.tenantId, scope.workspaceId, input.instrumentId, input.priceUnits, input.source, input.sourceAt, input.volatilityBps, input.payloadHash]);
-      if (insert.rows[0]) return insert;
-      return tx.query<{id:string;received_at:string}>(`SELECT id,received_at::text FROM invest_market_prices WHERE tenant_id=$1 AND workspace_id=$2 AND instrument_id=$3 AND source=$4 AND payload_hash=$5`,
+      const row = insert.rows[0] ? insert : await tx.query<{id:string;received_at:string}>(`SELECT id,received_at::text FROM invest_market_prices WHERE tenant_id=$1 AND workspace_id=$2 AND instrument_id=$3 AND source=$4 AND payload_hash=$5`,
         [scope.tenantId, scope.workspaceId, input.instrumentId, input.source, input.payloadHash]);
+      if (row.rows[0]) await this.monitorPaperPortfolios(tx, scope, actorId, input.instrumentId);
+      return row;
     });
     if (!result.rows[0]) throw new Error('Market price insert failed'); return result.rows[0];
+  }
+
+  private async monitorPaperPortfolios(tx: QueryTx, scope: InvestScope, actorId: string, changedInstrumentId: string): Promise<void> {
+    const portfolios = await tx.query<{id:string;book_id:string;base_asset:string;limits:unknown}>(
+      `SELECT p.id,p.book_id,p.base_asset,m.limits FROM invest_portfolios p
+       JOIN LATERAL (SELECT limits FROM invest_mandates WHERE tenant_id=p.tenant_id AND workspace_id=p.workspace_id AND portfolio_id=p.id
+         AND status='approved' AND effective_from<=now() AND (effective_until IS NULL OR effective_until>now()) ORDER BY version DESC LIMIT 1) m ON true
+       WHERE p.tenant_id=$1 AND p.workspace_id=$2 AND p.status='active'`, [scope.tenantId, scope.workspaceId]);
+    for (const portfolio of portfolios.rows) {
+      const limits = GuardrailLimits.parse(portfolio.limits);
+      const ledgerRows = await tx.query<{code:string;asset:string;units:string}>(
+        `SELECT a.code,b.asset,b.units::text FROM ledger_balances b JOIN ledger_accounts a
+           ON a.tenant_id=b.tenant_id AND a.workspace_id=b.workspace_id AND a.book_id=b.book_id AND a.id=b.account_id
+         WHERE b.tenant_id=$1 AND b.workspace_id=$2 AND b.book_id=$3`, [scope.tenantId, scope.workspaceId, portfolio.book_id]);
+      const cash = BigInt(ledgerRows.rows.find((row) => row.code === 'cash' && row.asset === portfolio.base_asset)?.units ?? '0');
+      const instruments = await tx.query<{id:string;quantity_scale:number;units:string;price_units:string|null}>(
+        `SELECT i.id,i.quantity_scale,COALESCE(b.units,0)::text AS units,q.price_units::text
+         FROM invest_instruments i JOIN ledger_accounts a ON a.tenant_id=i.tenant_id AND a.workspace_id=i.workspace_id
+           AND a.book_id=$3 AND a.code='position:'||i.id::text
+         LEFT JOIN ledger_balances b ON b.tenant_id=a.tenant_id AND b.workspace_id=a.workspace_id AND b.book_id=a.book_id AND b.account_id=a.id AND b.asset=i.asset_code
+         LEFT JOIN LATERAL (SELECT price_units FROM invest_market_prices WHERE tenant_id=i.tenant_id AND workspace_id=i.workspace_id AND instrument_id=i.id ORDER BY received_at DESC LIMIT 1) q ON true
+         WHERE i.tenant_id=$1 AND i.workspace_id=$2`, [scope.tenantId, scope.workspaceId, portfolio.book_id]);
+      let gross = 0n;
+      const positionValues: Array<{instrumentId:string;value:bigint}> = [];
+      for (const instrument of instruments.rows) {
+        const units = BigInt(instrument.units);
+        if (units < 0n) throw new Error('Negative PAPER ledger position detected during price mark');
+        if (!units) continue;
+        if (!instrument.price_units) throw new Error(`Cannot risk-mark held instrument ${instrument.id} without a current quote`);
+        const value = notionalUnits(units.toString(), instrument.price_units, instrument.quantity_scale);
+        gross += value;
+        positionValues.push({ instrumentId: instrument.id, value });
+      }
+      const nav = cash + gross;
+      const prior = await tx.query<{day_open_nav_units:string;high_water_nav_units:string;daily_loss_units:string;kill_switch:boolean}>(
+        `SELECT day_open_nav_units::text,high_water_nav_units::text,daily_loss_units::text,kill_switch FROM invest_portfolio_risk_state
+         WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, portfolio.id]);
+      const state = prior.rows[0]; const opening = BigInt(state?.day_open_nav_units ?? nav.toString());
+      const highWater = BigInt(state?.high_water_nav_units ?? nav.toString());
+      const loss = [BigInt(state?.daily_loss_units ?? '0'), opening > nav ? opening-nav : 0n].reduce((a,b) => a>b ? a:b);
+      const drawdownHit = highWater > nav && (highWater-nav)*10_000n >= highWater*BigInt(limits.maxDrawdownBps);
+      const dailyLossHit = loss >= BigInt(limits.maxDailyLossUnits);
+      const autoHalt = dailyLossHit || drawdownHit;
+      await tx.query(`UPDATE invest_portfolio_risk_state SET high_water_nav_units=GREATEST(high_water_nav_units,$4),daily_loss_units=$5,
+          kill_switch=CASE WHEN $6 THEN true ELSE kill_switch END,
+          kill_reason=CASE WHEN $6 THEN $7 ELSE kill_reason END,updated_at=now()
+        WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`,
+        [scope.tenantId, scope.workspaceId, portfolio.id, nav.toString(), loss.toString(), autoHalt,
+          dailyLossHit ? 'Automatic PAPER halt: daily-loss mandate exceeded' : 'Automatic PAPER halt: drawdown limit exceeded']);
+      const breaches: Array<{instrumentId:string|null;kind:string;detail:Record<string,string>}> = [];
+      for (const position of positionValues) {
+        if (position.value > BigInt(limits.maxPositionNotionalUnits)) breaches.push({ instrumentId:position.instrumentId, kind:'max_position_notional', detail:{value:position.value.toString(),limit:limits.maxPositionNotionalUnits} });
+        if (nav > 0n && position.value*10_000n > nav*BigInt(limits.maxConcentrationBps)) breaches.push({ instrumentId:position.instrumentId, kind:'position_concentration', detail:{value:position.value.toString(),nav:nav.toString(),limitBps:String(limits.maxConcentrationBps)} });
+      }
+      if (nav > 0n && gross*10_000n > nav*BigInt(limits.maxLeverageBps)) breaches.push({ instrumentId:null, kind:'gross_leverage', detail:{exposure:gross.toString(),nav:nav.toString(),limitBps:String(limits.maxLeverageBps)} });
+      if (loss > 0n) breaches.push({ instrumentId:null, kind:'daily_loss', detail:{lossUnits:loss.toString(),limitUnits:limits.maxDailyLossUnits} });
+      if (drawdownHit) breaches.push({ instrumentId:null, kind:'drawdown', detail:{highWaterUnits:highWater.toString(),navUnits:nav.toString(),limitBps:String(limits.maxDrawdownBps)} });
+      for (const breach of breaches) {
+        const exists = await tx.query<{id:string}>(`SELECT id FROM invest_breaches WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3
+          AND kind=$4 AND instrument_id IS NOT DISTINCT FROM $5 AND status<>'resolved'`,
+          [scope.tenantId, scope.workspaceId, portfolio.id, breach.kind, breach.instrumentId]);
+        if (!exists.rows.length) await tx.query(`INSERT INTO invest_breaches(id,tenant_id,workspace_id,portfolio_id,instrument_id,severity,kind,detail,created_by)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, portfolio.id, breach.instrumentId,
+          autoHalt ? 'critical' : 'high', breach.kind, JSON.stringify({ ...breach.detail, source: 'market_mark', instrumentId: changedInstrumentId }), actorId]);
+      }
+      if (autoHalt) {
+        const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
+          [scope.tenantId, scope.workspaceId, portfolio.id]);
+        for (const order of cancelled.rows) await this.orderEvent(tx, scope, actorId, order.id, 'cancelled', order.status, 'cancelled', { reason: 'Automatic PAPER risk halt after market mark' });
+      }
+    }
   }
 
   async recordMarketSession(scope: InvestScope, input: { exchangeCode: string; sessionDate: string; opensAt: string; closesAt: string; isOpen: boolean; source: string }): Promise<{received_at:string}> {
@@ -119,15 +216,84 @@ export class InvestService {
     if (!result.rows[0]) throw new Error('Market session insert failed'); return result.rows[0];
   }
 
-  async createMandate(scope: InvestScope, actorId: string, input: { portfolioId: string; version: number; effectiveFrom: string; effectiveUntil: string|null; allowedAssetClasses: Array<'equity'|'crypto'|'fixed_income'|'fund'>; allowedInstrumentIds: string[]; benchmark: string; limits: unknown }): Promise<{id:string;version:number;status:'approved'}> {
+  async createMandate(scope: InvestScope, actorId: string, input: MandateDraftInput): Promise<{id:string;version:number;status:'in_review'}> {
     const limits = GuardrailLimits.parse(input.limits);
     if (input.effectiveUntil && Date.parse(input.effectiveUntil) <= Date.parse(input.effectiveFrom)) throw new Error('Mandate expiry must follow its effective date');
-    const result = await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, (tx) => tx.query<{id:string;version:number;status:'approved'}>(
-      `INSERT INTO invest_mandates(id,tenant_id,workspace_id,portfolio_id,version,effective_from,effective_until,limits,status,approved_by,approved_at,created_by)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'approved',$9,now(),$9) RETURNING id,version,status`,
-      [uuidv7(), scope.tenantId, scope.workspaceId, input.portfolioId, input.version, input.effectiveFrom, input.effectiveUntil,
-        JSON.stringify({ ...limits, allowedAssetClasses: input.allowedAssetClasses, allowedInstrumentIds: input.allowedInstrumentIds, benchmark: input.benchmark }), actorId]));
-    if (!result.rows[0]) throw new Error('Mandate insert failed'); return result.rows[0];
+    const memoId = uuidv7();
+    const mandateDraft = { version: input.version, effectiveFrom: input.effectiveFrom, effectiveUntil: input.effectiveUntil,
+      limits, allowedAssetClasses: input.allowedAssetClasses, allowedInstrumentIds: input.allowedInstrumentIds, benchmark: input.benchmark };
+    const result = await this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
+      const memo = await tx.query<{id:string;version:number;status:'in_review'}>(
+        `INSERT INTO invest_ic_memos(id,tenant_id,workspace_id,portfolio_id,version,title,thesis,sources,risk_review,status,created_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,'in_review',$10) RETURNING id,version,status`,
+        [memoId, scope.tenantId, scope.workspaceId, input.portfolioId, input.version, input.title, input.thesis,
+          JSON.stringify(input.sources), JSON.stringify({ mandateDraft }), actorId]);
+      await tx.query(`INSERT INTO invest_ic_memo_events(id,tenant_id,workspace_id,memo_id,event_type,detail,actor_id)
+        VALUES($1,$2,$3,$4,'drafted',$5::jsonb,$6)`, [uuidv7(), scope.tenantId, scope.workspaceId, memoId,
+        JSON.stringify({ version: input.version, sourceCount: input.sources.length }), actorId]);
+      return memo;
+    });
+    if (!result.rows[0]) throw new Error('IC memo insert failed'); return result.rows[0];
+  }
+
+  async icQueue(scope: InvestScope): Promise<Array<{id:string;portfolio_id:string;version:number;title:string;status:string;approvals:number;rejections:number;recusals:number;created_at:string}>> {
+    return (await this.scoped.query<{id:string;portfolio_id:string;version:number;title:string;status:'draft'|'in_review'|'approved'|'rejected'|'expired';approvals:number;rejections:number;recusals:number;created_at:string}>(scope, `SELECT m.id,m.portfolio_id,m.version,m.title,m.status,m.created_at::text,
+        count(*) FILTER (WHERE v.vote='approve')::int AS approvals,
+        count(*) FILTER (WHERE v.vote='reject')::int AS rejections,
+        count(*) FILTER (WHERE v.vote='recuse')::int AS recusals
+      FROM invest_ic_memos m LEFT JOIN invest_ic_votes v ON v.tenant_id=m.tenant_id AND v.workspace_id=m.workspace_id AND v.memo_id=m.id
+      WHERE m.tenant_id=$1 AND m.workspace_id=$2 GROUP BY m.id ORDER BY m.created_at DESC LIMIT 200`, [scope.tenantId, scope.workspaceId])).rows;
+  }
+
+  async voteMemo(scope: InvestScope, call: Call, input: {memoId:string;vote:'approve'|'reject'|'recuse';reason:string}): Promise<{memoId:string;vote:'approve'|'reject'|'recuse';approvals:number;rejections:number;recusals:number}> {
+    const voterId = this.requireHumanOwner(scope, call);
+    return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
+      const memo = await tx.query<{id:string;status:string}>(`SELECT id,status FROM invest_ic_memos WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, input.memoId]);
+      if (!memo.rows[0] || memo.rows[0].status !== 'in_review') throw new Error('IC memo is not accepting votes');
+      await tx.query(`INSERT INTO invest_ic_votes(id,tenant_id,workspace_id,memo_id,voter_id,vote,reason) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+        [uuidv7(), scope.tenantId, scope.workspaceId, input.memoId, voterId, input.vote, input.reason]);
+      await tx.query(`INSERT INTO invest_ic_memo_events(id,tenant_id,workspace_id,memo_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'vote_recorded',$5::jsonb,$6)`,
+        [uuidv7(), scope.tenantId, scope.workspaceId, input.memoId, JSON.stringify({ voterId, vote: input.vote }), voterId]);
+      const counts = await tx.query<{approvals:number;rejections:number;recusals:number}>(`SELECT count(*) FILTER(WHERE vote='approve')::int AS approvals,
+        count(*) FILTER(WHERE vote='reject')::int AS rejections,count(*) FILTER(WHERE vote='recuse')::int AS recusals
+        FROM invest_ic_votes WHERE tenant_id=$1 AND workspace_id=$2 AND memo_id=$3`, [scope.tenantId, scope.workspaceId, input.memoId]);
+      const totals = counts.rows[0] ?? { approvals: 0, rejections: 0, recusals: 0 };
+      if (totals.rejections >= 2) {
+        await tx.query(`UPDATE invest_ic_memos SET status='rejected' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.memoId]);
+        await tx.query(`INSERT INTO invest_ic_memo_events(id,tenant_id,workspace_id,memo_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'rejected',$5::jsonb,$6)`,
+          [uuidv7(), scope.tenantId, scope.workspaceId, input.memoId, JSON.stringify({ approvals: totals.approvals, rejections: totals.rejections }), voterId]);
+      }
+      return { memoId: input.memoId, vote: input.vote, ...totals };
+    });
+  }
+
+  async activateMandate(scope: InvestScope, call: Call, input: {memoId:string}): Promise<{id:string;version:number;status:'approved';expiresAt:string}> {
+    const approverId = this.requireHumanOwner(scope, call);
+    return this.scoped.withServerScope(scope, 'invest_paper', scope.hlc, async (tx) => {
+      const memo = await tx.query<{portfolio_id:string;version:number;risk_review:Record<string,unknown>;status:string}>(
+        `SELECT portfolio_id,version,risk_review,status FROM invest_ic_memos WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3 FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, input.memoId]);
+      const row = memo.rows[0]; if (!row || row.status !== 'in_review') throw new Error('IC memo is not approvable');
+      const votes = await tx.query<{approvals:number;rejections:number}>(`SELECT count(*) FILTER(WHERE vote='approve')::int AS approvals,
+        count(*) FILTER(WHERE vote='reject')::int AS rejections FROM invest_ic_votes WHERE tenant_id=$1 AND workspace_id=$2 AND memo_id=$3`,
+        [scope.tenantId, scope.workspaceId, input.memoId]);
+      const total = votes.rows[0] ?? { approvals: 0, rejections: 0 };
+      if (total.approvals < 2 || total.rejections > 0) throw new Error('Mandate requires two independent approvals and no rejection');
+      const draft = row.risk_review['mandateDraft'] as MandateDraft;
+      if (!draft) throw new Error('IC memo has no mandate draft');
+      const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60_000).toISOString();
+      const effectiveUntil = draft.effectiveUntil ?? expiresAt;
+      const mandate = await tx.query<{id:string;version:number}>(`INSERT INTO invest_mandates(id,tenant_id,workspace_id,portfolio_id,version,effective_from,effective_until,limits,status,approved_by,approved_at,created_by)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'approved',$9,now(),$10) RETURNING id,version`,
+        [uuidv7(), scope.tenantId, scope.workspaceId, row.portfolio_id, row.version, draft.effectiveFrom, effectiveUntil,
+          JSON.stringify({ ...draft.limits, allowedAssetClasses: draft.allowedAssetClasses, allowedInstrumentIds: draft.allowedInstrumentIds, benchmark: draft.benchmark }), approverId, approverId]);
+      if (!mandate.rows[0]) throw new Error('Approved mandate insert failed');
+      await tx.query(`UPDATE invest_ic_memos SET status='approved',expires_at=$4 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,
+        [scope.tenantId, scope.workspaceId, input.memoId, expiresAt]);
+      await tx.query(`INSERT INTO invest_ic_memo_events(id,tenant_id,workspace_id,memo_id,event_type,detail,actor_id) VALUES($1,$2,$3,$4,'approved',$5::jsonb,$6)`,
+        [uuidv7(), scope.tenantId, scope.workspaceId, input.memoId, JSON.stringify({ mandateId: mandate.rows[0].id, expiresAt, approvals: total.approvals }), approverId]);
+      return { ...mandate.rows[0], status: 'approved' as const, expiresAt };
+    });
   }
 
   async fundPortfolio(scope: InvestScope, actorId: string, input: { portfolioId: string; units: string; reference: string }): Promise<{transactionId:string;environment:'paper'}> {
@@ -324,19 +490,29 @@ export class InvestService {
   async execute(scope: InvestScope, actorId: string, input: { orderId: string }): Promise<{ order: OrderRow; fillId: string; transactionId: string; environment: 'paper' }> {
     return this.paperLedger.withPaperTradeTransaction(scope, async (tx) => {
       const result = await tx.query<Record<string, unknown>>(
-        `SELECT o.id,o.portfolio_id,o.instrument_id,o.mandate_id,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text,p.book_id,p.base_asset,i.symbol,i.asset_code,i.quantity_scale,i.exchange_code,q.price_units::text,q.id AS quote_id,q.received_at
+        `SELECT o.id,o.portfolio_id,o.instrument_id,o.mandate_id,o.risk_decision_id,o.side,o.order_type,o.quantity_units::text,o.limit_price_units::text,o.status,o.environment,o.created_at::text,
+           p.book_id,p.base_asset,i.symbol,i.asset_code,i.quantity_scale,i.exchange_code,q.price_units::text,q.id AS quote_id,q.received_at,
+           accepted_quote.price_units::text AS accepted_price_units,m.limits AS mandate_limits
          FROM invest_orders o JOIN invest_portfolios p ON p.tenant_id=o.tenant_id AND p.workspace_id=o.workspace_id AND p.id=o.portfolio_id
          JOIN invest_instruments i ON i.tenant_id=o.tenant_id AND i.workspace_id=o.workspace_id AND i.id=o.instrument_id
-         JOIN LATERAL (SELECT id,price_units FROM invest_market_prices WHERE tenant_id=o.tenant_id AND workspace_id=o.workspace_id AND instrument_id=o.instrument_id ORDER BY received_at DESC LIMIT 1) q ON true
-         WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3 FOR UPDATE`, [scope.tenantId, scope.workspaceId, input.orderId]);
+         JOIN invest_mandates m ON m.tenant_id=o.tenant_id AND m.workspace_id=o.workspace_id AND m.id=o.mandate_id
+         JOIN invest_risk_decisions rd ON rd.tenant_id=o.tenant_id AND rd.workspace_id=o.workspace_id AND rd.id=o.risk_decision_id
+         JOIN invest_market_prices accepted_quote ON accepted_quote.tenant_id=rd.tenant_id AND accepted_quote.workspace_id=rd.workspace_id AND accepted_quote.id=rd.quote_id
+         JOIN LATERAL (SELECT id,price_units,received_at FROM invest_market_prices WHERE tenant_id=o.tenant_id AND workspace_id=o.workspace_id AND instrument_id=o.instrument_id ORDER BY received_at DESC LIMIT 1) q ON true
+         WHERE o.tenant_id=$1 AND o.workspace_id=$2 AND o.id=$3 FOR UPDATE OF o`, [scope.tenantId, scope.workspaceId, input.orderId]);
       const row = result.rows[0]; if (!row || row['status'] !== 'approved' || row['environment'] !== 'paper') throw new Error('Only approved PAPER orders can execute');
       const quote = BigInt(String(row['price_units'])); const quantity = String(row['quantity_units']);
-      if (Date.now() - new Date(row['received_at'] as string | Date).getTime() > 300_000) throw new Error('Latest PAPER market quote is stale');
+      const mandateLimits = GuardrailLimits.parse(row['mandate_limits']);
+      if (Date.now() - new Date(row['received_at'] as string | Date).getTime() > mandateLimits.quoteFreshnessSeconds * 1000) throw new Error('Latest PAPER market quote is stale');
+      const acceptedPrice = BigInt(String(row['accepted_price_units']));
+      const deviation = quote > acceptedPrice ? quote - acceptedPrice : acceptedPrice - quote;
+      if (deviation * 10_000n > acceptedPrice * BigInt(mandateLimits.maxPriceDeviationBps)) throw new Error('Execution quote is outside the mandate price-sanity band');
       if (row['order_type'] === 'limit') {
         const limit = BigInt(String(row['limit_price_units']));
         if ((row['side'] === 'buy' && quote > limit) || (row['side'] === 'sell' && quote < limit)) throw new Error('Stored PAPER market quote does not cross the order limit');
       }
       const notional = notionalUnits(quantity, quote.toString(), Number(row['quantity_scale']));
+      if (notional > BigInt(mandateLimits.maxOrderNotionalUnits)) throw new Error('Execution notional exceeds the active mandate order cap');
       const accounts = await tx.query<{id:string;code:string;type:string}>(`SELECT id,code,type FROM ledger_accounts WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$3 AND deleted_hlc IS NULL`, [scope.tenantId, scope.workspaceId, row['book_id']]);
       const cash = accounts.rows.find((account) => account.code === 'cash');
       const cashClearing = accounts.rows.find((account) => account.code === 'cash-clearing');
@@ -367,6 +543,52 @@ export class InvestService {
       await this.orderEvent(tx, scope, actorId, input.orderId, 'submitted', 'approved', 'submitted', { environment: 'paper' });
       await tx.query(`UPDATE invest_orders SET status='filled' WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`, [scope.tenantId, scope.workspaceId, input.orderId]);
       await this.orderEvent(tx, scope, actorId, input.orderId, 'filled', 'submitted', 'filled', { fillId, transactionId, environment: 'paper' });
+
+      const held = await tx.query<{instrument_id:string;quantity_units:string;quantity_scale:number;price_units:string|null}>(
+        `SELECT i.id AS instrument_id,COALESCE(b.units,0)::text AS quantity_units,i.quantity_scale,q.price_units::text
+         FROM invest_instruments i
+         JOIN ledger_accounts a ON a.tenant_id=i.tenant_id AND a.workspace_id=i.workspace_id AND a.book_id=$3 AND a.code='position:'||i.id::text
+         LEFT JOIN ledger_balances b ON b.tenant_id=a.tenant_id AND b.workspace_id=a.workspace_id AND b.book_id=a.book_id AND b.account_id=a.id AND b.asset=i.asset_code
+         LEFT JOIN LATERAL (SELECT price_units FROM invest_market_prices WHERE tenant_id=i.tenant_id AND workspace_id=i.workspace_id AND instrument_id=i.id ORDER BY received_at DESC LIMIT 1) q ON true
+         WHERE i.tenant_id=$1 AND i.workspace_id=$2`, [scope.tenantId, scope.workspaceId, row['book_id']]);
+      let grossExposure = 0n; let currentPositionValue = 0n;
+      for (const holding of held.rows) {
+        const units = BigInt(holding.quantity_units);
+        if (units < 0n) throw new Error('Negative PAPER ledger position detected');
+        if (units === 0n) continue;
+        if (!holding.price_units) throw new Error(`Post-trade monitor cannot value held instrument ${holding.instrument_id}`);
+        const value = notionalUnits(units.toString(), holding.price_units, holding.quantity_scale);
+        grossExposure += value;
+        if (holding.instrument_id === String(row['instrument_id'])) currentPositionValue = value;
+      }
+      const postCash = cashUnits + BigInt(signedCash);
+      const navAfter = postCash + grossExposure;
+      const riskState = await tx.query<{day_open_nav_units:string;high_water_nav_units:string;daily_loss_units:string;kill_switch:boolean}>(
+        `SELECT day_open_nav_units::text,high_water_nav_units::text,daily_loss_units::text,kill_switch FROM invest_portfolio_risk_state
+         WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date FOR UPDATE`,
+        [scope.tenantId, scope.workspaceId, row['portfolio_id']]);
+      const previous = riskState.rows[0];
+      const dayOpen = BigInt(previous?.day_open_nav_units ?? navAfter.toString());
+      const dailyLoss = [BigInt(previous?.daily_loss_units ?? '0'), dayOpen > navAfter ? dayOpen - navAfter : 0n].reduce((a,b) => a > b ? a : b);
+      const autoHalt = dailyLoss >= BigInt(mandateLimits.maxDailyLossUnits);
+      await tx.query(`UPDATE invest_portfolio_risk_state SET high_water_nav_units=GREATEST(high_water_nav_units,$4),daily_loss_units=$5,
+          kill_switch=CASE WHEN $6 THEN true ELSE kill_switch END,
+          kill_reason=CASE WHEN $6 THEN 'Automatic PAPER halt: daily-loss mandate exceeded' ELSE kill_reason END,updated_at=now()
+        WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=(now() AT TIME ZONE 'UTC')::date`,
+        [scope.tenantId, scope.workspaceId, row['portfolio_id'], navAfter.toString(), dailyLoss.toString(), autoHalt]);
+      const breaches: Array<{kind:string;detail:Record<string,string>}> = [];
+      if (currentPositionValue > BigInt(mandateLimits.maxPositionNotionalUnits)) breaches.push({ kind: 'max_position_notional', detail: { value: currentPositionValue.toString(), limit: mandateLimits.maxPositionNotionalUnits } });
+      if (navAfter > 0n && currentPositionValue * 10_000n > navAfter * BigInt(mandateLimits.maxConcentrationBps)) breaches.push({ kind: 'position_concentration', detail: { value: currentPositionValue.toString(), nav: navAfter.toString(), limitBps: String(mandateLimits.maxConcentrationBps) } });
+      if (navAfter > 0n && grossExposure * 10_000n > navAfter * BigInt(mandateLimits.maxLeverageBps)) breaches.push({ kind: 'gross_leverage', detail: { exposure: grossExposure.toString(), nav: navAfter.toString(), limitBps: String(mandateLimits.maxLeverageBps) } });
+      if (dailyLoss > 0n) breaches.push({ kind: 'daily_loss', detail: { lossUnits: dailyLoss.toString(), limitUnits: mandateLimits.maxDailyLossUnits } });
+      for (const breach of breaches) await tx.query(`INSERT INTO invest_breaches(id,tenant_id,workspace_id,portfolio_id,instrument_id,severity,kind,detail,created_by)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)`, [uuidv7(), scope.tenantId, scope.workspaceId, row['portfolio_id'], row['instrument_id'],
+        autoHalt ? 'critical' : 'high', breach.kind, JSON.stringify({ ...breach.detail, sourceOrderId: input.orderId }), actorId]);
+      if (autoHalt) {
+        const cancelled = await tx.query<{id:string;status:string}>(`UPDATE invest_orders SET status='cancelled' WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND id<>$4 AND status IN ('proposed','approved','submitted') RETURNING id,status`,
+          [scope.tenantId, scope.workspaceId, row['portfolio_id'], input.orderId]);
+        for (const order of cancelled.rows) await this.orderEvent(tx, scope, actorId, order.id, 'cancelled', order.status, 'cancelled', { reason: 'Automatic PAPER daily-loss halt' });
+      }
       const order: OrderRow = { id: String(row['id']), portfolio_id: String(row['portfolio_id']), instrument_id: String(row['instrument_id']),
         symbol: String(row['symbol']), side: row['side'] as 'buy'|'sell', order_type: row['order_type'] as 'market'|'limit', quantity_units: quantity,
         limit_price_units: row['limit_price_units'] == null ? null : String(row['limit_price_units']), status: 'filled', environment: 'paper', created_at: String(row['created_at']) };

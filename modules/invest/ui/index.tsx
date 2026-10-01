@@ -5,11 +5,12 @@ import { Activity, AlertTriangle, ArrowDownUp, BriefcaseBusiness, CircleDollarSi
 import { useCapability } from '@xyra/sdk';
 import type { ModulePageProps, ModuleUi } from '@xyra/sdk/module-ui';
 import { Badge, Button, EmptyState, ErrorState, Input, LoadingState, PageHeader, Panel } from '@xyra/ui';
-import { investCapabilities as caps } from '../server/capabilities';
+import { investCapabilities as caps } from '../contracts';
 
 type Portfolio = { id: string; name: string; base_asset: string; book_id: string; environment: 'paper'; status: string };
 type Instrument = { id: string; symbol: string; asset_class: string; quantity_scale: number; exchange_code: string|null };
 type Order = { id:string; portfolio_id:string; instrument_id:string; symbol:string; side:'buy'|'sell'; order_type:'market'|'limit'; quantity_units:string; limit_price_units:string|null; status:string; environment:'paper'; created_at:string };
+type ICMemo = { id:string; portfolio_id:string; version:number; title:string; status:'draft'|'in_review'|'approved'|'rejected'|'expired'; approvals:number; rejections:number; recusals:number; created_at:string };
 type Summary = { portfolioId:string; environment:'paper'; cashUnits:string; navUnits:string; positions:Array<{instrumentId:string;symbol:string;quantityUnits:string;priceUnits:string;marketValueUnits:string}> };
 
 function PaperBanner() {
@@ -135,14 +136,16 @@ function OrdersPage({ workspaceId, api }: ModulePageProps) {
 function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
   const portfolios = useCapability<Portfolio[]>(api, workspaceId, caps.portfolios.id);
   const instruments = useCapability<Instrument[]>(api, workspaceId, caps.instruments.id);
+  const memoQueue = useCapability<ICMemo[]>(api, workspaceId, caps.icQueue.id);
   const [symbol, setSymbol] = useState(''); const [exchange, setExchange] = useState(''); const [price, setPrice] = useState('');
-  const [maxOrders, setMaxOrders] = useState('10'); const [busy, setBusy] = useState(false); const [message, setMessage] = useState<string|null>(null);
+  const [memoTitle, setMemoTitle] = useState(''); const [thesis, setThesis] = useState(''); const [sourceRef, setSourceRef] = useState('');
+  const [maxOrderNotional, setMaxOrderNotional] = useState('1000'); const [busy, setBusy] = useState(false); const [message, setMessage] = useState<string|null>(null);
   const [marketSession, setMarketSession] = useState(true);
   const selectedPortfolio = portfolios.data?.[0];
   async function write(id: string, input: unknown) {
     if (!api || !workspaceId) return;
     setBusy(true); setMessage(null);
-    try { await api.write(workspaceId, id, input); setMessage('Saved.'); portfolios.refresh(); instruments.refresh(); }
+    try { await api.write(workspaceId, id, input); setMessage('Saved.'); portfolios.refresh(); instruments.refresh(); memoQueue.refresh(); }
     catch (cause) { setMessage(cause instanceof Error ? cause.message : 'Investment configuration failed'); }
     finally { setBusy(false); }
   }
@@ -162,13 +165,22 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
     finally { setBusy(false); }
   }
   async function createMandate() {
-    if (!selectedPortfolio || !instruments.data?.length) return;
-    await write(caps.createMandate.id, { portfolioId: selectedPortfolio.id, version: 1, effectiveFrom: new Date(Date.now()-60_000).toISOString(), effectiveUntil: null,
+    if (!selectedPortfolio || !instruments.data?.length || !api || !workspaceId) return;
+    const payload = new TextEncoder().encode(sourceRef.trim());
+    const digest = await crypto.subtle.digest('SHA-256', payload);
+    const sourceHash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2,'0')).join('');
+    await write(caps.createMandate.id, { portfolioId: selectedPortfolio.id, version: Math.max(0, ...(memoQueue.data?.filter((memo) => memo.portfolio_id === selectedPortfolio.id).map((memo) => memo.version) ?? [])) + 1,
+      title: memoTitle, thesis, sources: [{ label: 'User supplied research reference', ref: sourceRef, sha256: sourceHash }],
+      effectiveFrom: new Date(Date.now()-60_000).toISOString(), effectiveUntil: null,
       allowedAssetClasses: ['equity'], allowedInstrumentIds: instruments.data.map((instrument) => instrument.id), benchmark: 'PAPER-CASH',
-      limits: { maxOrderNotionalUnits: maxOrders, maxPositionNotionalUnits: '100000000', maxDailyLossUnits: '1000000', maxOrdersPerHour: 10,
+      limits: { maxOrderNotionalUnits: maxOrderNotional, maxPositionNotionalUnits: '100000000', maxDailyLossUnits: '1000000', maxOrdersPerHour: 10,
         maxPriceDeviationBps: 500, quoteFreshnessSeconds: 300, duplicateWindowSeconds: 60, maxConcentrationBps: 5000,
         maxCorrelatedExposureBps: 10000, maxLeverageBps: 10000, maxDrawdownBps: 2000, targetVolatilityBps: 2000 } });
   }
+  async function voteMemo(memoId: string, vote: 'approve'|'reject'|'recuse') {
+    await write(caps.voteMemo.id, { memoId, vote, reason: vote === 'approve' ? 'Reviewed source-cited thesis and risk policy' : vote === 'reject' ? 'IC review rejected this mandate draft' : 'IC member recused from this decision' });
+  }
+  async function activateMemo(memoId: string) { await write(caps.activateMandate.id, { memoId }); }
   return <div className="space-y-5">
     <PageHeader eyebrow="Invest / controls" title="Risk and mandates" description="Versioned portfolio policy and fail-closed market calendar inputs." />
     <PaperBanner />
@@ -176,9 +188,21 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><label className="space-y-1 text-xs text-fg-muted">Symbol<Input aria-label="Instrument symbol" value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} /></label><label className="space-y-1 text-xs text-fg-muted">Exchange<Input aria-label="Exchange code" value={exchange} onChange={(event) => setExchange(event.target.value.toUpperCase())} /></label><label className="space-y-1 text-xs text-fg-muted">Price minor units<Input aria-label="Price minor units" inputMode="numeric" value={price} onChange={(event) => setPrice(event.target.value)} /></label><label className="flex items-center gap-2 self-end pb-2 text-sm"><input type="checkbox" checked={marketSession} onChange={(event) => setMarketSession(event.target.checked)} />Market session open today</label></div>
       <Button className="mt-3" loading={busy} disabled={!symbol.trim() || !/^[1-9]\d*$/.test(price)} onClick={() => void registerInstrument()}><Plus aria-hidden className="size-4" /> Record manual PAPER quote</Button>
     </Panel>
-    <Panel title="Active policy" description="Limit updates are retained as versioned mandates; approval is an owner/admin capability.">
-      {!selectedPortfolio ? <EmptyState icon={ShieldCheck} title="Create a portfolio first">Investment mandates are scoped to one PAPER portfolio.</EmptyState> : <div className="space-y-3"><p className="text-sm">Portfolio: <strong>{selectedPortfolio.name}</strong></p><label className="block max-w-xs space-y-1 text-xs text-fg-muted">Maximum order notional, minor units<Input aria-label="Maximum order notional" inputMode="numeric" value={maxOrders} onChange={(event) => setMaxOrders(event.target.value)} /></label><Button loading={busy} onClick={() => void createMandate()}>Approve mandate version</Button></div>}
+    <Panel title="Investment policy memo" description="Agents can draft source-cited policy memos. Direct owner/admin votes require two independent approvals before a versioned mandate activates.">
+      {!selectedPortfolio ? <EmptyState icon={ShieldCheck} title="Create a portfolio first">Investment mandates are scoped to one PAPER portfolio.</EmptyState> : <div className="grid gap-3 sm:grid-cols-2">
+        <p className="text-sm sm:col-span-2">Portfolio: <strong>{selectedPortfolio.name}</strong></p>
+        <label className="space-y-1 text-xs text-fg-muted">Memo title<Input aria-label="Memo title" value={memoTitle} onChange={(event) => setMemoTitle(event.target.value)} maxLength={240} /></label>
+        <label className="space-y-1 text-xs text-fg-muted">Source reference<Input aria-label="Source reference" value={sourceRef} onChange={(event) => setSourceRef(event.target.value)} maxLength={1000} /></label>
+        <label className="space-y-1 text-xs text-fg-muted sm:col-span-2">Investment thesis<textarea aria-label="Investment thesis" className="min-h-20 w-full rounded-md border border-line bg-surface px-3 py-2 text-sm text-fg" value={thesis} onChange={(event) => setThesis(event.target.value)} maxLength={20000} /></label>
+        <label className="block max-w-xs space-y-1 text-xs text-fg-muted">Maximum order notional, minor units<Input aria-label="Maximum order notional" inputMode="numeric" value={maxOrderNotional} onChange={(event) => setMaxOrderNotional(event.target.value)} /></label>
+        <span className="self-end"><Button loading={busy} disabled={!memoTitle.trim() || !thesis.trim() || !sourceRef.trim() || !/^[1-9]\d{0,37}$/.test(maxOrderNotional)} onClick={() => void createMandate()}>Submit for IC review</Button></span>
+      </div>}
       {message ? <p role="status" className="mt-3 text-sm text-fg-muted">{message}</p> : null}
+    </Panel>
+    <Panel title="IC decision queue" description="Votes are append-only. Recusals are retained and do not count toward quorum.">
+      {memoQueue.loading ? <LoadingState label="Loading IC decisions" rows={3} /> : null}
+      {!memoQueue.loading && !memoQueue.data?.length ? <EmptyState icon={ShieldCheck} title="No committee memos">Policy drafts submitted for review will appear here.</EmptyState> : null}
+      {memoQueue.data?.map((memo) => <div key={memo.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-line py-3 last:border-0"><div><p className="font-medium">{memo.title} <Badge tone={memo.status === 'approved' ? 'positive' : memo.status === 'rejected' ? 'negative' : 'caution'}>{memo.status}</Badge></p><p className="font-mono text-xs text-fg-muted">v{memo.version} · approve {memo.approvals}/2 · reject {memo.rejections} · recuse {memo.recusals}</p></div>{memo.status === 'in_review' ? <div className="flex gap-2"><Button size="sm" variant="secondary" loading={busy} onClick={() => void voteMemo(memo.id,'approve')}>Approve vote</Button><Button size="sm" variant="secondary" loading={busy} onClick={() => void voteMemo(memo.id,'recuse')}>Recuse</Button>{memo.approvals >= 2 && memo.rejections === 0 ? <Button size="sm" loading={busy} onClick={() => void activateMemo(memo.id)}>Activate mandate</Button> : null}</div> : null}</div>)}
     </Panel>
     {selectedPortfolio ? <KillSwitch workspaceId={workspaceId} api={api} portfolioId={selectedPortfolio.id} /> : null}
     <Panel title="Instruments" description="Registered instruments and scale used by deterministic sizing.">{instruments.data?.length ? <ul className="divide-y divide-line">{instruments.data.map((instrument) => <li className="flex justify-between py-2 text-sm" key={instrument.id}><span>{instrument.symbol} · {instrument.asset_class}</span><span className="font-mono text-xs text-fg-muted">scale {instrument.quantity_scale} · {instrument.exchange_code ?? '24/7'}</span></li>)}</ul> : <EmptyState icon={AlertTriangle} title="No instruments configured">Register a paper instrument above before proposing an order.</EmptyState>}</Panel>
@@ -186,9 +210,11 @@ function RiskAndMandates({ workspaceId, api }: ModulePageProps) {
 }
 
 function KillSwitch({ workspaceId, api, portfolioId }: { workspaceId:string|null; api:ModulePageProps['api']; portfolioId:string }) {
-  const [engaged, setEngaged] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState<string|null>(null);
-  async function toggle() { if (!api || !workspaceId) return; setBusy(true); setError(null); try { await api.write(workspaceId, caps.killSwitch.id, { portfolioId, engaged: !engaged, reason: engaged ? 'Owner explicitly resumed PAPER trading' : 'Owner engaged portfolio kill switch' }); setEngaged(!engaged); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Kill switch update failed'); } finally { setBusy(false); } }
-  return <Panel title="Portfolio trading kill switch" description="Engaging halts proposals and cancels open orders. Resuming requires an explicit action."><div className="flex items-center justify-between gap-3"><span className="text-sm">{engaged ? <Badge tone="negative">HALTED</Badge> : <Badge tone="positive">ACTIVE</Badge>}</span><Button variant={engaged ? 'primary' : 'secondary'} loading={busy} onClick={() => void toggle()}>{engaged ? 'Explicitly resume PAPER' : 'Halt PAPER trading'}</Button></div>{error ? <p role="alert" className="mt-2 text-sm text-negative">{error}</p> : null}</Panel>;
+  const state = useCapability<{portfolioId:string;killSwitch:boolean;killReason:string|null;dailyLossUnits:string;riskDate:string}>(api, workspaceId, caps.riskState.id, { portfolioId });
+  const [busy, setBusy] = useState(false); const [error, setError] = useState<string|null>(null);
+  const engaged = state.data?.killSwitch ?? false;
+  async function toggle() { if (!api || !workspaceId || !state.data) return; setBusy(true); setError(null); try { await api.write(workspaceId, caps.killSwitch.id, { portfolioId, engaged: !engaged, reason: engaged ? 'Owner explicitly resumed PAPER trading' : 'Owner engaged portfolio kill switch' }); state.refresh(); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Kill switch update failed'); } finally { setBusy(false); } }
+  return <Panel title="Portfolio trading kill switch" description="Engaging halts proposals and cancels open orders. Resuming requires an explicit action.">{state.error ? <ErrorState error={state.error} onRetry={state.refresh} title="Risk state could not be loaded" /> : state.loading || !state.data ? <LoadingState label="Loading persisted PAPER risk state" rows={1} /> : <><div className="flex items-center justify-between gap-3"><span className="text-sm">{engaged ? <Badge tone="negative">HALTED</Badge> : <Badge tone="positive">ACTIVE</Badge>}{engaged && state.data.killReason ? <span className="ml-2 text-fg-muted">{state.data.killReason}</span> : null}</span><Button variant={engaged ? 'primary' : 'secondary'} loading={busy} onClick={() => void toggle()}>{engaged ? 'Explicitly resume PAPER' : 'Halt PAPER trading'}</Button></div><p className="mt-2 text-xs text-fg-muted">Daily loss: {state.data.dailyLossUnits} minor units · {state.data.riskDate}</p></>}{error ? <p role="alert" className="mt-2 text-sm text-negative">{error}</p> : null}</Panel>;
 }
 
 function Metric({ title, value, icon: Icon }: { title:string; value:string|number; icon:typeof TrendingUp }) {

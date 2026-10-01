@@ -110,6 +110,31 @@ describe('frozen ledger wire contract', () => {
 });
 
 describe('exact minor-unit arithmetic', () => {
+  test('balances 10,000 deterministic generated journals independently per asset', () => {
+    // Xorshift64* gives a reproducible integer-only corpus; no floating-point oracle is involved.
+    let state = 0x9e3779b97f4a7c15n;
+    const next = () => {
+      state ^= state >> 12n; state ^= state << 25n; state ^= state >> 27n;
+      return BigInt.asUintN(64, state * 0x2545f4914f6cdd1dn);
+    };
+    const assets = ['USD', 'BTC', 'EQ:ACME'];
+    for (let index = 0; index < 10_000; index++) {
+      const entries = assets.flatMap((asset, assetIndex) => {
+        const magnitude = next() % 1_000_000_000_000n + 1n;
+        const units = assetIndex % 2 ? -magnitude : magnitude;
+        return [
+          { accountId: id, asset, units: units.toString() },
+          { accountId: `0199aaba-0000-7000-8000-${(assetIndex + 2).toString().padStart(12, '0')}`, asset, units: (-units).toString() },
+        ];
+      });
+      const journal = PostTransactionInput.parse({ id, bookId: id, environment: 'paper', effectiveDate: '2026-09-30',
+        description: `generated journal ${index}`, source: 'property-test', entries });
+      const totals = new Map<string, bigint>();
+      for (const entry of journal.entries) totals.set(entry.asset, (totals.get(entry.asset) ?? 0n) + BigInt(entry.units));
+      expect([...totals.values()].every((total) => total === 0n), `journal ${index}`).toBe(true);
+    }
+  });
+
   test('round trips amounts well beyond Number.MAX_SAFE_INTEGER at every supported scale', () => {
     // Deterministic generated cases, no dependency on a random seed or a floating-point oracle.
     for (let scale = 0; scale <= 18; scale++) {
