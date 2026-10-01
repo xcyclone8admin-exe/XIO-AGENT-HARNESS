@@ -34,6 +34,8 @@ const MAX_SYNC_PUSH_BYTES: usize = 1_000_000;
 const MAX_SIGNAL_RESPONSE_BYTES: usize = 64 * 1024;
 const SIGNAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const INVEST_SIGNAL_CONSUME_PROTOCOL: &str = "xyra.invest.signal.consume.v1";
+const INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION: &str = "xyra.invest.envelope.digest.v1";
+const INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM: &str = "SHA-256";
 
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -766,6 +768,18 @@ impl CloudAuthService {
             .as_str()
             .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
             .to_owned();
+        let envelope_digest_version = claim["signal"]["envelopeDigestVersion"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let envelope_digest_algorithm = claim["signal"]["envelopeDigestAlgorithm"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let envelope_digest = claim["signal"]["envelopeDigest"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
         let lease_id = claim["lease"]["leaseId"]
             .as_str()
             .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
@@ -779,6 +793,9 @@ impl CloudAuthService {
             "protocol": INVEST_SIGNAL_CONSUME_PROTOCOL,
             "eventId": event_id,
             "payloadDigest": payload_digest,
+            "envelopeDigestVersion": envelope_digest_version,
+            "envelopeDigestAlgorithm": envelope_digest_algorithm,
+            "envelopeDigest": envelope_digest,
             "leaseId": lease_id,
             "decisionId": decision_id,
             "idempotencyKey": claim_key,
@@ -1306,13 +1323,16 @@ fn parse_signal_claim(bytes: &[u8]) -> Result<Value, String> {
                 "workspaceId",
                 "receivedAt",
                 "payloadDigest",
+                "envelopeDigestVersion",
+                "envelopeDigestAlgorithm",
+                "envelopeDigest",
                 "verification",
             ],
             &[],
         )
         || !has_exact_keys(
             &value["signal"]["verification"],
-            &["signature", "keyId"],
+            &["signature", "keyId", "signingAlg"],
             &[],
         )
     {
@@ -1344,6 +1364,13 @@ fn parse_signal_claim(bytes: &[u8]) -> Result<Value, String> {
         || !is_canonical_uuid(string(signal, "workspaceId").unwrap_or_default())
         || !is_canonical_uuid(string(&signal["verification"], "keyId").unwrap_or_default())
         || signal["verification"]["signature"] != "verified"
+        || !matches!(
+            signal["verification"]["signingAlg"].as_str(),
+            Some("ES256" | "EdDSA")
+        )
+        || signal["envelopeDigestVersion"] != INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION
+        || signal["envelopeDigestAlgorithm"] != INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM
+        || !string(signal, "envelopeDigest").is_some_and(is_sha256_hex)
         || !is_iso_utc_timestamp(string(signal, "occurredAt").unwrap_or_default())
         || !is_iso_utc_timestamp(string(signal, "expiresAt").unwrap_or_default())
         || !is_iso_utc_timestamp(string(signal, "receivedAt").unwrap_or_default())
@@ -1393,6 +1420,9 @@ fn validate_signal_ack(bytes: &[u8], request: &Value) -> Result<(), String> {
             "status",
             "eventId",
             "payloadDigest",
+            "envelopeDigestVersion",
+            "envelopeDigestAlgorithm",
+            "envelopeDigest",
             "decisionId",
             "acknowledgedAt",
             "replayed",
@@ -1401,6 +1431,9 @@ fn validate_signal_ack(bytes: &[u8], request: &Value) -> Result<(), String> {
     ) && response["status"] == "acked"
         && response["eventId"] == request["eventId"]
         && response["payloadDigest"] == request["payloadDigest"]
+        && response["envelopeDigestVersion"] == request["envelopeDigestVersion"]
+        && response["envelopeDigestAlgorithm"] == request["envelopeDigestAlgorithm"]
+        && response["envelopeDigest"] == request["envelopeDigest"]
         && response["decisionId"] == request["decisionId"]
         && response["decisionId"]
             .as_str()
@@ -1414,6 +1447,13 @@ fn validate_signal_ack(bytes: &[u8], request: &Value) -> Result<(), String> {
     } else {
         Err("CLOUD_SIGNAL_ACK_INVALID".into())
     }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_iso_utc_timestamp(value: &str) -> bool {
@@ -1632,7 +1672,9 @@ mod tests {
                 "algorithmId":"strategy.alpha","signalId":"018f47a1-7b2c-7d0a-8d11-123456789abd","symbol":"ACME","side":"buy","quantity":"1.25",
                 "sourceId":"018f47a1-7b2c-7d0a-8d11-123456789aba","tenantId":"018f47a1-7b2c-7d0a-8d11-123456789abb","workspaceId":"018f47a1-7b2c-7d0a-8d11-123456789abc",
                 "receivedAt":"2026-01-01T00:00:01Z","payloadDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "verification":{"signature":"verified","keyId":"018f47a1-7b2c-7d0a-8d11-123456789ac0"}
+                "envelopeDigestVersion":"xyra.invest.envelope.digest.v1","envelopeDigestAlgorithm":"SHA-256",
+                "envelopeDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "verification":{"signature":"verified","keyId":"018f47a1-7b2c-7d0a-8d11-123456789ac0","signingAlg":"ES256"}
             }
         })
     }
@@ -1725,6 +1767,8 @@ mod tests {
         let claim = signal_claim_response();
         let ack = serde_json::json!({
             "status":"acked","eventId":"event-1","payloadDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "envelopeDigestVersion":"xyra.invest.envelope.digest.v1","envelopeDigestAlgorithm":"SHA-256",
+            "envelopeDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "decisionId":"018f47a1-7b2c-7d0a-8d11-123456789abc","acknowledgedAt":"2026-09-30T00:00:00Z","replayed":false
         });
         let fake = Arc::new(FakeTransport::with_responses(vec![
@@ -1759,6 +1803,18 @@ mod tests {
         let ack_body: Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(ack_body["eventId"], "event-1");
         assert_eq!(ack_body["payloadDigest"], claim["signal"]["payloadDigest"]);
+        assert_eq!(
+            ack_body["envelopeDigestVersion"],
+            claim["signal"]["envelopeDigestVersion"]
+        );
+        assert_eq!(
+            ack_body["envelopeDigestAlgorithm"],
+            claim["signal"]["envelopeDigestAlgorithm"]
+        );
+        assert_eq!(
+            ack_body["envelopeDigest"],
+            claim["signal"]["envelopeDigest"]
+        );
         assert_eq!(ack_body["leaseId"], claim["lease"]["leaseId"]);
         assert_eq!(ack_body["idempotencyKey"], claim_body["idempotencyKey"]);
         assert_eq!(
@@ -1791,6 +1847,8 @@ mod tests {
         let claim = signal_claim_response();
         let mut mismatched_ack = serde_json::json!({
             "status":"acked","eventId":"other-event","payloadDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "envelopeDigestVersion":"xyra.invest.envelope.digest.v1","envelopeDigestAlgorithm":"SHA-256",
+            "envelopeDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "decisionId":"018f47a1-7b2c-7d0a-8d11-123456789abc","acknowledgedAt":"2026-09-30T00:00:00Z","replayed":false
         });
         let client = authenticated_signal_service(
@@ -1806,6 +1864,46 @@ mod tests {
                 .consume_advisory_signal(43123, &"D".repeat(43))
                 .unwrap_err(),
             "CLOUD_SIGNAL_ACK_INVALID"
+        );
+    }
+
+    #[test]
+    fn advisory_signal_claim_requires_and_preserves_envelope_digest_metadata() {
+        let claim = signal_claim_response();
+        let encoded = serde_json::to_vec(&claim).unwrap();
+        assert_eq!(parse_signal_claim(&encoded).unwrap(), claim);
+
+        for (field, bad_value) in [
+            (
+                "envelopeDigestVersion",
+                Value::String("wrong-version".into()),
+            ),
+            ("envelopeDigestAlgorithm", Value::String("SHA1".into())),
+            ("envelopeDigest", Value::String("not-lowercase-hex".into())),
+        ] {
+            let mut mutated = claim.clone();
+            mutated["signal"][field] = bad_value;
+            assert_eq!(
+                parse_signal_claim(&serde_json::to_vec(&mutated).unwrap()).unwrap_err(),
+                "CLOUD_SIGNAL_RESPONSE_INVALID"
+            );
+        }
+        for bad_alg in ["none", "ES384"] {
+            let mut mutated = claim.clone();
+            mutated["signal"]["verification"]["signingAlg"] = Value::String(bad_alg.into());
+            assert_eq!(
+                parse_signal_claim(&serde_json::to_vec(&mutated).unwrap()).unwrap_err(),
+                "CLOUD_SIGNAL_RESPONSE_INVALID"
+            );
+        }
+        let mut missing = claim;
+        missing["signal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("envelopeDigest");
+        assert_eq!(
+            parse_signal_claim(&serde_json::to_vec(&missing).unwrap()).unwrap_err(),
+            "CLOUD_SIGNAL_RESPONSE_INVALID"
         );
     }
 
