@@ -83,7 +83,8 @@ export class CommandService {
     systems_total: number;
     agents_live: number;
     agents_total: number;
-    pending_approvals: number;
+    /** null = count not available; host runtime must compose via core.approvals capability. */
+    pending_approvals: number | null;
     unread_alerts: number;
   }> {
     const hour = new Date().getHours();
@@ -91,16 +92,13 @@ export class CommandService {
     const unread = await this.store.query<{ count: number } & Record<string, unknown>>(scope,
       'SELECT count(*)::int AS count FROM command_alerts WHERE workspace_id=$1 AND dismissed_at IS NULL',
       [scope.workspaceId]);
-    const pending = await this.store.query<{ count: number } & Record<string, unknown>>(scope,
-      'SELECT count(*)::int AS count FROM approval_requests WHERE workspace_id=$1 AND expires_at > now()',
-      [scope.workspaceId]);
     return {
       greeting,
       systems_live: 0,
       systems_total: 0,
       agents_live: 0,
       agents_total: 0,
-      pending_approvals: Number(pending.rows[0]?.count ?? 0),
+      pending_approvals: null,
       unread_alerts: Number(unread.rows[0]?.count ?? 0),
     };
   }

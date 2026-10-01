@@ -3,7 +3,6 @@ import type { PGlite } from '@electric-sql/pglite';
 import { applyPGliteMigrations, LocalScopedStore, prepareLocalAppRole } from '@xyra/db';
 import { openLocalStore } from '@xyra/db/pglite';
 import { uuidv7 } from '@xyra/core';
-import coreManifest from '@xyra/mod-core/manifest';
 import commandManifest from '../manifest';
 import { CommandService } from '../server/service';
 import { loadMigrations } from './fixtures';
@@ -14,7 +13,7 @@ let service: CommandService;
 beforeAll(async () => {
   db = await openLocalStore();
   await applyPGliteMigrations(db, loadMigrations());
-  await prepareLocalAppRole(db, [...coreManifest.tables, ...commandManifest.tables]);
+  await prepareLocalAppRole(db, commandManifest.tables);
   service = new CommandService(new LocalScopedStore(db));
 }, 60_000);
 
@@ -45,7 +44,8 @@ describe('command service', () => {
     const summary = await service.dashboardSummary(workspace);
     expect(summary.greeting).toMatch(/morning|afternoon|evening|night/i);
     expect(summary.unread_alerts).toBe(0);
-    expect(summary.pending_approvals).toBe(0);
+    // pending_approvals is null (unavailable) until host runtime composes via core.approvals
+    expect(summary.pending_approvals).toBeNull();
   });
 
   test('chats, messages and alerts stay within their workspace', async () => {
