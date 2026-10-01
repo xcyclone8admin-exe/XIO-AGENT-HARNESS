@@ -5,6 +5,7 @@ import { openLocalStore } from '@xyra/db/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { isHonestStatus } from '@xyra/contracts';
 import manifest from '../manifest';
+import { ConnectorRecord, ConnectorGrantRecord } from '../contracts';
 import { ConnectRepository } from './repository';
 import { ConnectMcpBoundary } from './mcp-boundary';
 
@@ -79,6 +80,16 @@ describe('CONNECT catalog honesty and isolation', () => {
     const revoked = await connect.recordGrant(actorA, { connectorId: 'github', action: 'revoke', allowedTools: [], reason: 'offboarding' });
     expect(revoked.action).toBe('revoke');
     expect(await connect.currentGrant(actorA, 'github')).toMatchObject({ action: 'revoke' });
+  });
+
+  it('returns ConnectorRecord and ConnectorGrantRecord that validate as the wire contract (regression: PGlite timestamptz is a Date, not a string)', async () => {
+    await connect.registerConnector(actorA, { id: 'contract-shape', name: 'Contract Shape', family: 'dev', availability: 'available', custody: 'none' });
+    const [connector] = (await connect.listConnectors(actorA)).filter((c) => c.id === 'contract-shape');
+    expect(() => ConnectorRecord.parse(connector)).not.toThrow();
+    const grant = await connect.recordGrant(actorA, { connectorId: 'contract-shape', action: 'grant', allowedTools: [], reason: '' });
+    expect(() => ConnectorGrantRecord.parse(grant)).not.toThrow();
+    const current = await connect.currentGrant(actorA, 'contract-shape');
+    expect(() => ConnectorGrantRecord.parse(current)).not.toThrow();
   });
 
   it('refuses a grant against a connector that was never registered', async () => {

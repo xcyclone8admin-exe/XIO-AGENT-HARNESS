@@ -14,12 +14,12 @@ interface ConnectorRow extends Record<string, unknown> {
   family: string;
   state: string;
   detail: string;
-  checked_at: string | null;
+  checked_at: string | Date | null;
   availability: string;
   custody: string;
   created_by: string;
-  created_at: string;
-  updated_at: string;
+  created_at: string | Date;
+  updated_at: string | Date;
 }
 
 interface GrantRow extends Record<string, unknown> {
@@ -29,7 +29,20 @@ interface GrantRow extends Record<string, unknown> {
   allowed_tools: unknown;
   reason: string;
   created_by: string;
-  created_at: string;
+  created_at: string | Date;
+}
+
+/**
+ * PGlite (like node-postgres) returns `timestamptz` columns as JS Date objects, not strings, even
+ * though every row type here is declared as `string` for query-site convenience. Every date field
+ * leaving this module for a zod-validated boundary MUST go through this so it is never handed out
+ * as a raw Date.
+ */
+function toIso(value: string | Date): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+function toIsoNullable(value: string | Date | null): string | null {
+  return value === null ? null : toIso(value);
 }
 
 /**
@@ -132,12 +145,12 @@ function toConnectorRecord(row: ConnectorRow): ConnectorRecord {
     family: row.family,
     state: row.state as ConnectorRecord['state'],
     detail: row.detail,
-    checkedAt: row.checked_at,
+    checkedAt: toIsoNullable(row.checked_at),
     availability: row.availability as ConnectorRecord['availability'],
     custody: row.custody as ConnectorRecord['custody'],
     createdBy: row.created_by,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
   };
 }
 
@@ -149,6 +162,6 @@ function toGrantRecord(row: GrantRow): ConnectorGrantRecord {
     allowedTools: Array.isArray(row.allowed_tools) ? (row.allowed_tools as string[]) : [],
     reason: row.reason,
     createdBy: row.created_by,
-    createdAt: row.created_at,
+    createdAt: toIso(row.created_at),
   };
 }
