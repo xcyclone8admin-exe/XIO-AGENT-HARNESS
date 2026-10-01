@@ -264,6 +264,8 @@ test('Cloud signal claim becomes one immutable advisory decision before host ack
   const first=await service.consumeCloudInvestSignal(scope,envelope,claim,userId);
   const duplicate=await service.consumeCloudInvestSignal(scope,envelope,claim,userId);
   expect(duplicate).toEqual(first);
+  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,leaseId:'019a0000-0000-7000-8000-000000000805'},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
+  await expect(service.consumeCloudInvestSignal(scope,envelope,{...claim,fence:2},userId)).rejects.toThrow('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
   expect((await service.orders(scope,{}))).toHaveLength(before);
   const row=await db.query<{decision_status:string;instrument_id:string;claim_fence:number;detail:Record<string,unknown>}>(
     `SELECT decision_status,instrument_id,claim_fence,detail FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,[tenantId,workspaceId,first.decisionId]);

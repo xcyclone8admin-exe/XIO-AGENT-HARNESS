@@ -100,11 +100,12 @@ export class InvestService {
     validateVerifiedInvestSignal(trustedScope,envelope,claim);
     if(decimalQuantityToUnits(envelope.quantity,12)<=0n) throw new Error('INVEST_SIGNAL_QUANTITY_INVALID');
     if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(actorId)) throw new Error('INVEST_SIGNAL_ACTOR_INVALID');
-    const existing=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string}>(
-      `SELECT id,payload_digest FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
+    const existing=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;claim_lease_id:string;claim_fence:number}>(
+      `SELECT id,payload_digest,claim_lease_id,claim_fence FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
     if(existing){
       if(existing.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+      if(existing.claim_lease_id!==claim.leaseId||existing.claim_fence!==claim.fence) throw new Error('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
       return {decisionId:existing.id};
     }
     const instruments=(await this.scoped.withServerScope(trustedScope,'invest_paper_execution',trustedScope.hlc,(tx)=>tx.query<{id:string;asset_class:string;quantity_scale:number}>(
@@ -122,10 +123,11 @@ export class InvestService {
        ON CONFLICT(tenant_id,workspace_id,source_id,event_id) DO NOTHING`,
       [decisionId,trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId,envelope.signalId,envelope.payloadDigest,envelope.algorithmId,
        envelope.symbol,envelope.side,envelope.quantity,claim.leaseId,claim.fence,claim.expiresAt,candidateInstrument?.id??null,JSON.stringify(detail),actorId]));
-    const persisted=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string}>(
-      `SELECT id,payload_digest FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
+    const persisted=(await this.scoped.withServerScope(trustedScope,'invest_paper',trustedScope.hlc,(tx)=>tx.query<{id:string;payload_digest:string;claim_lease_id:string;claim_fence:number}>(
+      `SELECT id,payload_digest,claim_lease_id,claim_fence FROM invest_signal_decisions WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND event_id=$4`,
       [trustedScope.tenantId,trustedScope.workspaceId,envelope.sourceId,envelope.eventId]))).rows[0];
     if(!persisted||persisted.payload_digest!==envelope.payloadDigest) throw new Error('INVEST_SIGNAL_EVENT_DIGEST_CONFLICT');
+    if(persisted.claim_lease_id!==claim.leaseId||persisted.claim_fence!==claim.fence) throw new Error('INVEST_SIGNAL_CLAIM_REPLAY_CONFLICT');
     return {decisionId:persisted.id};
   }
 
