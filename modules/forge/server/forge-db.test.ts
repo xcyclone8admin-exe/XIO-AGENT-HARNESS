@@ -4,6 +4,9 @@ import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole
 import { openLocalStore } from '@xyra/db/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import manifest from '../manifest';
+import { ForgeRepository } from './repository';
+import { registerForge, type ForgeCall } from './index';
+import type { AnyCapability } from '@xyra/contracts';
 
 type Db = Awaited<ReturnType<typeof openLocalStore>>;
 const tenantA = '019a0000-0000-7000-8000-000000000001';
@@ -15,6 +18,7 @@ const scopeA = { tenantId: tenantA, workspaceId: workspaceA };
 const scopeB = { tenantId: tenantB, workspaceId: workspaceB };
 let db: Db;
 let scoped: LocalScopedStore;
+let forge: ForgeRepository;
 
 function load(owner: string, relativeDir: string): Migration[] {
   const dir = fileURLToPath(new URL(relativeDir, import.meta.url));
@@ -30,6 +34,7 @@ beforeAll(async () => {
   await db.query('INSERT INTO tenants(id,name) VALUES ($1,$2),($3,$4)', [tenantA, 'A', tenantB, 'B']);
   await db.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3),($4,$5,$6)', [workspaceA, tenantA, 'A', workspaceB, tenantB, 'B']);
   scoped = new LocalScopedStore(db);
+  forge = new ForgeRepository(scoped);
 }, 60_000);
 
 afterAll(async () => { await db?.close(); });
@@ -52,5 +57,63 @@ describe('Forge schema and workspace isolation', () => {
     await expect(scoped.query(scopeA, "UPDATE forge_evidence SET result='fail' WHERE requirement_id='REQ'")).rejects.toThrow();
     await expect(scoped.query(scopeA, "DELETE FROM forge_evidence WHERE requirement_id='REQ'")).rejects.toThrow();
     await expect(scoped.query(scopeB, "INSERT INTO forge_nodes(id,tenant_id,workspace_id,project_id,kind,title,state,created_by) VALUES ('019a0000-0000-7000-8000-000000000071',$1,$2,$3,'ticket','Cross scope','ready',$4)", [tenantA, workspaceB, projectId, actor])).rejects.toThrow();
+  });
+
+  it('persists hierarchy, approval decisions and source provenance only inside the caller workspace', async () => {
+    const actorA = { id: actor, tenantId: tenantA, workspaceId: workspaceA };
+    const project = await forge.createProject(actorA, { name: 'Forge persistence', description: 'test', requirements: [] });
+    const epic = await forge.createNode(actorA, project.id, { parentId: null, kind: 'epic', title: 'Bounded epic', description: '', state: 'draft', priority: 'normal', dependencies: [], requirements: [], acceptanceCriteria: [], ownerId: null });
+    expect((await forge.nodes(actorA, project.id)).map((node) => node.id)).toContain(epic.id);
+    expect((await forge.updateNode(actorA, { nodeId: epic.id, title: 'Updated epic' })).title).toBe('Updated epic');
+    await expect(forge.requestApproval(actorA, { epicId: epic.id })).rejects.toThrow('FORGE_EPIC_MUST_BE_PROPOSED');
+    await forge.updateNode(actorA, { nodeId: epic.id, state: 'proposed' });
+    const request = await forge.requestApproval(actorA, { epicId: epic.id });
+    expect(request.status).toBe('pending');
+    const approvedRequest = await forge.decideApproval(actorA, { approvalId: request.id, decision: 'approved', reason: 'Scope reviewed' });
+    expect(approvedRequest.status).toBe('approved');
+    expect((await forge.approvals(actorA)).find((item) => item.id === request.id)?.status).toBe('approved');
+    expect((await forge.approvedPlanData(actorA, request.id)).tickets.map((node) => node.id)).toContain(epic.id);
+    await expect(forge.approvedPlanData(actorA, '019a0000-0000-7000-8000-000000000099')).rejects.toThrow('FORGE_APPROVED_DURABLE_APPROVAL_REQUIRED');
+    const source = await forge.createSource(actorA, { label: 'Requirements', locator: 'project/requirements.md', sha256: 'b'.repeat(64) });
+    expect(source).toMatchObject({ authority: 'user', status: 'draft' });
+    expect((await forge.sources(actorA)).map((item) => item.id)).toContain(source.id);
+    expect(await forge.projects({ id: actor, tenantId: tenantB, workspaceId: workspaceB })).toEqual([]);
+    await expect(scoped.query(scopeA, "UPDATE forge_sources SET status='rejected' WHERE id=$1", [source.id])).rejects.toThrow();
+    const task = await forge.createNode(actorA, project.id, { parentId: epic.id, kind: 'ticket', title: 'First work', description: '', state: 'ready', priority: 'normal', dependencies: [], requirements: [{ id: 'XIO-REQ-FRG-008', statement: 'evidence gate' }], acceptanceCriteria: ['pass'], ownerId: null });
+    const dependent = await forge.createNode(actorA, project.id, { parentId: epic.id, kind: 'ticket', title: 'Dependent work', description: '', state: 'ready', priority: 'normal', dependencies: [task.id], requirements: [], acceptanceCriteria: ['wait'], ownerId: null });
+    const evidenceRecord = await forge.createEvidence(actorA, { requirementId: 'XIO-REQ-FRG-008', kind: 'test', source: 'vitest fixture', deterministic: true, result: 'pass', payload: { test: 'green' }, ticketId: task.id });
+    expect((await forge.nodes(actorA, project.id)).find((node) => node.id === task.id)?.evidenceIds).toContain(evidenceRecord.id);
+    expect((await forge.gateMatrix(actorA, { requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'critical', evidenceIds: [evidenceRecord.id] }] })).overall).toBe('pass');
+    const finding = await forge.createFindingRecord(actorA, { role: 'security', state: 'open', severity: 'medium', title: 'Review finding', evidenceIds: [evidenceRecord.id], affectedRequirements: ['XIO-REQ-FRG-007'], confidence: 0.8, reproduction: 'Repro in fixture', remediation: 'Address issue', revalidation: 'Rerun suite' });
+    expect((await forge.transitionFindingRecord(actorA, { findingId: finding.id, state: 'triaged', detail: 'Assigned' })).state).toBe('triaged');
+    const plannerInput = { epicId: epic.id, approval: approvedRequest, config: { maxConcurrency: 1, maxBudgetUsd: 10, resourceLocks: [], substrateVerified: false, externalAdaptersEnabled: false }, tickets: await forge.nodes(actorA, project.id), spentUsd: 0, killSwitchEngaged: false };
+    const handlers = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    registerForge({ register: (_manifest, descriptor: AnyCapability, handler) => { handlers.set(descriptor.id, handler); } }, manifest, forge);
+    const capabilityCall: ForgeCall = { principal: { id: actor, tenantId: tenantA }, workspaceId: workspaceA };
+    const plan = await handlers.get('forge.schedule.plan')?.({ epicId: epic.id, approvalId: approvedRequest.id, config: plannerInput.config, spentUsd: 0 }, capabilityCall) as { runId: string; runnableTicketIds: string[]; blockedTicketIds: string[] };
+    expect(plan.runnableTicketIds).toContain(task.id);
+    expect(plan.blockedTicketIds).toEqual([dependent.id]);
+    const schedule = (await forge.schedules(actorA)).find((item) => item.id === plan.runId);
+    expect(schedule).toBeDefined();
+    if (!schedule) throw new Error('test schedule missing');
+    expect(schedule.state).toBe('queued');
+    expect((await forge.cancelSchedule(actorA, schedule.id, 'User canceled')).state).toBe('canceled');
+    expect((await forge.runs(actorA)).some((event) => event.ticketId === task.id && event.state === 'canceled' && event.externalExecution === false)).toBe(true);
+    const escalation = await forge.recordDiscovery(actorA, { ticketId: task.id, summary: 'Contract change affects this work', evidenceIds: [evidenceRecord.id], affectedTicketIds: [] });
+    expect(escalation.discovery.classification).toBe('material');
+    expect(escalation.blockedTicketIds).toEqual(expect.arrayContaining([task.id, dependent.id]));
+    expect((await forge.nodes(actorA, project.id)).filter((node) => [task.id, dependent.id].includes(node.id)).every((node) => node.state === 'blocked')).toBe(true);
+  });
+
+  it('derives tenant and workspace from trusted capability call context', async () => {
+    const handlers = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    registerForge({ register: (_manifest, descriptor: AnyCapability, handler) => { handlers.set(descriptor.id, handler); } }, manifest, forge);
+    const callA: ForgeCall = { principal: { id: actor, tenantId: tenantA }, workspaceId: workspaceA };
+    await expect(Promise.resolve().then(() => handlers.get('forge.projects.list')?.({} as unknown, undefined as unknown as ForgeCall))).rejects.toThrow('FORGE_TRUSTED_CALL_CONTEXT_REQUIRED');
+    const created = await handlers.get('forge.projects.create')?.({ name: 'Capability scoped', description: '', requirements: [] }, callA) as { workspaceId: string };
+    expect(created.workspaceId).toBe(workspaceA);
+    const callB: ForgeCall = { principal: { id: '019a0000-0000-7000-8000-000000000022', tenantId: tenantB }, workspaceId: workspaceB };
+    const visible = await handlers.get('forge.projects.list')?.({}, callB);
+    expect(visible).toEqual([]);
   });
 });
