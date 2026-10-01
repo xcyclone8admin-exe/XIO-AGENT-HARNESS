@@ -188,6 +188,14 @@ export class FlowRepository {
       throw new Error('FLOW_CONCURRENCY_LIMIT_REACHED');
     }
     const runId = randomUUID();
+    // The registry row must exist before the first flow_runs event: flow_runs.run_id carries a
+    // real FK into flow_run_registry as of migration 0003.
+    await this.store.query(
+      scope,
+      `INSERT INTO flow_run_registry (tenant_id, workspace_id, run_id, workflow_id, trigger, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [actor.tenantId, actor.workspaceId, runId, workflowId, trigger, actor.id],
+    );
     await this.store.query(
       scope,
       `INSERT INTO flow_runs (id, run_id, tenant_id, workspace_id, workflow_id, trigger, state, step_index, attempt, detail, created_by)

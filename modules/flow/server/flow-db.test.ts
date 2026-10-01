@@ -81,8 +81,56 @@ describe('FLOW schema and workspace isolation', () => {
         expect(pgType, `${where} type`).toBe(spec.type);
         expect(column.is_nullable === 'YES', `${where} nullable`).toBe(spec.nullable);
         expect(column.is_nullable === 'NO' && column.column_default === null, `${where} requiredOnInsert`).toBe(spec.requiredOnInsert);
+        if (spec.references) {
+          const fk = await db.query(
+            `SELECT 1 FROM information_schema.key_column_usage k
+             JOIN information_schema.referential_constraints r
+               ON r.constraint_name = k.constraint_name AND r.constraint_schema = k.constraint_schema
+             JOIN information_schema.table_constraints t
+               ON t.constraint_name = r.unique_constraint_name AND t.constraint_schema = r.unique_constraint_schema
+             WHERE k.table_name = $1 AND k.column_name = $2 AND t.table_name = $3`,
+            [table.name, name, spec.references.table],
+          );
+          expect(fk.rows.length, `${where} references ${spec.references.table}`).toBeGreaterThan(0);
+        }
       }
     }
+  });
+
+  it('rejects a checkpoint or approval row whose run_id has no flow_run_registry entry', async () => {
+    const bogusRunId = '019a0000-0000-7000-8000-00000000dead';
+    await expect(
+      scoped.query(
+        { tenantId: tenantA, workspaceId: workspaceA },
+        `INSERT INTO flow_checkpoints (id, tenant_id, workspace_id, run_id, step_index, step_id, status, attempt, output, error, created_by)
+         VALUES ($1, $2, $3, $4, 0, 'orphan', 'succeeded', 0, '{}'::jsonb, NULL, $5)`,
+        ['019a0000-0000-7000-8000-00000000c0de', tenantA, workspaceA, bogusRunId, actorIdA],
+      ),
+    ).rejects.toThrow();
+    await expect(
+      scoped.query(
+        { tenantId: tenantA, workspaceId: workspaceA },
+        `INSERT INTO flow_approvals (id, tenant_id, workspace_id, run_id, step_index, attempt, decision, reason, decided_by)
+         VALUES ($1, $2, $3, $4, 0, 0, 'approve', '', $5)`,
+        ['019a0000-0000-7000-8000-00000000face', tenantA, workspaceA, bogusRunId, actorIdA],
+      ),
+    ).rejects.toThrow();
+  });
+
+  it('registers one flow_run_registry row per logical run, created before the run can advance', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'registry-backed', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const registry = await scoped.query<{ run_id: string; workflow_id: string; trigger: string }>(
+      { tenantId: tenantA, workspaceId: workspaceA },
+      'SELECT run_id, workflow_id, trigger FROM flow_run_registry WHERE run_id = $1',
+      [started.runId],
+    );
+    expect(registry.rows).toHaveLength(1);
+    expect(registry.rows[0]).toMatchObject({ run_id: started.runId, workflow_id: workflow.id, trigger: 'manual' });
+    await flow.advanceRun(actorA, started.runId);
+    // Advancing appends more flow_runs events for the same run_id; the registry row stays singular.
+    const stillOne = await scoped.query({ tenantId: tenantA, workspaceId: workspaceA }, 'SELECT run_id FROM flow_run_registry WHERE run_id = $1', [started.runId]);
+    expect(stillOne.rows).toHaveLength(1);
   });
 });
 
