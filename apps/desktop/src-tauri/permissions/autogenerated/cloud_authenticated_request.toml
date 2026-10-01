@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-authenticated-request"
+description = "Enables the cloud_authenticated_request command without any pre-configured scope."
+commands.allow = ["cloud_authenticated_request"]
+
+[[permission]]
+identifier = "deny-cloud-authenticated-request"
+description = "Denies the cloud_authenticated_request command without any pre-configured scope."
+commands.deny = ["cloud_authenticated_request"]

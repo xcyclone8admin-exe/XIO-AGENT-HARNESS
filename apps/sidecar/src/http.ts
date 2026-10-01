@@ -23,16 +23,20 @@ export interface SidecarHttpOptions {
   readonly resolvePrincipal: () => Promise<Principal>;
   readonly bus: CapabilityBus;
   /** Records a validated Cloud response. Must be wired to a trusted server-side service only. */
-  readonly acceptCloudSyncPush?: (request: PushRequestValue, response: PushResponseValue) => Promise<void>;
+  readonly acceptCloudSyncPush?: (
+    scope: { readonly tenantId: string; readonly workspaceId: string },
+    request: PushRequestValue,
+    response: PushResponseValue,
+  ) => Promise<void>;
 }
 
-const NATIVE_SYNC_PATH = '/api/v1/internal/cloud-sync/push-result';
+const NATIVE_SYNC_PATH = '/internal/native/cloud-sync/push';
 const MAX_NATIVE_SYNC_BODY_BYTES = 2_100_000;
 
-async function boundedJson(request: Request, maxBytes: number): Promise<
-  | { ok: true; value: unknown }
-  | { ok: false; status: 400 | 413; code: string }
-> {
+async function boundedJson(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: unknown } | { ok: false; status: 400 | 413; code: string }> {
   const reader = request.body?.getReader();
   if (!reader) return { ok: false, status: 400, code: 'INVALID_JSON' };
   const chunks: Uint8Array[] = [];
@@ -70,9 +74,18 @@ function tokenMatches(candidate: string | undefined, expected: string): boolean 
   return provided.length === reference.length && timingSafeEqual(provided, reference);
 }
 
+function nativeTokenMatches(candidate: string | undefined, expected: string): boolean {
+  if (!candidate) return false;
+  const provided = Buffer.from(candidate);
+  const reference = Buffer.from(expected);
+  return provided.length === reference.length && timingSafeEqual(provided, reference);
+}
+
 export function createSidecarApp(options: SidecarHttpOptions): Hono {
   if (
-    options.port < 1 || options.port > 65535 || Buffer.from(options.launchToken).length < 32 ||
+    options.port < 1 ||
+    options.port > 65535 ||
+    Buffer.from(options.launchToken).length < 32 ||
     (options.nativeSyncToken !== undefined && Buffer.from(options.nativeSyncToken).length < 32)
   ) {
     throw new Error('Sidecar requires a bound port and a 256-bit launch token');
@@ -81,6 +94,9 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
   app.use('*', async (c, next) => {
     if (c.req.header('host') !== `127.0.0.1:${options.port}`) return c.json({ code: 'HOST_REJECTED' }, 403);
     const origin = c.req.header('origin');
+    if (c.req.path === NATIVE_SYNC_PATH && (origin || c.req.method !== 'POST')) {
+      return c.json({ code: 'NATIVE_SYNC_ONLY' }, 403);
+    }
     if (origin && !options.allowedOrigins.includes(origin)) return c.json({ code: 'ORIGIN_REJECTED' }, 403);
     if (origin) {
       c.header('Access-Control-Allow-Origin', origin);
@@ -90,10 +106,16 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
     }
     if (c.req.method === 'OPTIONS') return c.body(null, 204);
     if (c.req.path === NATIVE_SYNC_PATH) {
-      if (!options.nativeSyncToken || !tokenMatches(c.req.header('authorization'), options.nativeSyncToken)) {
+      if (
+        !options.nativeSyncToken ||
+        !nativeTokenMatches(c.req.header('x-xyra-native-sync-token'), options.nativeSyncToken)
+      ) {
         return c.json({ code: 'NATIVE_SYNC_ONLY' }, 403);
       }
-    } else if (c.req.path !== '/api/health' && !tokenMatches(c.req.header('authorization'), options.launchToken)) {
+    } else if (
+      c.req.path !== '/api/health' &&
+      !tokenMatches(c.req.header('authorization'), options.launchToken)
+    ) {
       return c.json({ code: 'UNAUTHORIZED' }, 401);
     }
     await next();
@@ -111,17 +133,27 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
     if (!envelope.success) return c.json({ code: 'SYNC_ACK_INVALID' }, 400);
     const principal = await options.resolvePrincipal();
     const allowedWorkspaces = new Set(principal.workspaces.map((workspace) => workspace.id));
+    const workspaces = new Set(envelope.data.request.changes.map((change) => change.workspaceId));
     if (
       principal.kind !== 'user' ||
-      envelope.data.request.changes.some((change) =>
-        change.tenantId !== principal.tenantId ||
-        change.workspaceId === null ||
-        !allowedWorkspaces.has(change.workspaceId),
+      workspaces.size !== 1 ||
+      envelope.data.request.changes.some(
+        (change) =>
+          change.tenantId !== principal.tenantId ||
+          change.workspaceId === null ||
+          !allowedWorkspaces.has(change.workspaceId),
       )
-    ) return c.json({ code: 'SYNC_ACK_SCOPE_MISMATCH' }, 403);
+    )
+      return c.json({ code: 'SYNC_ACK_SCOPE_MISMATCH' }, 403);
     try {
       assertPushResponseBoundToRequest(envelope.data.request, envelope.data.response);
-      await options.acceptCloudSyncPush(envelope.data.request, envelope.data.response);
+      const workspaceId = [...workspaces][0];
+      if (!workspaceId) return c.json({ code: 'SYNC_ACK_SCOPE_MISMATCH' }, 403);
+      await options.acceptCloudSyncPush(
+        { tenantId: principal.tenantId, workspaceId },
+        envelope.data.request,
+        envelope.data.response,
+      );
       return c.json({ status: 'recorded' });
     } catch {
       return c.json({ code: 'SYNC_ACK_REJECTED' }, 409);

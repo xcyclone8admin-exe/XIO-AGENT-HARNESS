@@ -82,7 +82,9 @@ for (const f of code) {
   read(f.p)
     .split('\n')
     .forEach((line, i) => {
-      if (!/\b(TODO|FIXME|XXX)\b/.test(line)) return;
+      // `XXX` is also a valid ISO currency code and appears in generated validators;
+      // recognize it only when used as a placeholder marker, while TODO/FIXME remain broad.
+      if (!/\b(TODO|FIXME)\b|\bXXX(?=\s|:|-|$)/.test(line)) return;
       const id = /PLACEHOLDER\((PH-\d{3})\)/.exec(line)?.[1];
       if (!id || !register.includes(id)) fail('placeholders', `${f.r}:${i + 1} unregistered placeholder`);
     });

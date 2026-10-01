@@ -5,6 +5,7 @@ import {
   AGENT_PROFILE_REQUIRED_FIELDS,
   BUILT_IN_AGENT_ROLES,
   AgentProfile,
+  AgentRunner,
   BoundedRunLoop,
   InMemoryRunJournal,
   LocalKillSwitch,
@@ -705,3 +706,31 @@ function leasedRun(
   const base = runInput({ profile: profile({ budgets: { ...profile().budgets, ...budgets } }), ...extra });
   return loop.run({ ...base, leaseScope: { jobId: 'j', window: 'w' } });
 }
+
+describe('in-process agent runner seam', () => {
+  it('executes only through the bounded loop and reports active invocation state without queue semantics', async () => {
+    const runner = new AgentRunner({
+      router: routerWith([provider('primary', async () => response())]),
+      capabilities: [],
+      capabilityCaller: { call: async () => { throw new Error('no capabilities configured'); } },
+    });
+    expect(runner.activeRunIds).toEqual([]);
+    const result = await runner.run(runInput());
+    expect(result.termination).toBe('COMPLETED');
+    expect(runner.activeRunIds).toEqual([]);
+    expect(runner.cancel(IDS.run)).toBe(false);
+  });
+
+  it('prepares runs only from host-resolved scope, profile, route and spawn contract', async () => {
+    const runner = new AgentRunner({ router: routerWith([provider('primary', async () => response())]), capabilities: [], capabilityCaller: { call: async () => [] } });
+    const input = runInput();
+    const prepared = runner.prepare({ ...input, verifiedApproval: null });
+    expect(prepared.authority).toMatchObject({ principalId: IDS.agent, tenantId: IDS.tenant, workspaceId: IDS.workspace, verifiedApproval: null });
+    await expect(runner.runPrepared(prepared)).resolves.toMatchObject({ termination: 'COMPLETED' });
+
+    expect(() => runner.prepare({ ...input, verifiedApproval: null, principal: { ...principal, workspaces: [] } })).toThrow('RUN_WORKSPACE_OUT_OF_SCOPE');
+    expect(() => runner.prepare({ ...input, verifiedApproval: null, spawn: { ...input.spawn, budgets: { ...input.spawn.budgets, maxActions: 4 } } })).toThrow('RUN_BUDGET_ESCALATION');
+    expect(() => runner.prepare({ ...input, verifiedApproval: null, route: undefined as never })).toThrow();
+    expect(() => new AgentRunner({ router: routerWith([provider('primary', async () => response())]), capabilities: [], capabilityCaller: undefined as never })).toThrow('AGENT_RUNNER_HOST_DEPENDENCIES_REQUIRED');
+  });
+});

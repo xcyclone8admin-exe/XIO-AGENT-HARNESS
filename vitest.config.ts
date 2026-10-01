@@ -9,5 +9,9 @@ export default defineConfig({
     testTimeout: 30_000,
     hookTimeout: 60_000,
     pool: 'forks',
+    // The Cloud integration suite runs a real workerd Durable Object; serial files avoid
+    // cross-fork pressure that has reset Miniflare's local bridge during long test runs.
+    fileParallelism: false,
+    maxWorkers: 1,
   },
 });

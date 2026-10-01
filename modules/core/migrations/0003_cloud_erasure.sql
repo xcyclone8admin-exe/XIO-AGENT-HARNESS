@@ -1,0 +1,159 @@
+-- Cloud/BRAIN erasure v1. Cloud owns this registry and its operation receipts.
+-- Storage keys remain server-only; clients see only opaque object/reference IDs.
+
+CREATE TABLE cloud_erasure_objects (
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  id uuid NOT NULL,
+  storage_key text NOT NULL CHECK (length(storage_key) BETWEEN 1 AND 2048),
+  reference_state_version bigint NOT NULL DEFAULT 1 CHECK (reference_state_version > 0),
+  hold_state text NOT NULL DEFAULT 'unknown' CHECK (hold_state IN ('unknown','clear','held')),
+  hold_state_version bigint NOT NULL DEFAULT 1 CHECK (hold_state_version > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id,workspace_id,id),
+  UNIQUE (tenant_id,workspace_id,storage_key),
+  FOREIGN KEY (tenant_id,workspace_id) REFERENCES workspaces(tenant_id,id) ON DELETE RESTRICT
+);
+
+CREATE TABLE cloud_erasure_refs (
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  object_id uuid NOT NULL,
+  source_kind text NOT NULL CHECK (source_kind='brain_source'),
+  source_id uuid NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  retired_at timestamptz,
+  PRIMARY KEY (tenant_id,workspace_id,object_id,source_kind,source_id),
+  FOREIGN KEY (tenant_id,workspace_id,object_id)
+    REFERENCES cloud_erasure_objects(tenant_id,workspace_id,id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id,workspace_id) REFERENCES workspaces(tenant_id,id) ON DELETE RESTRICT,
+  CHECK ((active AND retired_at IS NULL) OR (NOT active AND retired_at IS NOT NULL))
+);
+CREATE INDEX cloud_erasure_refs_source
+  ON cloud_erasure_refs(tenant_id,workspace_id,source_kind,source_id) WHERE active;
+CREATE INDEX cloud_erasure_refs_object
+  ON cloud_erasure_refs(tenant_id,workspace_id,object_id) WHERE active;
+
+CREATE TABLE cloud_erasure_operations (
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  id uuid NOT NULL,
+  erasure_id uuid NOT NULL,
+  source_kind text NOT NULL CHECK (source_kind='brain_source'),
+  source_id uuid NOT NULL,
+  source_version text NOT NULL CHECK (source_version ~ '^sha256:[0-9a-f]{64}$'),
+  request_digest text NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+  actor_id uuid NOT NULL,
+  capability_id text NOT NULL CHECK (capability_id='brain.sources.erase'),
+  approval_id uuid NOT NULL,
+  status text NOT NULL CHECK (status IN (
+    'eligible','retained_shared','retained_hold','hold_unknown','unavailable',
+    'eligibility_expired','eligibility_invalidated','purge_claimed',
+    'local_purge_acknowledged','delete_pending','completed','aborted',
+    'retryable_failure','terminal_failure'
+  )),
+  attempt_no integer NOT NULL DEFAULT 1 CHECK (attempt_no > 0),
+  reference_state_version jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(reference_state_version)='object'),
+  hold_state_version jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(hold_state_version)='object'),
+  reservation_id uuid,
+  reservation_expires_at timestamptz,
+  claim_id uuid,
+  claim_generation bigint NOT NULL DEFAULT 0 CHECK (claim_generation >= 0),
+  local_receipt_id uuid,
+  local_receipt_digest text CHECK (local_receipt_digest IS NULL OR local_receipt_digest ~ '^[0-9a-f]{64}$'),
+  receipt_id uuid NOT NULL,
+  retry_count integer NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+  retry_limit integer NOT NULL DEFAULT 5 CHECK (retry_limit BETWEEN 1 AND 10),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id,workspace_id,id),
+  UNIQUE (tenant_id,workspace_id,erasure_id),
+  FOREIGN KEY (tenant_id,workspace_id) REFERENCES workspaces(tenant_id,id) ON DELETE RESTRICT,
+  CHECK ((status='purge_claimed' AND claim_id IS NOT NULL AND claim_generation>0) OR status<>'purge_claimed'),
+  CHECK ((status='eligible' AND reservation_id IS NOT NULL AND reservation_expires_at IS NOT NULL) OR status<>'eligible')
+);
+CREATE INDEX cloud_erasure_operations_source
+  ON cloud_erasure_operations(tenant_id,workspace_id,source_kind,source_id,updated_at DESC);
+
+CREATE TABLE cloud_erasure_attempts (
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  operation_id uuid NOT NULL,
+  attempt_id uuid NOT NULL,
+  attempt_no integer NOT NULL CHECK (attempt_no > 0),
+  request_digest text NOT NULL CHECK (request_digest ~ '^[0-9a-f]{64}$'),
+  approval_id uuid NOT NULL,
+  approval_input_hash text NOT NULL CHECK (approval_input_hash ~ '^[0-9a-f]{64}$'),
+  approval_scope_hash text NOT NULL CHECK (approval_scope_hash ~ '^[0-9a-f]{64}$'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id,workspace_id,operation_id,attempt_id),
+  UNIQUE (tenant_id,workspace_id,operation_id,attempt_no),
+  UNIQUE (tenant_id,workspace_id,approval_id),
+  FOREIGN KEY (tenant_id,workspace_id,operation_id)
+    REFERENCES cloud_erasure_operations(tenant_id,workspace_id,id) ON DELETE RESTRICT
+);
+
+CREATE TABLE cloud_erasure_events (
+  id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  operation_id uuid NOT NULL,
+  event_id uuid NOT NULL,
+  status text NOT NULL CHECK (status IN (
+    'eligible','retained_shared','retained_hold','hold_unknown','unavailable',
+    'eligibility_expired','eligibility_invalidated','purge_claimed',
+    'local_purge_acknowledged','delete_pending','completed','aborted',
+    'retryable_failure','terminal_failure'
+  )),
+  detail jsonb NOT NULL CHECK (jsonb_typeof(detail)='object'),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id,workspace_id,event_id),
+  FOREIGN KEY (tenant_id,workspace_id,operation_id)
+    REFERENCES cloud_erasure_operations(tenant_id,workspace_id,id) ON DELETE RESTRICT
+);
+CREATE INDEX cloud_erasure_events_operation
+  ON cloud_erasure_events(tenant_id,workspace_id,operation_id,id);
+
+-- Retain only a content-free fence after purge to reject delayed sync resurrection.
+CREATE TABLE cloud_erasure_source_fences (
+  tenant_id uuid NOT NULL,
+  workspace_id uuid NOT NULL,
+  source_kind text NOT NULL CHECK (source_kind='brain_source'),
+  source_id uuid NOT NULL,
+  table_name text NOT NULL CHECK (table_name ~ '^[a-z][a-z0-9_]*$'),
+  row_id uuid NOT NULL,
+  operation_id uuid NOT NULL,
+  erased_source_version text NOT NULL CHECK (erased_source_version ~ '^sha256:[0-9a-f]{64}$'),
+  fenced_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id,workspace_id,table_name,row_id),
+  FOREIGN KEY (tenant_id,workspace_id,operation_id)
+    REFERENCES cloud_erasure_operations(tenant_id,workspace_id,id) ON DELETE RESTRICT
+);
+
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['cloud_erasure_objects','cloud_erasure_refs','cloud_erasure_operations','cloud_erasure_attempts','cloud_erasure_events','cloud_erasure_source_fences'] LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY',t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t);
+    EXECUTE format(
+      'CREATE POLICY %I ON %I USING (tenant_id::text=current_setting(''app.tenant_id'',true) AND workspace_id::text=current_setting(''app.workspace_id'',true)) WITH CHECK (tenant_id::text=current_setting(''app.tenant_id'',true) AND workspace_id::text=current_setting(''app.workspace_id'',true))',
+      t||'_scope',t
+    );
+  END LOOP;
+END $$;
+
+GRANT SELECT,INSERT ON cloud_erasure_objects TO xyra_app_login;
+GRANT UPDATE (reference_state_version,hold_state,hold_state_version) ON cloud_erasure_objects TO xyra_app_login;
+GRANT SELECT,INSERT ON cloud_erasure_refs TO xyra_app_login;
+GRANT UPDATE (active,retired_at) ON cloud_erasure_refs TO xyra_app_login;
+GRANT SELECT,INSERT ON cloud_erasure_operations TO xyra_app_login;
+GRANT UPDATE (status,attempt_no,reference_state_version,hold_state_version,reservation_id,reservation_expires_at,claim_id,claim_generation,local_receipt_id,local_receipt_digest,retry_count,updated_at) ON cloud_erasure_operations TO xyra_app_login;
+GRANT SELECT,INSERT ON cloud_erasure_attempts TO xyra_app_login;
+GRANT SELECT,INSERT ON cloud_erasure_events TO xyra_app_login;
+GRANT SELECT,INSERT ON cloud_erasure_source_fences TO xyra_app_login;
+GRANT USAGE,SELECT ON SEQUENCE cloud_erasure_events_id_seq TO xyra_app_login;
+-- The Worker independently validates CapabilityBus approvals against append-only
+-- requests/decisions and current active owner/admin membership in the same RLS scope.
+GRANT SELECT ON approval_requests,approval_decisions TO xyra_app_login;

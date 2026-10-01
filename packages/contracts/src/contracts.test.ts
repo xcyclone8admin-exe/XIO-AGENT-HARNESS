@@ -49,14 +49,20 @@ describe('TableDecl write surface', () => {
       class: 'local',
       authority: 'local',
       serverWriteCapabilities: ['money_ledger'],
+      serverReadCapabilities: ['invest_paper_execution'],
+      serverInsertCapabilities: ['invest_paper_execution'],
     });
     expect(table.serverWriteCapabilities).toEqual(['money_ledger']);
-    expect(() => TableDecl.parse({
-      name: 'ledger_balances',
-      class: 'local',
-      authority: 'local',
-      serverWriteCapabilities: ['Money Ledger'],
-    })).toThrow();
+    expect(table.serverReadCapabilities).toEqual(['invest_paper_execution']);
+    expect(table.serverInsertCapabilities).toEqual(['invest_paper_execution']);
+    expect(() =>
+      TableDecl.parse({
+        name: 'ledger_balances',
+        class: 'local',
+        authority: 'local',
+        serverWriteCapabilities: ['Money Ledger'],
+      }),
+    ).toThrow();
   });
 });
 

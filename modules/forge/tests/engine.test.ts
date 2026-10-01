@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { AdapterConfig, ContextCandidate, HierarchyNode, type ContextElementType, REVIEW_ROLES, SPEC_TEMPLATES } from '../contracts';
 import { compileContext, compileSpecCorpus } from '../server/compiler';
 import { authorizeChaosTarget, classifyDiscovery, createEvidence, evaluateGates, planSchedule, requestPromotion, rollbackPromotion } from '../server/engine';
+import { registerForge } from '../server';
+import type { AnyCapability, ModuleManifest } from '@xyra/contracts';
+import type { ForgeCall } from '../server';
+import type { ForgeRepository } from '../server/repository';
 import { renderAllGoldenBriefs } from '../server/specs';
 import { transitionEpic, transitionFinding, transitionPromotion, transitionTicket } from '../server/state-machine';
 
@@ -73,9 +77,34 @@ describe('approved bounded scheduler (planning only)', () => {
     expect(planSchedule({ epicId, approval, config, tickets: [ticket], spentUsd: 0, killSwitchEngaged: true }).state).toBe('stopped');
     expect(() => planSchedule({ epicId, approval, config: { ...config, substrateVerified: true }, tickets: [ticket], spentUsd: 0, killSwitchEngaged: false })).toThrow();
   });
+
+  it('returns an explicit empty plan for an approved epic with no tickets', () => {
+    const planned = planSchedule({ epicId, approval, config, tickets: [], spentUsd: 0, killSwitchEngaged: false });
+    expect(planned).toMatchObject({ state: 'blocked', runnableTicketIds: [], blockedTicketIds: [], reason: 'NO_RUNNABLE_TICKETS', externalExecution: false });
+  });
 });
 
 describe('review, gates, promotion and hard execution boundary', () => {
+  it('validates the gates envelope and registers evidence/review workflows through capabilities', async () => {
+    const registered = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    const bus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: ForgeCall) => Promise<unknown>) => registered.set(descriptor.id, handler) };
+    registerForge(bus, {} as ModuleManifest, {} as ForgeRepository);
+    expect([...registered.keys()]).toEqual(expect.arrayContaining([
+      'forge.evidence.create', 'forge.findings.create', 'forge.discoveries.classify', 'forge.promotions.rollback-record',
+    ]));
+    const validationCall: ForgeCall = { principal: { id: userId, tenantId }, workspaceId };
+    await expect(registered.get('forge.gates.evaluate')?.({}, validationCall)).rejects.toThrow();
+    await expect(registered.get('forge.gates.evaluate')?.({ gates: 'nope', riskAcceptances: [] }, validationCall)).rejects.toThrow();
+    const call: ForgeCall = { principal: { id: userId, tenantId }, workspaceId };
+    const recordPromotion = (actualCall: { id: string; tenantId: string; workspaceId: string }, promotion: unknown) => Promise.resolve(promotion);
+    const repository = { recordPromotion } as unknown as ForgeRepository;
+    const scopedHandlers = new Map<string, (input: unknown, call: ForgeCall) => Promise<unknown>>();
+    const scopedBus = { register: (_manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: ForgeCall) => Promise<unknown>) => scopedHandlers.set(descriptor.id, handler) };
+    registerForge(scopedBus, {} as ModuleManifest, repository);
+    const rollback = await scopedHandlers.get('forge.promotions.rollback-record')?.({ promotion: { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'promoted', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time }, rollbackEvidence: evidence }, call);
+    expect(rollback).toMatchObject({ state: 'rolled-back', rollbackOf: '019a0000-0000-7000-8000-000000000081' });
+  });
+
   it('material discoveries escalate and all nine structured reviewer roles are present', () => {
     const material = classifyDiscovery(ticket, 'Architecture contract changed', [], [ticketId]);
     expect(material.classification).toBe('critical');
@@ -93,9 +122,9 @@ describe('review, gates, promotion and hard execution boundary', () => {
 
   it('refuses missing gates and production approval and requires rollback evidence', () => {
     const promotion = { id: '019a0000-0000-7000-8000-000000000081', workspaceId, commitSha: 'c'.repeat(40), from: 'develop', to: 'staging', state: 'proposed', evidenceIds: [evidenceId], missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: time };
-    expect(() => requestPromotion({ promotion, gates: [{ ...goodGate, status: 'pending' }], productionApproval: null })).toThrow('PROMOTION_GATES_MISSING');
-    expect(() => requestPromotion({ promotion: { ...promotion, to: 'main' }, gates: [goodGate], productionApproval: null })).toThrow('PRODUCTION_APPROVAL_REQUIRED');
-    const proposed = requestPromotion({ promotion, gates: [goodGate], productionApproval: null });
+    expect(() => requestPromotion(promotion, [{ ...goodGate, status: 'pending' }])).toThrow('PROMOTION_GATES_MISSING');
+    expect(() => requestPromotion({ ...promotion, to: 'main' }, [goodGate])).toThrow('PRODUCTION_APPROVAL_REQUIRED');
+    const proposed = requestPromotion(promotion, [goodGate]);
     expect(proposed.state).toBe('proposed');
     expect(() => rollbackPromotion({ ...promotion, state: 'proposed' }, evidence)).toThrow('ROLLBACK_REQUIRES_PROMOTED_RECORD');
     expect(rollbackPromotion({ ...promotion, state: 'promoted' }, evidence).state).toBe('rolled-back');

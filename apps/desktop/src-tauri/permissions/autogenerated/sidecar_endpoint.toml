@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sidecar-endpoint"
+description = "Enables the sidecar_endpoint command without any pre-configured scope."
+commands.allow = ["sidecar_endpoint"]
+
+[[permission]]
+identifier = "deny-sidecar-endpoint"
+description = "Denies the sidecar_endpoint command without any pre-configured scope."
+commands.deny = ["sidecar_endpoint"]

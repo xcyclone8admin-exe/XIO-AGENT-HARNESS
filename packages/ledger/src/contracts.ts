@@ -436,6 +436,27 @@ export interface LedgerApi {
   ): Promise<Discrepancy>;
 }
 
+/**
+ * Transaction-scoped PAPER execution port for modules that must commit a domain fill and its
+ * double-entry ledger posting together. Queries are code-owned/guarded DML in the same scoped TX.
+ */
+export interface PaperTradeTransaction {
+  query<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<{ rows: T[]; rowCount: number }>;
+  /** Posts PAPER entries in this exact transaction; LIVE and external-ref imports are refused. */
+  post(actorId: string, input: PostTransactionInput): Promise<PostResult>;
+}
+
+export interface PaperTradeLedgerApi {
+  /** Capability-scoped transaction under `invest_paper_execution`, no nested transaction. */
+  withPaperTradeTransaction<T>(
+    scope: LedgerScope,
+    work: (transaction: PaperTradeTransaction) => Promise<T>,
+  ): Promise<T>;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Table declarations (ADR-0006 A1). The money module manifest includes these verbatim; its
 // migrations create them. Other modules use LedgerApi / capabilities for operations and may declare
@@ -465,6 +486,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
     // Assets are immutable once registered: a scale never changes under existing entries.
     name: 'ledger_assets',
     serverWriteCapabilities: ['money_ledger'],
+    serverReadCapabilities: ['invest_paper_execution'],
     class: 'append',
     authority: 'append',
     actorField: 'created_by',
@@ -484,6 +506,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     name: 'ledger_books',
     serverWriteCapabilities: ['money_ledger'],
+    serverReadCapabilities: ['invest_paper', 'invest_paper_execution'],
     class: 'lww',
     authority: 'synced',
     guardedColumns: ['environment', 'owner_module', 'base_asset'],
@@ -510,6 +533,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     name: 'ledger_accounts',
     serverWriteCapabilities: ['money_ledger'],
+    serverReadCapabilities: ['invest_paper', 'invest_paper_execution'],
     class: 'lww',
     authority: 'synced',
     guardedColumns: ['book_id', 'environment', 'type'],
@@ -536,6 +560,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
     // One transaction and all its entries form one atomic sync unit (LEDGER_SYNC_UNITS).
     name: 'ledger_transactions',
     serverWriteCapabilities: ['money_ledger'],
+    serverInsertCapabilities: ['invest_paper_execution'],
     class: 'append',
     authority: 'append',
     actorField: 'posted_by',
@@ -566,6 +591,7 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
   {
     name: 'ledger_entries',
     serverWriteCapabilities: ['money_ledger'],
+    serverInsertCapabilities: ['invest_paper_execution'],
     class: 'append',
     authority: 'append',
     actorField: 'created_by',
@@ -598,7 +624,14 @@ export const LEDGER_TABLES: readonly TableDeclInput[] = Object.freeze([
     },
   },
   // Projection maintained in the posting transaction on every store; never synced (recomputed per side).
-  { name: 'ledger_balances', class: 'local', authority: 'local', serverWriteCapabilities: ['money_ledger'], readPermission: 'money:ledger:read' },
+  {
+    name: 'ledger_balances',
+    class: 'local',
+    authority: 'local',
+    serverWriteCapabilities: ['money_ledger', 'invest_paper_execution'],
+    serverReadCapabilities: ['invest_paper'],
+    readPermission: 'money:ledger:read',
+  },
   {
     name: 'ledger_reconciliation_runs',
     serverWriteCapabilities: ['money_ledger'],

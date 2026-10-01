@@ -31,8 +31,48 @@ test('local runtime serves an authenticated, scoped workspace session', async ()
       },
     });
     expect(authenticated.status).toBe(200);
-    const body = (await authenticated.json()) as { workspaces: Array<{ kind: string }> };
+    const body = (await authenticated.json()) as { workspaces: Array<{ id: string; kind: string }> };
     expect(body.workspaces.map((w) => w.kind).sort()).toEqual(['sample', 'standard']);
+    const workspaceId = body.workspaces.find((w) => w.kind === 'standard')?.id;
+    expect(workspaceId).toBeTruthy();
+    const created = await fetch(`http://127.0.0.1:${port}/api/v1/call/forge.projects.create`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${session.launchToken}`,
+        origin: 'http://tauri.localhost',
+        'content-type': 'application/json',
+        'idempotency-key': 'runtime-forge-create-0001',
+      },
+      body: JSON.stringify({ workspaceId, input: { name: 'Runtime Forge', description: 'Integrated workflow', requirements: [] } }),
+    });
+    expect(created.status, JSON.stringify(await created.clone().json())).toBe(200);
+    const createdBody = await created.json() as { data: { id: string; name: string } };
+    expect(createdBody.data.name).toBe('Runtime Forge');
+
+    const moduleCalls = [
+      ['command.dashboard.summary', {}],
+      ['comms.threads.list', {}],
+      ['growth.contacts.list', {}],
+      ['invest.portfolios.list', {}],
+    ] as const;
+    const results = await Promise.all(moduleCalls.map(([capabilityId, input]) =>
+      fetch(`http://127.0.0.1:${port}/api/v1/call/${capabilityId}`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${session.launchToken}`,
+          origin: 'http://tauri.localhost',
+          'content-type': 'application/json',
+          'idempotency-key': `runtime-${capabilityId.replaceAll('.', '-')}`,
+        },
+        body: JSON.stringify({ workspaceId, input }),
+      }),
+    ));
+    expect(results.map((result) => result.status), 'integrated module registrars must be callable in the runtime')
+      .toEqual([200, 200, 200, 200]);
+    const dashboard = await results[0]!.json() as { data: { pending_approvals: number | null } };
+    expect(dashboard.data.pending_approvals).toBeNull();
+    const portfolios = await results[3]!.json() as { data: unknown[] };
+    expect(portfolios.data).toEqual([]);
   } finally {
     await session.close();
   }

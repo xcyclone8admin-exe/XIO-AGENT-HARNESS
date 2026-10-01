@@ -13,22 +13,26 @@ export function planSchedule(input: unknown): zReturn<typeof ScheduleResult> {
   const request = ScheduleRequest.parse(input);
   if (request.killSwitchEngaged) return { runId: uuidv7(), state: 'stopped', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'KILL_SWITCH_ENGAGED', externalExecution: false };
   const approval = ApprovalRecord.parse(request.approval);
-  if (approval.epicId !== request.epicId || approval.workspaceId !== request.tickets[0]?.workspaceId || approval.status !== 'approved' || Date.parse(approval.expiresAt) <= Date.now()) {
+  const workspaceIds = new Set(request.tickets.map((ticket) => ticket.workspaceId));
+  if (approval.epicId !== request.epicId || (workspaceIds.size > 0 && (workspaceIds.size !== 1 || !workspaceIds.has(approval.workspaceId))) || approval.status !== 'approved' || Date.parse(approval.expiresAt) <= Date.now()) {
     return { runId: uuidv7(), state: 'blocked', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'VALID_EPIC_APPROVAL_REQUIRED', externalExecution: false };
   }
   if (request.spentUsd >= request.config.maxBudgetUsd) return { runId: uuidv7(), state: 'blocked', runnableTicketIds: [], blockedTicketIds: request.tickets.map((t) => t.id), reason: 'BUDGET_EXHAUSTED', externalExecution: false };
   const nodes = request.tickets.map((ticket) => HierarchyNode.parse(ticket));
   const done = new Set(nodes.filter((ticket) => ticket.state === 'done').map((ticket) => ticket.id));
+  const reservations = new Set(request.reservedTicketIds);
   const blocked = new Set<string>();
   const runnable = nodes.filter((ticket) => {
+    if (ticket.kind !== 'ticket' && ticket.kind !== 'subtask') return false;
     if (ticket.state !== 'ready' && ticket.state !== 'queued') return false;
+    if (reservations.has(ticket.id)) { blocked.add(ticket.id); return false; }
     if (ticket.dependencies.some((id) => !done.has(id))) { blocked.add(ticket.id); return false; }
     if (ticket.dependencies.some((id) => !nodes.some((node) => node.id === id) && !done.has(id))) { blocked.add(ticket.id); return false; }
     if (request.config.resourceLocks.some((lock) => lock.startsWith(`${ticket.id}:`))) { blocked.add(ticket.id); return false; }
     return true;
   }).slice(0, request.config.maxConcurrency);
   const runId = uuidv7();
-  return { runId, state: runnable.length ? 'queued' : 'blocked', runnableTicketIds: runnable.map((ticket) => ticket.id), blockedTicketIds: [...new Set([...blocked, ...nodes.filter((t) => !runnable.includes(t) && t.state !== 'done').map((t) => t.id)])], reason: runnable.length ? null : 'NO_RUNNABLE_TICKETS', externalExecution: false };
+  return { runId, state: runnable.length ? 'queued' : 'blocked', runnableTicketIds: runnable.map((ticket) => ticket.id), blockedTicketIds: [...new Set([...blocked, ...nodes.filter((t) => (t.kind === 'ticket' || t.kind === 'subtask') && !runnable.includes(t) && t.state !== 'done' && t.state !== 'canceled').map((t) => t.id)])], reason: runnable.length ? null : 'NO_RUNNABLE_TICKETS', externalExecution: false };
 }
 
 export function classifyDiscovery(ticket: NodeType, summary: string, evidenceIds: string[], affectedTicketIds: string[]) {
@@ -70,14 +74,25 @@ export function evaluateGates(rawGates: readonly unknown[], riskAcceptances: rea
   return GateEvaluation.parse({ gates, overall: deterministicFailure || failedHard ? 'fail' : pendingHard ? 'blocked' : 'pass', aiJudgmentAllowed: false, deterministicBeforeJudgment: true });
 }
 
-export function createEvidence(input: Omit<zReturn<typeof Evidence>, 'id' | 'verifiedAt' | 'sha256'> & { sha256?: string; payload?: unknown }) {
+export function deriveGateMatrix(requirements: readonly { requirementId: string; risk: 'low' | 'medium' | 'high' | 'critical'; evidenceIds: readonly string[] }[], evidenceRows: readonly zReturn<typeof Evidence>[]) {
+  const evidenceById = new Map(evidenceRows.map((item) => [item.id, item]));
+  const gates = requirements.map((requirement) => {
+    const matched = requirement.evidenceIds.map((id) => evidenceById.get(id)).filter((item): item is zReturn<typeof Evidence> => item !== undefined);
+    const complete = matched.length === requirement.evidenceIds.length && matched.length > 0;
+    const status = !complete ? 'pending' : matched.some((item) => item.result === 'fail') ? 'fail' : matched.some((item) => item.result !== 'pass') ? 'blocked' : 'pass';
+    return { id: `req:${requirement.requirementId}`, requirementId: requirement.requirementId, kind: 'deterministic' as const, evidenceIds: matched.map((item) => item.id), status: status as 'pass' | 'fail' | 'pending' | 'blocked', hard: requirement.risk === 'high' || requirement.risk === 'critical' };
+  });
+  return evaluateGates(gates, []);
+}
+
+export function createEvidence(input: Omit<zReturn<typeof Evidence>, 'id' | 'verifiedAt' | 'sha256'> & { sha256?: string | undefined; payload?: unknown }) {
   const { payload, ...metadata } = input;
   const sourceHash = metadata.sha256 ?? hash(payload ?? metadata);
   return Evidence.parse({ ...metadata, sha256: sourceHash, id: uuidv7(), verifiedAt: now() });
 }
 
-export function requestPromotion(input: unknown) {
-  const { promotion: raw, gates: rawGates, productionApproval: rawApproval } = input as { promotion: unknown; gates: unknown[]; productionApproval: unknown };
+export function requestPromotion(input: unknown, rawGates: readonly unknown[], rawApproval: unknown = null) {
+  const raw = input;
   const promotion = Promotion.parse(raw);
   const gates = rawGates.map((gate) => Gate.parse(gate));
   const missingGateIds = gates.filter((gate) => gate.hard && gate.status !== 'pass').map((gate) => gate.id);

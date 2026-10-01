@@ -9,10 +9,7 @@ export interface RowResult<T> {
   readonly rowCount: number;
 }
 export interface ScopedTransaction {
-  query<T extends Record<string, unknown>>(
-    sql: string,
-    params?: unknown[],
-  ): Promise<RowResult<T>>;
+  query<T extends Record<string, unknown>>(sql: string, params?: unknown[]): Promise<RowResult<T>>;
 }
 
 /** Statements a scoped query may start with; everything else (DO, COPY, SET, DDL, ...) is refused. */
@@ -105,6 +102,10 @@ export interface GrantedTable {
   readonly privilegedColumns?: readonly string[];
   /** Only these named capability roles may write this relation as trusted code. */
   readonly serverWriteCapabilities?: readonly string[];
+  /** These named capability roles may read the relation without receiving DML grants. */
+  readonly serverReadCapabilities?: readonly string[];
+  /** These named capability roles may SELECT and INSERT but cannot UPDATE or DELETE. */
+  readonly serverInsertCapabilities?: readonly string[];
 }
 
 /** Platform bookkeeping relations that no module manifest declares. */
@@ -122,17 +123,35 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
   const privileged = new Map<string, readonly string[]>();
   const readOnly = new Set<string>();
   const declarations = new Map<string, GrantedTable>();
-  const capabilityTables = new Map<string, Set<string>>();
+  const capabilityReadTables = new Map<string, Set<string>>();
+  const capabilityInsertTables = new Map<string, Set<string>>();
+  const capabilityWriteTables = new Map<string, Set<string>>();
   for (const table of tables) {
     if (!/^[a-z][a-z0-9_]*$/.test(table.name)) throw new Error(`Invalid table name ${table.name}`);
     declarations.set(table.name, table);
-    for (const capability of table.serverWriteCapabilities ?? []) {
-      if (!/^[a-z][a-z0-9_]{1,47}$/.test(capability)) throw new Error(`Invalid server capability ${capability}`);
-      const granted = capabilityTables.get(capability) ?? new Set<string>();
+    for (const capability of table.serverReadCapabilities ?? []) {
+      if (!/^[a-z][a-z0-9_]{1,47}$/.test(capability))
+        throw new Error(`Invalid server capability ${capability}`);
+      const granted = capabilityReadTables.get(capability) ?? new Set<string>();
       granted.add(table.name);
-      capabilityTables.set(capability, granted);
+      capabilityReadTables.set(capability, granted);
     }
-    const authority = table.authority ?? (table.class === 'append' ? 'append' : table.class === 'local' ? 'local' : 'synced');
+    for (const capability of table.serverInsertCapabilities ?? []) {
+      if (!/^[a-z][a-z0-9_]{1,47}$/.test(capability))
+        throw new Error(`Invalid server capability ${capability}`);
+      const granted = capabilityInsertTables.get(capability) ?? new Set<string>();
+      granted.add(table.name);
+      capabilityInsertTables.set(capability, granted);
+    }
+    for (const capability of table.serverWriteCapabilities ?? []) {
+      if (!/^[a-z][a-z0-9_]{1,47}$/.test(capability))
+        throw new Error(`Invalid server capability ${capability}`);
+      const granted = capabilityWriteTables.get(capability) ?? new Set<string>();
+      granted.add(table.name);
+      capabilityWriteTables.set(capability, granted);
+    }
+    const authority =
+      table.authority ?? (table.class === 'append' ? 'append' : table.class === 'local' ? 'local' : 'synced');
     if (authority === 'server') {
       readOnly.add(table.name);
       mutable.delete(table.name);
@@ -143,7 +162,8 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
     } else if ((table.guardedColumns?.length ?? 0) || (table.privilegedColumns?.length ?? 0)) {
       const columns = [...new Set([...(table.guardedColumns ?? []), ...(table.privilegedColumns ?? [])])];
       for (const column of columns) {
-        if (!/^[a-z][a-z0-9_]*$/.test(column)) throw new Error(`Invalid guarded column ${column} on ${table.name}`);
+        if (!/^[a-z][a-z0-9_]*$/.test(column))
+          throw new Error(`Invalid guarded column ${column} on ${table.name}`);
       }
       privileged.set(table.name, columns);
       mutable.delete(table.name);
@@ -155,12 +175,20 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
   const existingCapabilities = await db.query<{ rolname: string }>(
     "SELECT rolname FROM pg_roles WHERE rolname LIKE 'xyra_cap_%'",
   );
-  const managedRoles = [...new Set([
-    'xyra_app',
-    'xyra_server',
-    ...existingCapabilities.rows.map((row) => row.rolname),
-    ...[...capabilityTables.keys()].map((capability) => `xyra_cap_${capability}`),
-  ])];
+  const managedRoles = [
+    ...new Set([
+      'xyra_app',
+      'xyra_server',
+      ...existingCapabilities.rows.map((row) => row.rolname),
+      ...[
+        ...new Set([
+          ...capabilityReadTables.keys(),
+          ...capabilityInsertTables.keys(),
+          ...capabilityWriteTables.keys(),
+        ]),
+      ].map((capability) => `xyra_cap_${capability}`),
+    ]),
+  ];
   const columnsByTable = new Map<string, string[]>();
   const revokes: string[] = [];
   for (const name of names) {
@@ -195,15 +223,25 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
   ];
   const serverGrants = [
     `GRANT SELECT, INSERT, UPDATE ON ${[...PLATFORM_TABLES].join(', ')} TO xyra_server`,
-    ...[...capabilityTables].flatMap(([capability, granted]) => [
-      ...[...granted].map((name) => `GRANT SELECT, INSERT, UPDATE ON ${name} TO xyra_cap_${capability}`),
-    ]),
+    ...[...capabilityReadTables].flatMap(([capability, granted]) =>
+      [...granted]
+        .filter(
+          (name) =>
+            !capabilityWriteTables.get(capability)?.has(name) &&
+            !capabilityInsertTables.get(capability)?.has(name),
+        )
+        .map((name) => `GRANT SELECT ON ${name} TO xyra_cap_${capability}`),
+    ),
+    ...[...capabilityInsertTables].flatMap(([capability, granted]) =>
+      [...granted]
+        .filter((name) => !capabilityWriteTables.get(capability)?.has(name))
+        .map((name) => `GRANT SELECT, INSERT ON ${name} TO xyra_cap_${capability}`),
+    ),
+    ...[...capabilityWriteTables].flatMap(([capability, granted]) =>
+      [...granted].map((name) => `GRANT SELECT, INSERT, UPDATE ON ${name} TO xyra_cap_${capability}`),
+    ),
   ];
-  const grants = [
-    ...revokes,
-    ...appGrants,
-    ...serverGrants,
-  ];
+  const grants = [...revokes, ...appGrants, ...serverGrants];
   await db.exec(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='xyra_app') THEN
       CREATE ROLE xyra_app NOLOGIN;
@@ -211,7 +249,7 @@ export async function prepareLocalAppRole(db: PGlite, tables: readonly GrantedTa
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='xyra_server') THEN
       CREATE ROLE xyra_server NOLOGIN;
     END IF;
-    ${[...capabilityTables.keys()].map((capability) => `IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='xyra_cap_${capability}') THEN CREATE ROLE xyra_cap_${capability} NOLOGIN; END IF;`).join('\n    ')}
+    ${[...new Set([...capabilityReadTables.keys(), ...capabilityInsertTables.keys(), ...capabilityWriteTables.keys()])].map((capability) => `IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='xyra_cap_${capability}') THEN CREATE ROLE xyra_cap_${capability} NOLOGIN; END IF;`).join('\n    ')}
   END $$;
   GRANT USAGE ON SCHEMA public TO ${managedRoles.join(', ')};
   ${grants.join(';\n  ')}`);
