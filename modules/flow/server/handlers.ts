@@ -22,6 +22,12 @@ export interface StepContext {
   readonly stepIndex: number;
   readonly attempt: number;
   /**
+   * The run's scheduled firing time, verbatim from what the host scheduler supplied to
+   * triggerRun — never invented from createdAt. Required and validated at trigger time for
+   * `trigger: 'schedule'` runs; always `null` for `trigger: 'manual'` runs.
+   */
+  readonly scheduledFor: string | null;
+  /**
    * Stable per-(run, step, attempt) idempotency key — `${runId}:${stepIndex}:${attempt}` — the
    * same tuple flow_checkpoints enforces uniqueness on. It does not change across a lease recovery
    * for the same tuple, so a downstream trusted call keyed on it stays idempotent even if the step

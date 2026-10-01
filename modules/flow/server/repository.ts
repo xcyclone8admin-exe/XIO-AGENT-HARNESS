@@ -8,6 +8,12 @@ import { topologicalOrder } from './dag';
 /** Default lease a claim holds before it is eligible for reclaim by another caller. */
 export const DEFAULT_CLAIM_LEASE_MS = 2 * 60_000;
 
+/** Canonical `YYYY-MM-DDTHH:MM:SS(.sss)?(Z|±HH:MM)` — the same shape zod's `z.iso.datetime({ offset: true })` accepts. */
+const CANONICAL_ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+function isCanonicalIsoDateTime(value: unknown): value is string {
+  return typeof value === 'string' && CANONICAL_ISO_DATETIME.test(value) && !Number.isNaN(Date.parse(value));
+}
+
 export interface StepClaim {
   readonly claimToken: string;
   readonly leaseExpiresAt: string;
@@ -190,10 +196,18 @@ export class FlowRepository {
 
   /**
    * Bounded by the workflow's max_concurrent_runs: refuses to start another run once the limit of
-   * currently-running runs is reached. `scheduledFor`, when the host's scheduler supplies it, is
-   * persisted verbatim in the run's detail — FLOW never invents or infers it from createdAt.
+   * currently-running runs is reached. A `trigger: 'schedule'` run REQUIRES a canonical ISO-8601
+   * (offset) `scheduledFor` and fails closed (FLOW_SCHEDULED_RUN_REQUIRES_SCHEDULED_FOR) if it is
+   * missing or malformed — this is the one honest source of that value (persisted verbatim in the
+   * run's detail; never invented from createdAt), enforced here regardless of whether the caller
+   * went through the zod-validated capability input or called this method directly. A
+   * `trigger: 'manual'` run never carries one, even if a caller passes it.
    */
   async triggerRun(actor: FlowActor, workflowId: string, trigger: RunTrigger, options?: { scheduledFor?: string }): Promise<RunStatus> {
+    const scheduledFor = options?.scheduledFor;
+    if (trigger === 'schedule' && !isCanonicalIsoDateTime(scheduledFor)) {
+      throw new Error('FLOW_SCHEDULED_RUN_REQUIRES_SCHEDULED_FOR');
+    }
     const scope = scopeOf(actor);
     const workflow = await this.requireWorkflow(actor, workflowId);
     if (!workflow.enabled) throw new Error('FLOW_WORKFLOW_DISABLED');
@@ -216,7 +230,7 @@ export class FlowRepository {
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [actor.tenantId, actor.workspaceId, runId, workflowId, trigger, actor.id],
     );
-    const detail = options?.scheduledFor ? { scheduledFor: options.scheduledFor } : {};
+    const detail = trigger === 'schedule' ? { scheduledFor } : {};
     await this.store.query(
       scope,
       `INSERT INTO flow_runs (id, run_id, tenant_id, workspace_id, workflow_id, trigger, state, step_index, attempt, detail, created_by)
@@ -296,6 +310,9 @@ export class FlowRepository {
   }
 
   private stepContext(actor: FlowActor, current: RunStatus, step: WorkflowStep): StepContext {
+    // Derived only from the run's own persisted detail (set once, validated, at triggerRun) —
+    // never from step.input. Absent for every manual run, by construction of triggerRun.
+    const scheduledFor = isCanonicalIsoDateTime(current.detail.scheduledFor) ? current.detail.scheduledFor : null;
     return {
       tenantId: actor.tenantId,
       workspaceId: actor.workspaceId,
@@ -306,6 +323,7 @@ export class FlowRepository {
       stepId: step.id,
       stepIndex: current.stepIndex,
       attempt: current.attempt,
+      scheduledFor,
       dispatchId: `${current.runId}:${current.stepIndex}:${current.attempt}`,
     };
   }
