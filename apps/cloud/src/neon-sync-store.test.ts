@@ -2,7 +2,13 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { applyPGliteMigrations, migration } from '@xyra/db';
-import { cloudBrainContentDigest, cloudBrainSourceVersion, cloudReferenceSetDigest } from '@xyra/contracts';
+import {
+  CLOUD_INVEST_SIGNAL_ENVELOPE_DIGEST_TEST_VECTOR,
+  cloudBrainContentDigest,
+  cloudBrainSourceVersion,
+  cloudInvestSignalEnvelopeDigest,
+  cloudReferenceSetDigest,
+} from '@xyra/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { AccessContext } from './access';
 import type { NeonQueryClient } from './neon';
@@ -15,6 +21,7 @@ import {
   acceptInvestSignalInTransaction,
   acknowledgeInvestSignalInTransaction,
   claimInvestSignalInTransaction,
+  investSignalEnvelopeDigest,
   verifyInvestSignalEnvelopeDigest,
   type InvestSignalBody,
   type InvestSignalSourceKey,
@@ -31,6 +38,19 @@ import {
 } from './erasures';
 
 const sql = (relative: string) => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
+const investSignalDigestVector = CLOUD_INVEST_SIGNAL_ENVELOPE_DIGEST_TEST_VECTOR;
+
+describe('Cloud Invest envelope digest contract parity', () => {
+  it('matches the shared fixed vector', async () => {
+    expect(await cloudInvestSignalEnvelopeDigest(investSignalDigestVector.input)).toBe(
+      investSignalDigestVector.digest,
+    );
+    expect(await investSignalEnvelopeDigest(investSignalDigestVector.input)).toBe(
+      investSignalDigestVector.digest,
+    );
+  });
+});
+
 const migrations = [
   migration('platform/0001_platform', sql('../../../packages/db/migrations/0001_platform.sql')),
   migration('platform/0002_modules', sql('../../../packages/db/migrations/0002_modules.sql')),
