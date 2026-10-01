@@ -9,6 +9,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { IdempotencyKeyReusedError, SyncAuthorityEngine, parseSyncPush } from './sync';
 import { MemorySyncStore } from './store';
 import { signBlobAccess } from './blobs';
+import {
+  INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
+  INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
+  investSignalEnvelopeDigest,
+  verifyInvestSignalEnvelopeDigest,
+  type InvestSignalEnvelopeDigestInput,
+} from './invest-signals';
+import type { VerifiedInvestSignalEnvelope } from './invest-signals';
+import type { InvestSignalBody } from './invest-signals';
 import type { AccessContext } from './access';
 
 /**
@@ -80,14 +89,24 @@ async function investSignalService(request: Request): Promise<Response> {
         envelope: previous['envelope'],
       });
     }
-    const envelope = {
-      ...body,
+    const envelopeInput: InvestSignalEnvelopeDigestInput = {
+      ...(body as unknown as InvestSignalBody),
       sourceId: source['sourceId'],
       tenantId: source['tenantId'],
       workspaceId: source['workspaceId'],
       receivedAt: new Date().toISOString(),
       payloadDigest: digest,
-      verification: { signature: 'verified', keyId: source['keyId'] },
+      verification: {
+        signature: 'verified' as const,
+        keyId: source['keyId'],
+        signingAlg: source['signingAlg'],
+      },
+    };
+    const envelope = {
+      ...envelopeInput,
+      envelopeDigestVersion: INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
+      envelopeDigestAlgorithm: INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
+      envelopeDigest: await investSignalEnvelopeDigest(envelopeInput),
     };
     const event = {
       id: crypto.randomUUID(),
@@ -156,6 +175,12 @@ async function investSignalService(request: Request): Promise<Response> {
       event['payloadDigest'] !== ack['payloadDigest']
     )
       return Response.json({ code: 'SIGNAL_LEASE_INVALID' }, { status: 409 });
+    if (
+      event['envelope']['envelopeDigestVersion'] !== ack['envelopeDigestVersion'] ||
+      event['envelope']['envelopeDigestAlgorithm'] !== ack['envelopeDigestAlgorithm'] ||
+      event['envelope']['envelopeDigest'] !== ack['envelopeDigest']
+    )
+      return Response.json({ code: 'SIGNAL_ENVELOPE_DIGEST_MISMATCH' }, { status: 409 });
     if (event['status'] === 'acked') {
       if (event['ackIdempotencyKey'] !== ack['idempotencyKey'] || event['decisionId'] !== ack['decisionId'])
         return Response.json({ code: 'SIGNAL_ACK_IDEMPOTENCY_REUSED' }, { status: 409 });
@@ -163,6 +188,9 @@ async function investSignalService(request: Request): Promise<Response> {
         status: 'acked',
         eventId: ack['eventId'],
         payloadDigest: ack['payloadDigest'],
+        envelopeDigestVersion: ack['envelopeDigestVersion'],
+        envelopeDigestAlgorithm: ack['envelopeDigestAlgorithm'],
+        envelopeDigest: ack['envelopeDigest'],
         decisionId: ack['decisionId'],
         acknowledgedAt: event['ackedAt'],
         replayed: true,
@@ -178,6 +206,9 @@ async function investSignalService(request: Request): Promise<Response> {
       status: 'acked',
       eventId: ack['eventId'],
       payloadDigest: ack['payloadDigest'],
+      envelopeDigestVersion: ack['envelopeDigestVersion'],
+      envelopeDigestAlgorithm: ack['envelopeDigestAlgorithm'],
+      envelopeDigest: ack['envelopeDigest'],
       decisionId: ack['decisionId'],
       acknowledgedAt: event['ackedAt'],
       replayed: false,
@@ -1790,6 +1821,9 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
         workspaceId: W1,
         sourceId: SIGNAL_SOURCE,
         verification: { signature: 'verified', keyId: SIGNAL_KEY },
+        envelopeDigestVersion: INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
+        envelopeDigestAlgorithm: INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
+        envelopeDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
       },
     });
     const repeated = await call('POST', '/v1/invest/signals/claim', tokenA, claimRequest);
@@ -1804,14 +1838,27 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
 
     const signal = first.json?.['signal'];
     const lease = first.json?.['lease'];
+    expect(await verifyInvestSignalEnvelopeDigest(signal as VerifiedInvestSignalEnvelope)).toBe(true);
+    const mutatedSignal = { ...signal, quantity: '999.99' } as VerifiedInvestSignalEnvelope;
+    expect(mutatedSignal.payloadDigest).toBe(signal['payloadDigest']);
+    expect(await verifyInvestSignalEnvelopeDigest(mutatedSignal)).toBe(false);
     const ack = {
       protocol: 'xyra.invest.signal.consume.v1',
       eventId: signal['eventId'],
       payloadDigest: signal['payloadDigest'],
+      envelopeDigestVersion: signal['envelopeDigestVersion'],
+      envelopeDigestAlgorithm: signal['envelopeDigestAlgorithm'],
+      envelopeDigest: signal['envelopeDigest'],
       leaseId: lease['leaseId'],
       decisionId: crypto.randomUUID(),
       idempotencyKey: crypto.randomUUID(),
     };
+    expect(
+      await call('POST', '/v1/invest/signals/ack', tokenA, { ...ack, envelopeDigest: '0'.repeat(64) }),
+    ).toMatchObject({
+      status: 409,
+      json: { code: 'SIGNAL_ENVELOPE_DIGEST_MISMATCH' },
+    });
     expect(await call('POST', '/v1/invest/signals/ack', tokenB, ack)).toMatchObject({
       status: 409,
       json: { code: 'SIGNAL_LEASE_INVALID' },
