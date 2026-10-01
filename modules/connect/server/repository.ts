@@ -96,6 +96,33 @@ export class ConnectRepository {
     const row = result.rows[0];
     return row ? toGrantRecord(row) : null;
   }
+
+  /**
+   * Derives a DelegatedCredential (agent-core shape) from the grant ledger: a 'grant' decision is
+   * active for GRANT_CREDENTIAL_TTL_MS from when it was recorded; a 'revoke' decision — or no grant
+   * at all — is never active. This is the credential-broker contract an MCP registration checks
+   * before a tool call is authorized (packages/agent-core/src/credentials.ts), derived here from
+   * the same append-only ledger the grant/revoke UI reads, so there is one source of truth.
+   */
+  async currentCredential(actor: ConnectActor, connectorId: string): Promise<ConnectorCredential | null> {
+    const grant = await this.currentGrant(actor, connectorId);
+    if (!grant) return null;
+    if (grant.action === 'revoke') {
+      return { connectorId, scope: connectorId, expiresAt: grant.createdAt, revokedAt: grant.createdAt };
+    }
+    const expiresAt = new Date(new Date(grant.createdAt).getTime() + GRANT_CREDENTIAL_TTL_MS).toISOString();
+    return { connectorId, scope: connectorId, expiresAt, revokedAt: null };
+  }
+}
+
+/** Default lifetime of a credential derived from a 'grant' decision before it must be re-granted. */
+export const GRANT_CREDENTIAL_TTL_MS = 24 * 60 * 60_000;
+
+export interface ConnectorCredential {
+  readonly connectorId: string;
+  readonly scope: string;
+  readonly expiresAt: string;
+  readonly revokedAt: string | null;
 }
 
 function toConnectorRecord(row: ConnectorRow): ConnectorRecord {

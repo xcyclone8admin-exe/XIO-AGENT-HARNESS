@@ -87,9 +87,9 @@ describe('CONNECT catalog honesty and isolation', () => {
 });
 
 describe('CONNECT MCP boundary fails closed with no transport', () => {
-  it('refuses tool calls and listings against a registered-but-unavailable server', async () => {
+  it('refuses tool calls and listings against a never-granted connector', async () => {
     const boundary = new ConnectMcpBoundary();
-    boundary.registerUnavailable({ id: 'github-mcp', connectorId: 'github', allowedTools: ['repo.read'], available: false });
+    boundary.register({ id: 'github-mcp', connectorId: 'github', allowedTools: ['repo.read'], available: false }, null);
     const signal = new AbortController().signal;
     await expect(boundary.client.listTools('github-mcp', signal)).rejects.toThrow('CREDENTIAL_EXPIRED_OR_REVOKED');
     await expect(boundary.client.callTool('github-mcp', 'repo.read', {}, signal)).rejects.toThrow('CREDENTIAL_EXPIRED_OR_REVOKED');
@@ -99,5 +99,25 @@ describe('CONNECT MCP boundary fails closed with no transport', () => {
     const boundary = new ConnectMcpBoundary();
     const signal = new AbortController().signal;
     await expect(boundary.client.listTools('unknown', signal)).rejects.toThrow('MCP_SERVER_NOT_REGISTERED');
+  });
+
+  it('authorizes against a granted connector credential but still fails closed with no transport, and stops authorizing once revoked', async () => {
+    const descriptor = { id: 'github-mcp-granted', connectorId: 'github', allowedTools: ['repo.read'], available: false as const };
+    const signal = new AbortController().signal;
+
+    await connect.recordGrant(actorA, { connectorId: 'github', action: 'grant', allowedTools: ['repo.read'], reason: 'onboarding' });
+    const activeCredential = await connect.currentCredential(actorA, 'github');
+    expect(activeCredential?.revokedAt).toBeNull();
+    const grantedBoundary = new ConnectMcpBoundary();
+    grantedBoundary.register(descriptor, activeCredential);
+    // Credential authorization passes; the call still fails because CONNECT has no real transport.
+    await expect(grantedBoundary.client.listTools(descriptor.id, signal)).rejects.toThrow('MCP_TRANSPORT_NOT_CONFIGURED');
+
+    await connect.recordGrant(actorA, { connectorId: 'github', action: 'revoke', allowedTools: [], reason: 'offboarding' });
+    const revokedCredential = await connect.currentCredential(actorA, 'github');
+    expect(revokedCredential?.revokedAt).not.toBeNull();
+    const revokedBoundary = new ConnectMcpBoundary();
+    revokedBoundary.register(descriptor, revokedCredential);
+    await expect(revokedBoundary.client.listTools(descriptor.id, signal)).rejects.toThrow('CREDENTIAL_EXPIRED_OR_REVOKED');
   });
 });
