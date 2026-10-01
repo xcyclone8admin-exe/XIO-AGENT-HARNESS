@@ -22,9 +22,9 @@ use crate::cloud_auth::{
     AuthenticatedResponse, BlobUploadRequest, BlobUploadResponse, SessionStatus,
     SessionStatusResponse,
 };
-use crate::cloud_crypto::{
-    CredentialStore, DeviceKey, SessionTokens, StoredSessionStatus, WindowsCredentialStore,
-};
+#[cfg(test)]
+use crate::cloud_crypto::CredentialStore;
+use crate::cloud_crypto::{DeviceKey, SessionTokens, StoredSessionStatus, WindowsCredentialStore};
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 256 * 1024;
@@ -172,6 +172,8 @@ struct PendingAuth {
     verifier: String,
     redirect_uri: String,
     created_at_ms: u64,
+    #[serde(default)]
+    key_algorithm: crate::cloud_crypto::DpopAlgorithm,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +214,7 @@ pub struct CloudAuthService {
 }
 
 impl CloudAuthService {
+    #[cfg(test)]
     fn build(
         origin: Option<String>,
         transport: Arc<dyn HttpTransport>,
@@ -231,13 +234,32 @@ impl CloudAuthService {
         })
     }
 
+    fn build_with_device_key(
+        origin: Option<String>,
+        transport: Arc<dyn HttpTransport>,
+        sidecar_transport: Arc<dyn SidecarTransport>,
+        device_key: DeviceKey,
+    ) -> Result<Self, String> {
+        if let Some(origin) = origin.as_deref() {
+            crate::cloud_auth::validate_https_origin(origin)
+                .map_err(|_| "CLOUD_ORIGIN_NOT_CONFIGURED")?;
+        }
+        Ok(Self {
+            origin,
+            transport,
+            sidecar_transport,
+            device_key,
+            callback_listeners: Mutex::new(HashMap::new()),
+        })
+    }
+
     pub fn production() -> Result<Self, String> {
         let origin = crate::cloud_auth::selected_cloud_origin()?.map(str::to_owned);
-        Self::build(
+        Self::build_with_device_key(
             origin,
             Arc::new(ReqwestTransport::new()?),
             Arc::new(ReqwestSidecarTransport::new()?),
-            Arc::new(WindowsCredentialStore),
+            DeviceKey::production(Arc::new(WindowsCredentialStore))?,
         )
     }
 
@@ -395,6 +417,7 @@ impl CloudAuthService {
             verifier,
             redirect_uri,
             created_at_ms: now_ms,
+            key_algorithm: self.device_key.current_algorithm(),
         })?;
         let mut listeners = self
             .callback_listeners
@@ -1343,7 +1366,9 @@ mod tests {
                 .len(),
             43
         );
-        assert_eq!(store.0.lock().unwrap().len(), 2);
+        let persisted = store.0.lock().unwrap();
+        assert_eq!(persisted.len(), 3);
+        assert!(persisted.contains_key("cloud-device-id-v1"));
     }
 
     #[test]
@@ -1415,6 +1440,7 @@ mod tests {
             verifier: "verifier".into(),
             redirect_uri: "http://127.0.0.1:42001".into(),
             created_at_ms: 1,
+            key_algorithm: crate::cloud_crypto::DpopAlgorithm::EdDsa,
         };
         assert_eq!(
             extract_callback_code("http://127.0.0.1:42001/?code=one&state=state-1", &pending)
@@ -1443,6 +1469,7 @@ mod tests {
         let callback_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let callback_port = callback_listener.local_addr().unwrap().port();
         let redirect_uri = format!("http://127.0.0.1:{callback_port}");
+        client.device_key.public_identity().unwrap();
         client
             .device_key
             .save_pending_auth(&PendingAuth {
@@ -1452,6 +1479,7 @@ mod tests {
                 verifier: "a-fake-pkce-verifier".into(),
                 redirect_uri: redirect_uri.clone(),
                 created_at_ms: CloudAuthService::now_ms().unwrap(),
+                key_algorithm: client.device_key.current_algorithm(),
             })
             .unwrap();
         client
