@@ -118,6 +118,14 @@ describe('Forge schema and workspace isolation', () => {
     expect(proposal).toMatchObject({ state: 'proposed', evidenceIds: [evidenceRecord.id], missingGateIds: [] });
     expect((await forge.promotions(actorA)).map((item) => item.id)).toContain(proposal.id);
     await expect(forge.requestPromotionRecord(actorA, { commitSha: 'd'.repeat(40), from: 'develop', to: 'staging', evidenceIds: ['019a0000-0000-7000-8000-000000000099'], requirements: [] })).rejects.toThrow('FORGE_PROMOTION_EVIDENCE_NOT_FOUND');
+    const mainProposal = await forge.requestPromotionRecord(actorA, { commitSha: 'e'.repeat(40), from: 'staging', to: 'main', evidenceIds: [evidenceRecord.id], requirements: [{ requirementId: 'XIO-REQ-FRG-008', risk: 'low', evidenceIds: [evidenceRecord.id] }], approvalId: '019a0000-0000-7000-8000-000000000099' });
+    expect(mainProposal.approvalId).toBeNull();
+    const mainRequest = await forge.requestPromotionApproval(actorA, { promotionId: mainProposal.id });
+    if (!mainRequest) throw new Error('main promotion approval request missing');
+    await expect(forge.decidePromotionApproval(actorA, { requestId: mainRequest.id, decision: 'approved', reason: 'Self approve attempt' })).rejects.toThrow('FORGE_PROMOTION_APPROVAL_REQUIRES_INDEPENDENT_APPROVER');
+    await expect(forge.requestPromotionApproval(actorA, { promotionId: mainProposal.id })).rejects.toThrow('FORGE_PROMOTION_APPROVAL_ALREADY_REQUESTED');
+    const approvedMainRequest = await forge.decidePromotionApproval(secondActor, { requestId: mainRequest.id, decision: 'approved', reason: 'Reviewed exact commit evidence and scope' });
+    expect(approvedMainRequest).toMatchObject({ status: 'approved', commitSha: 'e'.repeat(40), to: 'main' });
     const finding = await forge.createFindingRecord(actorA, { role: 'security', state: 'open', severity: 'medium', title: 'Review finding', evidenceIds: [evidenceRecord.id], affectedRequirements: ['XIO-REQ-FRG-007'], confidence: 0.8, reproduction: 'Repro in fixture', remediation: 'Address issue', revalidation: 'Rerun suite' });
     expect((await forge.transitionFindingRecord(actorA, { findingId: finding.id, state: 'triaged', detail: 'Assigned' })).state).toBe('triaged');
     const council = await forge.startCouncil(actorA, { projectId: project.id, targetId: epic.id, targetKind: 'epic' });

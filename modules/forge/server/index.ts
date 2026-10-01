@@ -96,6 +96,9 @@ const ForgeRegistration = {
     bus.register(manifest, forgeCapabilities.requestRiskAcceptance, (input, call) => requireRepository(repository).requestRiskAcceptance(actor(call), forgeCapabilities.requestRiskAcceptance.input.parse(input)));
     bus.register(manifest, forgeCapabilities.decideRiskAcceptance, (input, call) => requireRepository(repository).decideRiskAcceptance(actor(call), forgeCapabilities.decideRiskAcceptance.input.parse(input)));
     bus.register(manifest, forgeCapabilities.promotionList, (_input, call) => requireRepository(repository).promotions(actor(call)));
+    bus.register(manifest, forgeCapabilities.promotionApprovalList, (_input, call) => requireRepository(repository).promotionApprovalRequests(actor(call)));
+    bus.register(manifest, forgeCapabilities.requestPromotionApproval, (input, call) => requireRepository(repository).requestPromotionApproval(actor(call), forgeCapabilities.requestPromotionApproval.input.parse(input)));
+    bus.register(manifest, forgeCapabilities.decidePromotionApproval, (input, call) => requireRepository(repository).decidePromotionApproval(actor(call), forgeCapabilities.decidePromotionApproval.input.parse(input)));
     bus.register(manifest, forgeCapabilities.specs, (input, call) => { const request = forgeCapabilities.specs.input.parse(input); return requireRepository(repository).specs(actor(call), request.projectId); });
     bus.register(manifest, forgeCapabilities.specLifecycle, (input, call) => requireRepository(repository).transitionSpec(actor(call), forgeCapabilities.specLifecycle.input.parse(input)));
     bus.register(manifest, forgeCapabilities.saveSpecs, (input, call) => { const request = forgeCapabilities.saveSpecs.input.parse(input); return requireRepository(repository).saveSpecs(actor(call), request.projectId, request.documents); });

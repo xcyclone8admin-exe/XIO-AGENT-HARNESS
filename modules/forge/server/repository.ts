@@ -2,7 +2,7 @@ import { uuidv7 } from '@xyra/core';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { LocalScopedStore, Scope } from '@xyra/db';
-import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
+import { ApprovalRecord, ArchiveNodeRequest, ContextCandidate, CouncilSubmitRequest, CreateEvidenceRequest, CreateFindingRequest, DiscoveryRequest, EpicState, EscalationRecord, EscalationResolution, Evidence, Finding, FindingStateUpdate, ForgeNodeCreate, ForgeNodeUpdate, ForgeProjectCreate, ForgeProjectUpdate, ForgeRunEvent, ForgeSchedule, GateMatrixRequest, HierarchyNode, PersistedContextManifest, Promotion, PromotionApprovalDecisionRequest, PromotionApprovalRecord, PromotionApprovalRequest, PromotionCommand, REVIEW_ROLES, ReviewCouncil, RiskAcceptanceDecisionRequest, RiskAcceptanceRecord, RiskAcceptanceRequest, SourceIngestRequest, SourceRecordCreate, SpecDocument, SpecLifecycleCommand, SpecLifecycleEvent, TicketState } from '../contracts';
 import { createEvidence, createFinding, classifyDiscovery, deriveGateMatrix } from './engine';
 import { compileContext } from './compiler';
 import { transitionEpic, transitionFinding, transitionTicket } from './state-machine';
@@ -394,11 +394,42 @@ export class ForgeRepository {
     if (known.rows.length !== ids.length) throw new Error('FORGE_PROMOTION_EVIDENCE_NOT_FOUND');
     const evidence = known.rows.map((row) => Evidence.parse({ id: row.id, workspaceId: row.workspace_id, requirementId: row.requirement_id, kind: row.kind, source: row.source, sha256: row.sha256, verifiedAt: timestamp(row.verified_at), deterministic: row.deterministic, result: row.result }));
     const gates = deriveGateMatrix(command.requirements, evidence).gates;
-    const promotion = Promotion.parse({ id: uuidv7(), workspaceId: actor.workspaceId, commitSha: command.commitSha, from: command.from, to: command.to, state: 'proposed', evidenceIds: command.evidenceIds, missingGateIds: [], approvalId: command.approvalId, rollbackOf: null, createdAt: new Date().toISOString() });
-    const { requestPromotion } = await import('./engine');
-    const proposal = requestPromotion(promotion, gates);
+    const promotion = Promotion.parse({ id: uuidv7(), workspaceId: actor.workspaceId, commitSha: command.commitSha, from: command.from, to: command.to, state: 'proposed', evidenceIds: command.evidenceIds, missingGateIds: [], approvalId: null, rollbackOf: null, createdAt: new Date().toISOString() });
+    let proposal: z.infer<typeof Promotion>;
+    if (command.to === 'main') {
+      const missing = gates.filter((gate) => gate.hard && gate.status !== 'pass').map((gate) => gate.id);
+      if (missing.length) throw new Error(`PROMOTION_GATES_MISSING:${missing.join(',')}`);
+      proposal = promotion;
+    } else {
+      const { requestPromotion } = await import('./engine');
+      proposal = requestPromotion(promotion, gates);
+    }
     await this.recordPromotion(actor, proposal);
     return proposal;
+  }
+  async promotionApprovalRequests(actor: ForgeActor) {
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string; promotion_id: string; commit_sha: string; from_environment: string; requested_by: string; created_at: string; decision: 'approved'|'rejected'|null; decision_reason: string|null; decided_by: string|null; decided_at: string|null }>(this.scope(actor), 'SELECT r.id,r.promotion_id,r.commit_sha,r.from_environment,r.requested_by,r.created_at,d.decision,d.reason AS decision_reason,d.decided_by,d.created_at AS decided_at FROM forge_promotion_approval_requests r LEFT JOIN forge_promotion_approval_decisions d ON d.tenant_id=r.tenant_id AND d.workspace_id=r.workspace_id AND d.request_id=r.id ORDER BY r.created_at DESC');
+    return rows.map((row) => PromotionApprovalRecord.parse({ id: row.id, promotionId: row.promotion_id, commitSha: row.commit_sha, from: row.from_environment, to: 'main', status: row.decision ?? 'pending', requestedBy: row.requested_by, decidedBy: row.decided_by, decisionReason: row.decision_reason, createdAt: timestamp(row.created_at), decidedAt: row.decided_at ? timestamp(row.decided_at) : null }));
+  }
+  async requestPromotionApproval(actor: ForgeActor, raw: unknown) {
+    const request = PromotionApprovalRequest.parse(raw);
+    const promotion = (await this.promotions(actor)).find((item) => item.id === request.promotionId);
+    if (!promotion || promotion.to !== 'main') throw new Error('FORGE_MAIN_PROMOTION_PROPOSAL_REQUIRED');
+    if (promotion.missingGateIds.length) throw new Error('FORGE_PROMOTION_HARD_GATES_MUST_PASS');
+    const id = uuidv7();
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_promotion_approval_requests(id,tenant_id,workspace_id,promotion_id,commit_sha,from_environment,to_environment,requested_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(tenant_id,workspace_id,promotion_id) DO NOTHING RETURNING id', [id, actor.tenantId, actor.workspaceId, promotion.id, promotion.commitSha, promotion.from, promotion.to, actor.id]);
+    if (!rows.length) throw new Error('FORGE_PROMOTION_APPROVAL_ALREADY_REQUESTED');
+    return (await this.promotionApprovalRequests(actor)).find((item) => item.id === id);
+  }
+  async decidePromotionApproval(actor: ForgeActor, raw: unknown) {
+    const request = PromotionApprovalDecisionRequest.parse(raw);
+    const current = (await this.promotionApprovalRequests(actor)).find((item) => item.id === request.requestId);
+    if (!current) throw new Error('FORGE_PROMOTION_APPROVAL_NOT_FOUND');
+    if (current.status !== 'pending') throw new Error('FORGE_PROMOTION_APPROVAL_ALREADY_DECIDED');
+    if (request.decision === 'approved' && current.requestedBy === actor.id) throw new Error('FORGE_PROMOTION_APPROVAL_REQUIRES_INDEPENDENT_APPROVER');
+    const { rows } = await this.store.query<Record<string, unknown> & { id: string }>(this.scope(actor), 'INSERT INTO forge_promotion_approval_decisions(id,tenant_id,workspace_id,request_id,decision,reason,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,workspace_id,request_id) DO NOTHING RETURNING id', [uuidv7(), actor.tenantId, actor.workspaceId, request.requestId, request.decision, request.reason, actor.id]);
+    if (!rows.length) throw new Error('FORGE_PROMOTION_APPROVAL_ALREADY_DECIDED');
+    return (await this.promotionApprovalRequests(actor)).find((item) => item.id === request.requestId);
   }
   async promotions(actor: ForgeActor) {
     const { rows } = await this.store.query<Record<string, unknown> & { id: string; workspace_id: string; commit_sha: string; from_environment: string; to_environment: string; state: string; evidence_ids: unknown; missing_gate_ids: unknown; approval_id: string | null; rollback_of: string | null; created_at: string }>(this.scope(actor), 'SELECT id,workspace_id,commit_sha,from_environment,to_environment,state,evidence_ids,missing_gate_ids,approval_id,rollback_of,created_at FROM forge_promotions ORDER BY created_at DESC');
