@@ -1400,6 +1400,8 @@ describe('cycle-1 review regressions on real workerd HTTP', () => {
     expect(first.status).toBe(200);
     const expiresAtMs = first.json?.['lease']?.expiresAtMs;
     expect(Number.isSafeInteger(expiresAtMs), `invalid lease expiry: ${JSON.stringify(first)}`).toBe(true);
+    const beforeExpiry = await call('POST', '/v1/leases/acquire', token, { key, ttlMs: 5_000 });
+    expect(beforeExpiry).toMatchObject({ status: 409, json: { code: 'LEASE_UNAVAILABLE' } });
     const untilExpiry = expiresAtMs - Date.now() + 1;
     if (untilExpiry > 0) await new Promise((resolve) => setTimeout(resolve, untilExpiry));
     expect(Date.now(), 'lease expiry timestamp has not elapsed').toBeGreaterThan(expiresAtMs);
