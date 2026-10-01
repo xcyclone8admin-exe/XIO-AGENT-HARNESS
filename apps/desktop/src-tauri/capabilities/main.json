@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "The only WebView → shell surface: the bundled app origin in the main window may read its sidecar endpoint and guardian status, restart the local service, store a secret it cannot read back, read secret status, and read the (disabled) updater state. No core plugin commands are granted.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-sidecar-endpoint",
+    "allow-sidecar-status",
+    "allow-sidecar-restart",
+    "allow-secret-set",
+    "allow-secret-status",
+    "allow-cloud-auth-begin",
+    "allow-cloud-auth-complete",
+    "allow-cloud-session-status",
+    "allow-cloud-session-logout",
+    "allow-cloud-authenticated-request",
+    "allow-cloud-blob-upload",
+    "allow-cloud-sync-push-to-sidecar",
+    "allow-update-status"
+  ]
+}

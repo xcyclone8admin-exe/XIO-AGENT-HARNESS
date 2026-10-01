@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-blob-upload"
+description = "Enables the cloud_blob_upload command without any pre-configured scope."
+commands.allow = ["cloud_blob_upload"]
+
+[[permission]]
+identifier = "deny-cloud-blob-upload"
+description = "Denies the cloud_blob_upload command without any pre-configured scope."
+commands.deny = ["cloud_blob_upload"]

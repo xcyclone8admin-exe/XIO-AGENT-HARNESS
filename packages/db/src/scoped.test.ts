@@ -33,7 +33,12 @@ beforeAll(async () => {
       'workspace_settings',
       'ops_projects',
       'ops_tasks',
-    ].map((name) => ({ name, class: 'lww' as const, ...(name === 'ops_projects' ? { serverWriteCapabilities: ['test_ops'] } : {}) })),
+    ].map((name) => ({
+      name,
+      class: 'lww' as const,
+      ...(name === 'ops_projects' ? { serverWriteCapabilities: ['test_ops'] } : {}),
+      ...(name === 'ops_tasks' ? { serverReadCapabilities: ['test_ops'] } : {}),
+    })),
     ...['approval_requests', 'approval_decisions', 'audit_events', 'domain_events'].map((name) => ({
       name,
       class: 'append' as const,
@@ -54,6 +59,7 @@ beforeAll(async () => {
     ...['swarm_runs', 'swarm_run_journal', 'swarm_model_evals', 'swarm_prompt_versions'].map((name) => ({
       name,
       class: 'append' as const,
+      ...(name === 'swarm_runs' ? { serverInsertCapabilities: ['test_ops'] } : {}),
     })),
   ]);
   await db.query('INSERT INTO tenants(id,name) VALUES ($1,$2),($3,$4)', [tenantA, 'A', tenantB, 'B']);
@@ -95,6 +101,37 @@ test('a scoped write cannot insert another tenant', async () => {
       ['019a0000-0000-7000-8000-000000000099', tenantB, 'intruder'],
     ),
   ).rejects.toThrow();
+});
+
+test('server capability read, append, and write grants remain distinct', async () => {
+  const grants = await db.query<{
+    read_ops_tasks: boolean;
+    insert_ops_tasks: boolean;
+    insert_runs: boolean;
+    update_runs: boolean;
+  }>(
+    `SELECT
+       has_table_privilege('xyra_cap_test_ops','ops_tasks','SELECT') AS read_ops_tasks,
+       has_table_privilege('xyra_cap_test_ops','ops_tasks','INSERT') AS insert_ops_tasks,
+       has_table_privilege('xyra_cap_test_ops','swarm_runs','INSERT') AS insert_runs,
+       has_table_privilege('xyra_cap_test_ops','swarm_runs','UPDATE') AS update_runs`,
+  );
+  expect(grants.rows[0]).toEqual({
+    read_ops_tasks: true,
+    insert_ops_tasks: false,
+    insert_runs: true,
+    update_runs: false,
+  });
+  await expect(
+    scoped.withServerScope({ tenantId: tenantA, workspaceId: workspaceA }, 'test_ops', undefined, (tx) =>
+      tx.query('SELECT id FROM ops_tasks'),
+    ),
+  ).resolves.toBeDefined();
+  await expect(
+    scoped.withServerScope({ tenantId: tenantA, workspaceId: workspaceA }, 'test_ops', undefined, (tx) =>
+      tx.query("UPDATE ops_tasks SET title='forbidden' WHERE false"),
+    ),
+  ).rejects.toThrow(/permission denied/);
 });
 
 test('swarm tables isolate tenants and keep run records append-only', async () => {
@@ -186,9 +223,19 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
       { name: 'tenants', class: 'lww', authority: 'server' },
       { name: 'workspaces', class: 'lww', authority: 'server', serverWriteCapabilities: ['test_ops'] },
       { name: 'memberships', class: 'lww', authority: 'server' },
-      { name: 'ops_projects', class: 'lww', authority: 'synced', guardedColumns: ['status'], serverWriteCapabilities: ['test_ops'] },
+      {
+        name: 'ops_projects',
+        class: 'lww',
+        authority: 'synced',
+        guardedColumns: ['status'],
+        serverWriteCapabilities: ['test_ops'],
+      },
       { name: 'ops_tasks', class: 'lww', authority: 'synced' },
     ]);
+    const schemaAccess = await fresh.query<{ usage: boolean }>(
+      "SELECT has_schema_privilege('xyra_cap_test_ops', 'public', 'USAGE') AS usage",
+    );
+    expect(schemaAccess.rows[0]?.usage).toBe(true);
     await fresh.query('INSERT INTO tenants(id,name) VALUES ($1,$2)', [tenantA, 'A']);
     await fresh.query('INSERT INTO workspaces(id,tenant_id,name) VALUES ($1,$2,$3)', [
       workspaceA,
@@ -197,6 +244,14 @@ test('privileged columns get a column-listed UPDATE grant without them (SWM-R-00
     ]);
     const store = new LocalScopedStore(fresh);
     const scope = { tenantId: tenantA, workspaceId: workspaceA };
+    await expect(
+      store.withServerScope(
+        scope,
+        'test_ops',
+        `${Date.now() + 61_000}-0001-testnode`,
+        async () => 'unreachable',
+      ),
+    ).rejects.toThrow(/too far in the future/);
     const project = '019a0000-0000-7000-8000-000000000301';
     await store.query(
       scope,

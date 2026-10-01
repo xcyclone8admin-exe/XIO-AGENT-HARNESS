@@ -37,12 +37,13 @@ const bus = new CapabilityBus(
     },
   },
   { get: async () => undefined, put: async () => {} },
-  { verify: async () => false },
+  { verify: async () => null },
   () => false,
   async () => new Set(),
 );
 bus.register(manifest, descriptor, async () => ({ name: 'Real workspace' }));
 const TOKEN = 'x'.repeat(43);
+const NATIVE_SYNC_TOKEN = 'n'.repeat(43);
 const app = createSidecarApp({
   port: 43117,
   launchToken: TOKEN,
@@ -84,4 +85,124 @@ test('the HTTP call resolves its own principal and runs the shared bus', async (
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ data: { name: 'Real workspace' } });
   expect(audit).toContain('succeeded');
+});
+
+test('Cloud sync result callback requires a separate native-only token and validates the pair', async () => {
+  const path = '/internal/native/cloud-sync/push';
+  const changeId = '019a0000-0000-7000-8000-000000000061';
+  const hlc = '1790000000000-0003-devicea';
+  const request = {
+    protocolVersion: 1,
+    schemaVersion: 'cloud-sync-v1',
+    nodeId: 'devicea',
+    idempotencyKey: 'native-sync-00000001',
+    changes: [
+      {
+        table: 'brain_sources',
+        id: changeId,
+        tenantId: principal.tenantId,
+        workspaceId: WORKSPACE,
+        op: 'upsert',
+        fields: { title: { value: 'source', hlc, baseHlc: null } },
+        hlc,
+      },
+    ],
+  };
+  const response = {
+    accepted: 1,
+    conflicts: 0,
+    serverSeq: '1',
+    rejected: [],
+    conflictHistory: [],
+    changeOutcomes: [
+      {
+        index: 0,
+        changeId,
+        table: 'brain_sources',
+        rowId: changeId,
+        outcome: 'committed',
+        appliedFields: ['title'],
+        unchangedFields: [],
+        conflictedFields: [],
+      },
+    ],
+    replayed: false,
+  };
+  let recorded = 0;
+  const nativeApp = createSidecarApp({
+    port: 43118,
+    launchToken: TOKEN,
+    nativeSyncToken: NATIVE_SYNC_TOKEN,
+    allowedOrigins: ['http://tauri.localhost'],
+    resolvePrincipal: async () => principal,
+    bus,
+    acceptCloudSyncPush: async (scope, receivedRequest, receivedResponse) => {
+      expect(scope).toEqual({ tenantId: principal.tenantId, workspaceId: WORKSPACE });
+      expect(receivedRequest).toEqual(request);
+      expect(receivedResponse).toEqual(response);
+      recorded += 1;
+    },
+  });
+  const endpoint = `http://127.0.0.1:43118${path}`;
+  const body = JSON.stringify({ request, response });
+  const userTokenAttempt = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:43118',
+      authorization: `Bearer ${TOKEN}`,
+      'content-type': 'application/json',
+    },
+    body,
+  });
+  expect(userTokenAttempt.status).toBe(403);
+  const webviewOriginAttempt = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:43118',
+      authorization: `Bearer ${NATIVE_SYNC_TOKEN}`,
+      origin: 'http://tauri.localhost',
+      'content-type': 'application/json',
+    },
+    body,
+  });
+  expect(webviewOriginAttempt.status).toBe(403);
+  const accepted = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:43118',
+      'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+      'content-type': 'application/json',
+    },
+    body,
+  });
+  expect(accepted.status).toBe(200);
+  expect(await accepted.json()).toEqual({ status: 'recorded' });
+  expect(recorded).toBe(1);
+  const missingOutcomes = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:43118',
+      'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ request, response: { ...response, changeOutcomes: undefined } }),
+  });
+  expect(missingOutcomes.status).toBe(409);
+  expect(recorded).toBe(1);
+
+  const wrongTenantRequest = {
+    ...request,
+    changes: [{ ...request.changes[0]!, tenantId: '019a0000-0000-7000-8000-000000000099' }],
+  };
+  const wrongScope = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers: {
+      host: '127.0.0.1:43118',
+      'x-xyra-native-sync-token': NATIVE_SYNC_TOKEN,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ request: wrongTenantRequest, response }),
+  });
+  expect(wrongScope.status).toBe(403);
+  expect(recorded).toBe(1);
 });

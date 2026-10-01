@@ -148,6 +148,62 @@ test('deferred database checks reject unbalanced transactions atomically', async
   ).rejects.toThrow(/UNBALANCED/);
   const absent = await db.query('SELECT 1 FROM ledger_transactions WHERE id=$1', [unbalancedId]);
   expect(absent.rows).toHaveLength(0);
+  const balances = await db.query<{ account_id: string; units: string; entry_count: number }>(
+    `SELECT account_id, units::text, entry_count FROM ledger_balances
+     WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$3 ORDER BY account_id`,
+    [TA, WA, BOOK_A],
+  );
+  expect(balances.rows).toEqual([
+    { account_id: ACCT_A1, units: '100', entry_count: 1 },
+    { account_id: ACCT_A2, units: '-100', entry_count: 1 },
+  ]);
+});
+
+test('deferred checks reject one-entry and cross-asset net-zero transactions without projection changes', async () => {
+  const oneEntryId = '019a0000-0000-7000-8000-000000000084';
+  await expect(db.transaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO ledger_transactions(id,tenant_id,workspace_id,book_id,environment,effective_date,description,source,posted_by)
+       VALUES ($1,$2,$3,$4,'actual','2026-09-30','Single entry','money',$5)`,
+      [oneEntryId, TA, WA, BOOK_A, ACTOR_A],
+    );
+    await tx.query(
+      `INSERT INTO ledger_entries(id,tenant_id,workspace_id,transaction_id,line_no,book_id,environment,account_id,asset,units,created_by)
+       VALUES ('019a0000-0000-7000-8000-000000000085',$1,$2,$3,1,$4,'actual',$5,'USD',50,$6)`,
+      [TA, WA, oneEntryId, BOOK_A, ACCT_A1, ACTOR_A],
+    );
+  })).rejects.toThrow(/TOO_FEW_ENTRIES/);
+  expect((await db.query('SELECT 1 FROM ledger_transactions WHERE id=$1', [oneEntryId])).rows).toHaveLength(0);
+
+  await db.query(
+    `INSERT INTO ledger_assets(id,tenant_id,workspace_id,code,scale,kind,name,created_by)
+     VALUES ('019a0000-0000-7000-8000-000000000086',$1,$2,'EUR',2,'fiat','Euro',$3)`,
+    [TA, WA, ACTOR_A],
+  );
+  const crossAssetId = '019a0000-0000-7000-8000-000000000087';
+  await expect(db.transaction(async (tx) => {
+    await tx.query(
+      `INSERT INTO ledger_transactions(id,tenant_id,workspace_id,book_id,environment,effective_date,description,source,posted_by)
+       VALUES ($1,$2,$3,$4,'actual','2026-09-30','Cross-asset net zero','money',$5)`,
+      [crossAssetId, TA, WA, BOOK_A, ACTOR_A],
+    );
+    await tx.query(
+      `INSERT INTO ledger_entries(id,tenant_id,workspace_id,transaction_id,line_no,book_id,environment,account_id,asset,units,created_by)
+       VALUES ('019a0000-0000-7000-8000-000000000088',$1,$2,$3,1,$4,'actual',$5,'USD',50,$6),
+              ('019a0000-0000-7000-8000-000000000089',$1,$2,$3,2,$4,'actual',$7,'EUR',-50,$6)`,
+      [TA, WA, crossAssetId, BOOK_A, ACCT_A1, ACTOR_A, ACCT_A2],
+    );
+  })).rejects.toThrow(/UNBALANCED/);
+  expect((await db.query('SELECT 1 FROM ledger_transactions WHERE id=$1', [crossAssetId])).rows).toHaveLength(0);
+  const afterFailures = await db.query<{ account_id: string; units: string; entry_count: number }>(
+    `SELECT account_id, units::text, entry_count FROM ledger_balances
+     WHERE tenant_id=$1 AND workspace_id=$2 AND book_id=$3 ORDER BY account_id`,
+    [TA, WA, BOOK_A],
+  );
+  expect(afterFailures.rows).toEqual([
+    { account_id: ACCT_A1, units: '100', entry_count: 1 },
+    { account_id: ACCT_A2, units: '-100', entry_count: 1 },
+  ]);
 });
 
 test('live execution is disabled and immutable entries require reversing rows', async () => {
@@ -352,8 +408,11 @@ test('ledger query, aggregate, reconciliation, and discrepancy APIs return contr
   expect(page2.nextCursor).toBeNull();
 
   const trial = await writer.trialBalance(scope, { environment: 'actual', bookId: BOOK_A });
-  expect(trial.rows.map((row) => row.debit)).toEqual(['101', '0']);
-  expect(trial.totals).toEqual([{ asset: 'USD', scale: 2, debit: '101', credit: '101', balanced: true }]);
+  expect(trial.rows.filter((row) => row.asset === 'USD').map((row) => row.debit)).toEqual(['101', '0']);
+  expect(trial.totals).toEqual([
+    { asset: 'EUR', scale: 2, debit: '0', credit: '0', balanced: true },
+    { asset: 'USD', scale: 2, debit: '101', credit: '101', balanced: true },
+  ]);
   const totals = await writer.totals(scope, { environment: 'actual', asset: 'USD' });
   expect(totals.byType).toMatchObject({ asset: '101', equity: '-101' });
 
@@ -415,6 +474,9 @@ test('Money ledger capability scope can post atomically but cannot mutate Swarm 
   const appScoped = new LocalScopedStore(db);
   await expect(appScoped.query({ tenantId: TA, workspaceId: WA },
     `UPDATE swarm_agent_profiles SET approval_policy='changed' WHERE id=$1`, [settingId],
+  )).rejects.toThrow(/permission denied/);
+  await expect(appScoped.withServerScope(scope, 'money_ledger', scope.hlc, (tx) =>
+    tx.query(`UPDATE swarm_agent_profiles SET charter='capability escape' WHERE id=$1`, [settingId]),
   )).rejects.toThrow(/permission denied/);
   const unchanged = await db.query<{ charter: string }>('SELECT charter FROM swarm_agent_profiles WHERE id=$1', [settingId]);
   expect(unchanged.rows[0]?.charter).toBe('Ledger guard test');

@@ -1,0 +1,6 @@
+# Staged by scripts/stage-sidecar.mjs and tools/prepare-node.mjs; never committed.
+src-tauri/resources/
+src-tauri/binaries/
+src-tauri/gen/
+src-tauri/tauri.brand.json
+src-tauri/target/
