@@ -15,6 +15,7 @@ import {
   acceptInvestSignalInTransaction,
   acknowledgeInvestSignalInTransaction,
   claimInvestSignalInTransaction,
+  verifyInvestSignalEnvelopeDigest,
   type InvestSignalBody,
   type InvestSignalSourceKey,
   type RawInvestWebhook,
@@ -1279,8 +1280,25 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
       signalId: expect.any(String),
     });
     expect(storedEnvelope.rows[0]?.envelope).toMatchObject({
-      verification: { signature: 'verified', keyId },
+      verification: { signature: 'verified', keyId, signingAlg: 'ES256' },
+      envelopeDigestVersion: 'xyra.invest.envelope.digest.v1',
+      envelopeDigestAlgorithm: 'SHA-256',
+      envelopeDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
+    expect(await verifyInvestSignalEnvelopeDigest(accepted.envelope)).toBe(true);
+    const mutatedEnvelopes = [
+      { ...accepted.envelope, quantity: '9.99' },
+      { ...accepted.envelope, tenantId: TENANT_B },
+      { ...accepted.envelope, workspaceId: WORKSPACE_B },
+      {
+        ...accepted.envelope,
+        verification: { ...accepted.envelope.verification, keyId: '75757575-7575-4575-8575-757575757575' },
+      },
+    ];
+    for (const mutatedEnvelope of mutatedEnvelopes) {
+      expect(mutatedEnvelope.payloadDigest).toBe(accepted.envelope.payloadDigest);
+      expect(await verifyInvestSignalEnvelopeDigest(mutatedEnvelope)).toBe(false);
+    }
     const duplicate = await scoped(TENANT_A, WORKSPACE_A, (client) =>
       acceptInvestSignalInTransaction(client, webhook, source),
     );
@@ -1345,6 +1363,9 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
       protocol: INVEST_SIGNAL_CONSUME_PROTOCOL,
       eventId: 'atomic-event-001',
       payloadDigest: accepted.envelope.payloadDigest,
+      envelopeDigestVersion: accepted.envelope.envelopeDigestVersion,
+      envelopeDigestAlgorithm: accepted.envelope.envelopeDigestAlgorithm,
+      envelopeDigest: accepted.envelope.envelopeDigest,
       decisionId: crypto.randomUUID(),
       idempotencyKey: crypto.randomUUID(),
     } as const;
@@ -1353,6 +1374,15 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
         acknowledgeInvestSignalInTransaction(client, consumerA, { ...ackBase, leaseId: claim.lease.leaseId }),
       ),
     ).rejects.toThrow('SIGNAL_LEASE_INVALID');
+    await expect(
+      scoped(TENANT_A, WORKSPACE_A, (client) =>
+        acknowledgeInvestSignalInTransaction(client, consumerB, {
+          ...ackBase,
+          envelopeDigest: '0'.repeat(64),
+          leaseId: reclaimed.lease.leaseId,
+        }),
+      ),
+    ).rejects.toThrow('SIGNAL_ENVELOPE_DIGEST_MISMATCH');
     const ack = await scoped(TENANT_A, WORKSPACE_A, (client) =>
       acknowledgeInvestSignalInTransaction(client, consumerB, {
         ...ackBase,

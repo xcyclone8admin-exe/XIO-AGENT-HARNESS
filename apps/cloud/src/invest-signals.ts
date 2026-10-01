@@ -1,7 +1,10 @@
 import { withNeonTransaction, type NeonQueryClient } from './neon';
+import { canonicalCloudIngestionJson } from '@xyra/contracts';
 
 export const INVEST_SIGNAL_PROTOCOL = 'xyra.invest.signal.v1';
 export const INVEST_SIGNAL_CONSUME_PROTOCOL = 'xyra.invest.signal.consume.v1';
+export const INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION = 'xyra.invest.envelope.digest.v1';
+export const INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM = 'SHA-256';
 export const MAX_INVEST_SIGNAL_BODY_BYTES = 32 * 1024;
 export const INVEST_SIGNAL_LEASE_MS = 30_000;
 
@@ -45,7 +48,51 @@ export interface VerifiedInvestSignalEnvelope extends InvestSignalBody {
   readonly workspaceId: string;
   readonly receivedAt: string;
   readonly payloadDigest: string;
-  readonly verification: { readonly signature: 'verified'; readonly keyId: string };
+  readonly verification: {
+    readonly signature: 'verified';
+    readonly keyId: string;
+    readonly signingAlg: SignalSigningAlgorithm;
+  };
+  readonly envelopeDigestVersion: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION;
+  readonly envelopeDigestAlgorithm: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM;
+  readonly envelopeDigest: string;
+}
+
+export type InvestSignalEnvelopeDigestInput = Omit<
+  VerifiedInvestSignalEnvelope,
+  'envelopeDigestVersion' | 'envelopeDigestAlgorithm' | 'envelopeDigest'
+>;
+
+/**
+ * Hashes the exact normalized claim payload, scope, receipt time, raw-body digest and
+ * server-resolved verification key/algorithm. The raw `payloadDigest` remains the digest
+ * of the signed request bytes; this separate digest binds the typed envelope sent to Invest.
+ */
+export async function investSignalEnvelopeDigest(input: InvestSignalEnvelopeDigestInput): Promise<string> {
+  const canonical = canonicalCloudIngestionJson({
+    digestAlgorithm: INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
+    digestVersion: INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
+    envelope: input,
+  });
+  return sha256Hex(new TextEncoder().encode(canonical));
+}
+
+export async function verifyInvestSignalEnvelopeDigest(
+  envelope: VerifiedInvestSignalEnvelope,
+): Promise<boolean> {
+  if (
+    envelope.envelopeDigestVersion !== INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION ||
+    envelope.envelopeDigestAlgorithm !== INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM ||
+    !DIGEST.test(envelope.envelopeDigest)
+  )
+    return false;
+  const {
+    envelopeDigest: _digest,
+    envelopeDigestAlgorithm: _algorithm,
+    envelopeDigestVersion: _version,
+    ...input
+  } = envelope;
+  return (await investSignalEnvelopeDigest(input)) === envelope.envelopeDigest;
 }
 
 export interface InvestSignalSourceKey {
@@ -369,21 +416,27 @@ export async function acceptInvestSignalInTransaction(
       eventRecordId: prior.id,
       jobId: job,
       receivedAt: normalizeDbTimestamp(prior.received_at),
-      envelope: parseEnvelope(prior.envelope),
+      envelope: await parseAndVerifyEnvelope(prior.envelope),
     };
   }
 
   const id = crypto.randomUUID();
   const created = await client.query<{ received_at: string }>('SELECT now()::text AS received_at');
   const receivedAt = normalizeDbTimestamp(created.rows[0]?.received_at ?? new Date(nowMs).toISOString());
-  const envelope: VerifiedInvestSignalEnvelope = {
+  const envelopeInput: InvestSignalEnvelopeDigestInput = {
     ...verified.body,
     sourceId: source.sourceId,
     tenantId: source.tenantId,
     workspaceId: source.workspaceId,
     receivedAt,
     payloadDigest: verified.payloadDigest,
-    verification: { signature: 'verified', keyId: source.keyId },
+    verification: { signature: 'verified', keyId: source.keyId, signingAlg: source.signingAlg },
+  };
+  const envelope: VerifiedInvestSignalEnvelope = {
+    ...envelopeInput,
+    envelopeDigestVersion: INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
+    envelopeDigestAlgorithm: INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
+    envelopeDigest: await investSignalEnvelopeDigest(envelopeInput),
   };
   await client.query(
     `INSERT INTO cloud_invest_signal_events
@@ -494,7 +547,7 @@ export async function claimInvestSignalInTransaction(
         fence: Number(row.lease_fence),
         expiresAt: normalizeDbTimestamp(row.expires_at),
       },
-      signal: parseEnvelope(row.envelope),
+      signal: await parseAndVerifyEnvelope(row.envelope),
     };
   }
   const available = await client.query<ClaimableDbRow>(
@@ -539,7 +592,7 @@ export async function claimInvestSignalInTransaction(
       fence: Number(lease.lease_fence),
       expiresAt: normalizeDbTimestamp(lease.lease_expires_at),
     },
-    signal: parseEnvelope(event.envelope),
+    signal: await parseAndVerifyEnvelope(event.envelope),
   };
 }
 
@@ -547,6 +600,9 @@ export interface SignalAckRequest {
   readonly protocol: typeof INVEST_SIGNAL_CONSUME_PROTOCOL;
   readonly eventId: string;
   readonly payloadDigest: string;
+  readonly envelopeDigestVersion: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION;
+  readonly envelopeDigestAlgorithm: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM;
+  readonly envelopeDigest: string;
   readonly leaseId: string;
   readonly decisionId: string;
   readonly idempotencyKey: string;
@@ -555,7 +611,17 @@ export interface SignalAckRequest {
 export function parseSignalAckRequest(value: unknown): SignalAckRequest | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  const keys = ['protocol', 'eventId', 'payloadDigest', 'leaseId', 'decisionId', 'idempotencyKey'];
+  const keys = [
+    'protocol',
+    'eventId',
+    'payloadDigest',
+    'envelopeDigestVersion',
+    'envelopeDigestAlgorithm',
+    'envelopeDigest',
+    'leaseId',
+    'decisionId',
+    'idempotencyKey',
+  ];
   if (
     Object.keys(row).length !== keys.length ||
     keys.some((key) => !(key in row)) ||
@@ -564,6 +630,10 @@ export function parseSignalAckRequest(value: unknown): SignalAckRequest | null {
     !EVENT_ID.test(row['eventId']) ||
     typeof row['payloadDigest'] !== 'string' ||
     !DIGEST.test(row['payloadDigest']) ||
+    row['envelopeDigestVersion'] !== INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION ||
+    row['envelopeDigestAlgorithm'] !== INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM ||
+    typeof row['envelopeDigest'] !== 'string' ||
+    !DIGEST.test(row['envelopeDigest']) ||
     typeof row['leaseId'] !== 'string' ||
     !UUID.test(row['leaseId']) ||
     typeof row['decisionId'] !== 'string' ||
@@ -576,6 +646,9 @@ export function parseSignalAckRequest(value: unknown): SignalAckRequest | null {
     protocol: INVEST_SIGNAL_CONSUME_PROTOCOL,
     eventId: row['eventId'],
     payloadDigest: row['payloadDigest'],
+    envelopeDigestVersion: INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
+    envelopeDigestAlgorithm: INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
+    envelopeDigest: row['envelopeDigest'],
     leaseId: row['leaseId'].toLowerCase(),
     decisionId: row['decisionId'].toLowerCase(),
     idempotencyKey: row['idempotencyKey'].toLowerCase(),
@@ -590,6 +663,9 @@ export async function acknowledgeInvestSignal(
   status: 'acked';
   eventId: string;
   payloadDigest: string;
+  envelopeDigestVersion: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION;
+  envelopeDigestAlgorithm: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM;
+  envelopeDigest: string;
   decisionId: string;
   acknowledgedAt: string;
   replayed: boolean;
@@ -609,6 +685,9 @@ export async function acknowledgeInvestSignalInTransaction(
   status: 'acked';
   eventId: string;
   payloadDigest: string;
+  envelopeDigestVersion: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION;
+  envelopeDigestAlgorithm: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM;
+  envelopeDigest: string;
   decisionId: string;
   acknowledgedAt: string;
   replayed: boolean;
@@ -623,6 +702,13 @@ export async function acknowledgeInvestSignalInTransaction(
   const event = rows.rows[0];
   if (!event || event.payload_digest !== input.payloadDigest || event.claim_device_id !== identity.deviceId)
     throw new InvestSignalError('SIGNAL_LEASE_INVALID', 409);
+  const envelope = await parseAndVerifyEnvelope(event.envelope);
+  if (
+    envelope.envelopeDigestVersion !== input.envelopeDigestVersion ||
+    envelope.envelopeDigestAlgorithm !== input.envelopeDigestAlgorithm ||
+    envelope.envelopeDigest !== input.envelopeDigest
+  )
+    throw new InvestSignalError('SIGNAL_ENVELOPE_DIGEST_MISMATCH', 409);
   if (event.status === 'acked') {
     if (event.ack_decision_id !== input.decisionId || event.ack_idempotency_key !== input.idempotencyKey)
       throw new InvestSignalError('SIGNAL_ACK_IDEMPOTENCY_REUSED', 409);
@@ -630,6 +716,9 @@ export async function acknowledgeInvestSignalInTransaction(
       status: 'acked',
       eventId: input.eventId,
       payloadDigest: input.payloadDigest,
+      envelopeDigestVersion: input.envelopeDigestVersion,
+      envelopeDigestAlgorithm: input.envelopeDigestAlgorithm,
+      envelopeDigest: input.envelopeDigest,
       decisionId: input.decisionId,
       acknowledgedAt: normalizeDbTimestamp(event.acked_at ?? ''),
       replayed: true,
@@ -660,6 +749,9 @@ export async function acknowledgeInvestSignalInTransaction(
     status: 'acked',
     eventId: input.eventId,
     payloadDigest: input.payloadDigest,
+    envelopeDigestVersion: input.envelopeDigestVersion,
+    envelopeDigestAlgorithm: input.envelopeDigestAlgorithm,
+    envelopeDigest: input.envelopeDigest,
     decisionId: input.decisionId,
     acknowledgedAt: normalizeDbTimestamp(ack.rows[0].acked_at),
     replayed: false,
@@ -910,10 +1002,47 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 
 function parseEnvelope(value: unknown): VerifiedInvestSignalEnvelope {
   const parsed = objectValue(value);
+  const expectedKeys = [
+    'protocol',
+    'eventId',
+    'occurredAt',
+    'expiresAt',
+    'algorithmId',
+    'signalId',
+    'symbol',
+    'side',
+    'quantity',
+    'sourceId',
+    'tenantId',
+    'workspaceId',
+    'receivedAt',
+    'payloadDigest',
+    'verification',
+    'envelopeDigestVersion',
+    'envelopeDigestAlgorithm',
+    'envelopeDigest',
+  ];
+  const verification = parsed && objectValue(parsed['verification']);
   if (
     !parsed ||
+    Object.keys(parsed).length !== expectedKeys.length ||
+    expectedKeys.some((key) => !(key in parsed)) ||
     parsed['protocol'] !== INVEST_SIGNAL_PROTOCOL ||
     typeof parsed['eventId'] !== 'string' ||
+    !EVENT_ID.test(parsed['eventId']) ||
+    typeof parsed['occurredAt'] !== 'string' ||
+    !validIsoTimestamp(parsed['occurredAt']) ||
+    typeof parsed['expiresAt'] !== 'string' ||
+    !validIsoTimestamp(parsed['expiresAt']) ||
+    typeof parsed['algorithmId'] !== 'string' ||
+    !ALGORITHM_ID.test(parsed['algorithmId']) ||
+    typeof parsed['signalId'] !== 'string' ||
+    !UUID.test(parsed['signalId']) ||
+    typeof parsed['symbol'] !== 'string' ||
+    !SYMBOL.test(parsed['symbol']) ||
+    (parsed['side'] !== 'buy' && parsed['side'] !== 'sell') ||
+    typeof parsed['quantity'] !== 'string' ||
+    !QUANTITY.test(parsed['quantity']) ||
     typeof parsed['payloadDigest'] !== 'string' ||
     !DIGEST.test(parsed['payloadDigest']) ||
     typeof parsed['sourceId'] !== 'string' ||
@@ -923,11 +1052,27 @@ function parseEnvelope(value: unknown): VerifiedInvestSignalEnvelope {
     typeof parsed['workspaceId'] !== 'string' ||
     !UUID.test(parsed['workspaceId']) ||
     typeof parsed['receivedAt'] !== 'string' ||
-    !parsed['verification'] ||
-    typeof parsed['verification'] !== 'object'
+    !validIsoTimestamp(parsed['receivedAt']) ||
+    !verification ||
+    Object.keys(verification).length !== 3 ||
+    verification['signature'] !== 'verified' ||
+    typeof verification['keyId'] !== 'string' ||
+    !UUID.test(verification['keyId']) ||
+    (verification['signingAlg'] !== 'ES256' && verification['signingAlg'] !== 'EdDSA') ||
+    parsed['envelopeDigestVersion'] !== INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION ||
+    parsed['envelopeDigestAlgorithm'] !== INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM ||
+    typeof parsed['envelopeDigest'] !== 'string' ||
+    !DIGEST.test(parsed['envelopeDigest'])
   )
     throw new InvestSignalError('SIGNAL_RECORD_INVALID', 503);
   return parsed as unknown as VerifiedInvestSignalEnvelope;
+}
+
+async function parseAndVerifyEnvelope(value: unknown): Promise<VerifiedInvestSignalEnvelope> {
+  const envelope = parseEnvelope(value);
+  if (!(await verifyInvestSignalEnvelopeDigest(envelope)))
+    throw new InvestSignalError('SIGNAL_RECORD_INVALID', 503);
+  return envelope;
 }
 
 function normalizeDbTimestamp(value: string): string {
