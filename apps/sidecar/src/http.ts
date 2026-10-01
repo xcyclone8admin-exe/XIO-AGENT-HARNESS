@@ -23,7 +23,11 @@ export interface SidecarHttpOptions {
   readonly resolvePrincipal: () => Promise<Principal>;
   readonly bus: CapabilityBus;
   /** Records a validated Cloud response. Must be wired to a trusted server-side service only. */
-  readonly acceptCloudSyncPush?: (request: PushRequestValue, response: PushResponseValue) => Promise<void>;
+  readonly acceptCloudSyncPush?: (
+    scope: { readonly tenantId: string; readonly workspaceId: string },
+    request: PushRequestValue,
+    response: PushResponseValue,
+  ) => Promise<void>;
 }
 
 const NATIVE_SYNC_PATH = '/internal/native/cloud-sync/push';
@@ -129,8 +133,10 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
     if (!envelope.success) return c.json({ code: 'SYNC_ACK_INVALID' }, 400);
     const principal = await options.resolvePrincipal();
     const allowedWorkspaces = new Set(principal.workspaces.map((workspace) => workspace.id));
+    const workspaces = new Set(envelope.data.request.changes.map((change) => change.workspaceId));
     if (
       principal.kind !== 'user' ||
+      workspaces.size !== 1 ||
       envelope.data.request.changes.some(
         (change) =>
           change.tenantId !== principal.tenantId ||
@@ -141,7 +147,13 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
       return c.json({ code: 'SYNC_ACK_SCOPE_MISMATCH' }, 403);
     try {
       assertPushResponseBoundToRequest(envelope.data.request, envelope.data.response);
-      await options.acceptCloudSyncPush(envelope.data.request, envelope.data.response);
+      const workspaceId = [...workspaces][0];
+      if (!workspaceId) return c.json({ code: 'SYNC_ACK_SCOPE_MISMATCH' }, 403);
+      await options.acceptCloudSyncPush(
+        { tenantId: principal.tenantId, workspaceId },
+        envelope.data.request,
+        envelope.data.response,
+      );
       return c.json({ status: 'recorded' });
     } catch {
       return c.json({ code: 'SYNC_ACK_REJECTED' }, 409);

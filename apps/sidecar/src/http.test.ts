@@ -136,7 +136,8 @@ test('Cloud sync result callback requires a separate native-only token and valid
     allowedOrigins: ['http://tauri.localhost'],
     resolvePrincipal: async () => principal,
     bus,
-    acceptCloudSyncPush: async (receivedRequest, receivedResponse) => {
+    acceptCloudSyncPush: async (scope, receivedRequest, receivedResponse) => {
+      expect(scope).toEqual({ tenantId: principal.tenantId, workspaceId: WORKSPACE });
       expect(receivedRequest).toEqual(request);
       expect(receivedResponse).toEqual(response);
       recorded += 1;

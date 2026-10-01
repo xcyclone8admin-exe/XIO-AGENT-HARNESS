@@ -27,8 +27,12 @@ export interface LocalSidecarOptions {
   readonly launchToken?: string;
   /** Private native→sidecar callback token; must never be returned through LocalSidecarSession. */
   readonly nativeSyncToken?: string;
-  /** Trusted host adapter; leave unset until BRAIN's durable acknowledgement handler is available. */
-  readonly acceptCloudSyncPush?: (request: PushRequestValue, response: PushResponseValue) => Promise<void>;
+  /** Optional override for the trusted native acknowledgement adapter, primarily for tests. */
+  readonly acceptCloudSyncPush?: (
+    scope: { readonly tenantId: string; readonly workspaceId: string },
+    request: PushRequestValue,
+    response: PushResponseValue,
+  ) => Promise<void>;
 }
 
 export interface LocalSidecarSession {
@@ -59,7 +63,8 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
     );
     registerFoundationCapabilities(bus, new CoreService(scoped), new OpsService(scoped));
     new MoneyService(new PGliteLedgerWriter(db)).register(bus);
-    registerBrainCapabilities(bus, new BrainService(scoped));
+    const brain = new BrainService(scoped);
+    registerBrainCapabilities(bus, brain);
     const launchToken = options.launchToken ?? randomBytes(32).toString('base64url');
     const app = createSidecarApp({
       port: options.port,
@@ -68,9 +73,8 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       resolvePrincipal: async () => principal,
       bus,
       ...(options.nativeSyncToken === undefined ? {} : { nativeSyncToken: options.nativeSyncToken }),
-      ...(options.acceptCloudSyncPush === undefined
-        ? {}
-        : { acceptCloudSyncPush: options.acceptCloudSyncPush }),
+      acceptCloudSyncPush: options.acceptCloudSyncPush ?? ((scope, request, response) =>
+        brain.acceptCloudReferenceSync(scope, request, response).then(() => undefined)),
     });
     const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: options.port });
     return {
