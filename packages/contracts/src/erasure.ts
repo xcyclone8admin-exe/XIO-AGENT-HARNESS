@@ -4,6 +4,30 @@ const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const CanonicalUuid = z.uuid().refine((value) => value === value.toLowerCase(), {
   message: 'UUID must use lowercase canonical form',
 });
+export const CloudInvestSignalEnvelopeDigestVersion = 'xyra.invest.envelope.digest.v1' as const;
+export const CloudInvestSignalEnvelopeDigestAlgorithm = 'SHA-256' as const;
+export const CloudInvestSignalEnvelopeDigestInputSchema = z.strictObject({
+  protocol: z.literal('xyra.invest.signal.v1'),
+  eventId: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
+  occurredAt: z.iso.datetime({ offset: true }),
+  expiresAt: z.iso.datetime({ offset: true }),
+  algorithmId: z.string().regex(/^[a-z0-9][a-z0-9._:-]{0,63}$/),
+  signalId: CanonicalUuid,
+  symbol: z.string().regex(/^[A-Z0-9][A-Z0-9._/-]{0,31}$/),
+  side: z.enum(['buy', 'sell']),
+  quantity: z.string().regex(/^(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,12})?$/),
+  sourceId: CanonicalUuid,
+  tenantId: CanonicalUuid,
+  workspaceId: CanonicalUuid,
+  receivedAt: z.iso.datetime({ offset: true }),
+  payloadDigest: Digest,
+  verification: z.strictObject({
+    signature: z.literal('verified'),
+    keyId: CanonicalUuid,
+    signingAlg: z.enum(['ES256', 'EdDSA']),
+  }),
+});
+export type CloudInvestSignalEnvelopeDigestInput = z.infer<typeof CloudInvestSignalEnvelopeDigestInputSchema>;
 export const CloudBrainSourceVersion = z.string().regex(/^cloud-ingest-v2:sha256:[a-f0-9]{64}$/);
 const UuidList = z.array(CanonicalUuid).superRefine((values, context) => {
   if (new Set(values).size !== values.length) {
@@ -233,6 +257,19 @@ export async function cloudBrainSourceVersion(
   return `cloud-ingest-v2:sha256:${digest}`;
 }
 
+/** Shared canonical digest of the normalized, Cloud-verified Invest claim envelope. */
+export async function cloudInvestSignalEnvelopeDigest(
+  input: z.input<typeof CloudInvestSignalEnvelopeDigestInputSchema>,
+): Promise<string> {
+  const envelope = CloudInvestSignalEnvelopeDigestInputSchema.parse(input);
+  const canonical = canonicalCloudIngestionJson({
+    digestAlgorithm: CloudInvestSignalEnvelopeDigestAlgorithm,
+    digestVersion: CloudInvestSignalEnvelopeDigestVersion,
+    envelope,
+  });
+  return sha256Hex(new webCryptoRuntime.TextEncoder().encode(canonical));
+}
+
 /** Fixed cross-runtime vectors for Cloud, BRAIN, and SDK canonicalizer parity. */
 export const CLOUD_INGESTION_V2_TEST_VECTORS = Object.freeze({
   normalizedContent: 'XYRA source text\nsecond line',
@@ -248,4 +285,30 @@ export const CLOUD_INGESTION_V2_TEST_VECTORS = Object.freeze({
   referenceSetDigest: '9e040ea50d090b2830e6f3a424339e5823dfee1027a9bd2ef9ed34f31de8eb71',
   referenceStateVersion: 7,
   sourceVersion: 'cloud-ingest-v2:sha256:f15954fb1c65da5a2eff6475ffac97de6a60e2d10d6af25e2ce9ac6f98ddb111',
+});
+
+/** Fixed Cloud/Invest/sidecar parity vector for the normalized signed-signal envelope. */
+export const CLOUD_INVEST_SIGNAL_ENVELOPE_DIGEST_TEST_VECTOR = Object.freeze({
+  input: Object.freeze({
+    protocol: 'xyra.invest.signal.v1',
+    eventId: 'feed:event-1',
+    occurredAt: '2026-09-30T12:00:00.000Z',
+    expiresAt: '2026-09-30T12:05:00.000Z',
+    algorithmId: 'momentum-v1',
+    signalId: '00000000-0000-4000-8000-000000000001',
+    symbol: 'XYRA',
+    side: 'buy',
+    quantity: '2.5',
+    sourceId: '00000000-0000-4000-8000-000000000002',
+    tenantId: '00000000-0000-4000-8000-000000000003',
+    workspaceId: '00000000-0000-4000-8000-000000000004',
+    receivedAt: '2026-09-30T12:00:01.000Z',
+    payloadDigest: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    verification: Object.freeze({
+      signature: 'verified',
+      keyId: '00000000-0000-4000-8000-000000000005',
+      signingAlg: 'ES256',
+    }),
+  }),
+  digest: '07588322e8162ffcda4cb67bc807d5552f60a3d44e4a1631dd4a63b0a6558940',
 });
