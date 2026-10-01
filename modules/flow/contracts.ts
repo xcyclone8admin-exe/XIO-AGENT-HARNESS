@@ -15,6 +15,23 @@ export type CheckpointStatus = z.infer<typeof CheckpointStatus>;
 export const MissedJobPolicy = z.enum(['skip', 'run-once']);
 export type MissedJobPolicy = z.infer<typeof MissedJobPolicy>;
 
+/** Trusted server-generated context passed to a FLOW step handler; never accepted as capability input. */
+export interface StepContext {
+  readonly tenantId: string;
+  readonly workspaceId: string;
+  readonly principalId: string;
+  readonly workflowId: string;
+  readonly runId: string;
+  readonly trigger: RunTrigger;
+  readonly stepId: string;
+  readonly stepIndex: number;
+  readonly attempt: number;
+  /** Persisted host-supplied schedule time; null for manual runs. */
+  readonly scheduledFor: string | null;
+  /** Stable run/step/attempt idempotency key. */
+  readonly dispatchId: string;
+}
+
 /**
  * A single node in a workflow's step DAG: a named reference to a step handler the host registers,
  * plus the ids of steps that must succeed first. `requiresApproval` gates execution on an explicit

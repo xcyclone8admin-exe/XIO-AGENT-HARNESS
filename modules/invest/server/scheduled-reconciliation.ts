@@ -1,4 +1,5 @@
 import type { Scope } from '@xyra/db';
+import type { StepContext } from '@xyra/mod-flow/contracts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -21,20 +22,8 @@ export interface PersistedCustodyStatementInbox {
   acknowledgeProcessed(scope: Scope, statementIds: readonly string[], dispatchId: string): Promise<void>;
 }
 
-/** Read-only structural boundary matching FLOW's trusted server StepContext contract. */
-export interface TrustedFlowStepContext {
-  readonly tenantId: string;
-  readonly workspaceId: string;
-  readonly principalId: string;
-  readonly workflowId: string;
-  readonly runId: string;
-  readonly trigger: 'manual'|'schedule';
-  readonly stepId: string;
-  readonly stepIndex: number;
-  readonly attempt: number;
-  readonly scheduledFor: string|null;
-  readonly dispatchId: string;
-}
+/** FLOW's server-generated context; never construct it from renderer or workflow input. */
+export type TrustedFlowStepContext = StepContext;
 
 export interface PrivateFlowStepRegistry {
   register(name: string, handler: (input: Record<string, unknown>, context: TrustedFlowStepContext) => Promise<Record<string, unknown>>): void;

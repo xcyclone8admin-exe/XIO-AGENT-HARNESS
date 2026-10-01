@@ -1,3 +1,6 @@
+import type { StepContext } from '../contracts';
+export type { StepContext } from '../contracts';
+
 /**
  * FLOW ships no privileged step handlers. A step handler is a pure function the HOST registers;
  * FLOW's engine only ever calls whatever the host explicitly wired in. The one handler defined
@@ -10,31 +13,6 @@
  * call (e.g. a server-only method on another module) can rely on this context instead of trusting
  * anything the workflow author configured.
  */
-export interface StepContext {
-  readonly tenantId: string;
-  readonly workspaceId: string;
-  /** The principal that advanced/claimed this step (the trusted caller, e.g. a service identity). */
-  readonly principalId: string;
-  readonly workflowId: string;
-  readonly runId: string;
-  readonly trigger: 'manual' | 'schedule';
-  readonly stepId: string;
-  readonly stepIndex: number;
-  readonly attempt: number;
-  /**
-   * The run's scheduled firing time, verbatim from what the host scheduler supplied to
-   * triggerRun — never invented from createdAt. Required and validated at trigger time for
-   * `trigger: 'schedule'` runs; always `null` for `trigger: 'manual'` runs.
-   */
-  readonly scheduledFor: string | null;
-  /**
-   * Stable per-(run, step, attempt) idempotency key — `${runId}:${stepIndex}:${attempt}` — the
-   * same tuple flow_checkpoints enforces uniqueness on. It does not change across a lease recovery
-   * for the same tuple, so a downstream trusted call keyed on it stays idempotent even if the step
-   * is claimed and executed more than once due to a crashed claimant's lease expiring.
-   */
-  readonly dispatchId: string;
-}
 export type StepHandler = (input: Record<string, unknown>, context: StepContext) => Promise<Record<string, unknown>>;
 
 export class StepHandlerRegistry {

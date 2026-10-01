@@ -3,6 +3,7 @@ import { HybridClock, uuidv7 } from '@xyra/core';
 import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
 import type { LocalScopedStore, Scope, ScopedTransaction } from '@xyra/db';
 import type { Asset, LedgerApi, LedgerScope, PaperTradeLedgerApi } from '@xyra/ledger/contracts';
+import type { KillSwitchReader } from '@xyra/mod-swarm/contracts';
 import { BUILTIN_ASSETS } from '@xyra/ledger/contracts';
 import { GuardrailLimits, RiskQuote, RiskSnapshot, checkInvestOrder, notionalUnits, sizeForStopRisk } from './risk';
 import { allocateFifoTaxLots } from './tax-lots';
@@ -15,9 +16,7 @@ import { validateScheduledCustodyContext, type PersistedCustodyStatementInbox, t
 type Call = { readonly principal: Principal; readonly workspaceId: string };
 type Registrar = { register(manifest: ModuleManifest, descriptor: AnyCapability, handler: (input: unknown, call: Call) => Promise<unknown>): void };
 type QueryTx = Pick<ScopedTransaction, 'query'>;
-type KillSwitchSnapshot = { readonly engaged: boolean; readonly reason: string | null; readonly changedBy: string | null; readonly changedAt: string | null };
-/** Structural boundary equivalent to SWARM's durable server reader contract. */
-export interface KillSwitchReader { getKillSwitch(scope: Scope): Promise<KillSwitchSnapshot> }
+type KillSwitchSnapshot = Awaited<ReturnType<KillSwitchReader['getKillSwitch']>>;
 type OrderRow = {
   id: string; portfolio_id: string; instrument_id: string; symbol: string; side: 'buy'|'sell'; order_type: 'market'|'limit';
   quantity_units: string; limit_price_units: string|null; status: 'proposed'|'approved'|'submitted'|'partially_filled'|'filled'|'cancelled'|'expired';
