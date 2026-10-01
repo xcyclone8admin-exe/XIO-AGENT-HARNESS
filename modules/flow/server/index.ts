@@ -1,56 +1,46 @@
 export * from './repository';
 export * from './handlers';
+export * from './dag';
+export * from './missed-job';
 
-import type { AnyCapability, ModuleManifest, Principal } from '@xyra/contracts';
+import type { CapabilityBusLike, CapabilityCallContext, ModuleManifest, ModuleServer } from '@xyra/contracts';
+import type { LocalScopedStore } from '@xyra/db';
 import { flowCapabilities } from '../contracts';
 import { FlowRepository, type FlowActor } from './repository';
+import { StepHandlerRegistry } from './handlers';
 
-export interface FlowCall {
-  readonly principal: Pick<Principal, 'id' | 'tenantId'>;
-  readonly workspaceId: string;
-  readonly capabilityId?: string;
-  readonly input?: unknown;
-  readonly idempotencyKey?: string;
-  readonly approvalId?: string;
-}
-export interface FlowBus {
-  register(
-    manifest: ModuleManifest,
-    descriptor: AnyCapability,
-    handler: (input: unknown, call?: FlowCall) => Promise<unknown>,
-  ): void;
-}
-
-function actor(call: FlowCall | undefined): FlowActor {
-  if (!call) throw new Error('FLOW_TRUSTED_CALL_CONTEXT_REQUIRED');
+function scope(call: CapabilityCallContext): FlowActor {
   return { id: call.principal.id, tenantId: call.principal.tenantId, workspaceId: call.workspaceId };
 }
 
-export function registerFlow(bus: FlowBus, manifest: ModuleManifest, repository: FlowRepository): void {
-  bus.register(manifest, flowCapabilities.listWorkflows, async (_input, call) => repository.listWorkflows(actor(call)));
-  bus.register(manifest, flowCapabilities.createWorkflow, async (input, call) =>
-    repository.createWorkflow(actor(call), flowCapabilities.createWorkflow.input.parse(input)),
-  );
-  bus.register(manifest, flowCapabilities.trigger, async (input, call) => {
-    const request = flowCapabilities.trigger.input.parse(input);
-    return repository.triggerRun(actor(call), request.workflowId, request.trigger);
+export function registerFlow(repository: FlowRepository, bus: CapabilityBusLike, manifest: ModuleManifest): void {
+  const c = flowCapabilities;
+  bus.register(manifest, c.listWorkflows, async (_input, call) => repository.listWorkflows(scope(call)));
+  bus.register(manifest, c.createWorkflow, async (input, call) => repository.createWorkflow(scope(call), c.createWorkflow.input.parse(input)));
+  bus.register(manifest, c.trigger, async (input, call) => {
+    const request = c.trigger.input.parse(input);
+    return repository.triggerRun(scope(call), request.workflowId, request.trigger);
   });
-  bus.register(manifest, flowCapabilities.advance, async (input, call) => {
-    const request = flowCapabilities.advance.input.parse(input);
-    return repository.advanceRun(actor(call), request.runId);
+  bus.register(manifest, c.advance, async (input, call) => repository.advanceRun(scope(call), c.advance.input.parse(input).runId));
+  bus.register(manifest, c.cancel, async (input, call) => repository.cancelRun(scope(call), c.cancel.input.parse(input).runId));
+  bus.register(manifest, c.decideApproval, async (input, call) => {
+    const request = c.decideApproval.input.parse(input);
+    return repository.decideApproval(scope(call), request.runId, request.decision, request.reason);
   });
-  bus.register(manifest, flowCapabilities.cancel, async (input, call) => {
-    const request = flowCapabilities.cancel.input.parse(input);
-    return repository.cancelRun(actor(call), request.runId);
-  });
-  bus.register(manifest, flowCapabilities.listRuns, async (input, call) => {
-    const request = flowCapabilities.listRuns.input.parse(input);
-    return repository.listRuns(actor(call), request.workflowId);
-  });
+  bus.register(manifest, c.listRuns, async (input, call) => repository.listRuns(scope(call), c.listRuns.input.parse(input).workflowId));
 }
 
-export const flowModuleServer = {
-  id: 'flow',
-  capabilities: Object.values(flowCapabilities),
-  register: registerFlow,
-};
+export type ModuleServerFactory = (store: LocalScopedStore) => ModuleServer;
+
+export function createFlowServer(store: LocalScopedStore): ModuleServer {
+  const repository = new FlowRepository(store, new StepHandlerRegistry());
+  return {
+    id: 'flow',
+    capabilities: Object.values(flowCapabilities),
+    register(bus: CapabilityBusLike, manifest: ModuleManifest): void {
+      registerFlow(repository, bus, manifest);
+    },
+  };
+}
+
+export default createFlowServer;
