@@ -2,6 +2,11 @@ import { timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import {
+  CloudInvestSignalEnvelopeDigestAlgorithm,
+  CloudInvestSignalEnvelopeDigestVersion,
+  cloudInvestSignalEnvelopeDigest,
+} from '@xyra/contracts';
+import {
   assertPushResponseBoundToRequest,
   PushRequest,
   PushResponse,
@@ -43,7 +48,7 @@ const MAX_NATIVE_SYNC_BODY_BYTES = 2_100_000;
 const MAX_NATIVE_INVEST_SIGNAL_BODY_BYTES = 40_000;
 const INVEST_SIGNAL_PROTOCOL = 'xyra.invest.signal.v1';
 
-const Uuid = z.uuid();
+const Uuid = z.uuid().refine((value) => value === value.toLowerCase());
 const CloudInvestSignalEnvelope = z.strictObject({
   protocol: z.literal(INVEST_SIGNAL_PROTOCOL),
   eventId: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
@@ -54,12 +59,19 @@ const CloudInvestSignalEnvelope = z.strictObject({
   occurredAt: z.iso.datetime({ offset: true }),
   expiresAt: z.iso.datetime({ offset: true }),
   algorithmId: z.string().regex(/^[a-z0-9][a-z0-9._:-]{0,63}$/),
-  signalId: z.string().min(1).max(128),
+  signalId: Uuid,
   symbol: z.string().regex(/^[A-Z0-9][A-Z0-9._/-]{0,31}$/),
   side: z.enum(['buy', 'sell']),
   quantity: z.string().regex(/^(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,12})?$/),
   payloadDigest: z.string().regex(/^[0-9a-f]{64}$/),
-  verification: z.strictObject({ signature: z.literal('verified'), keyId: Uuid }),
+  verification: z.strictObject({
+    signature: z.literal('verified'),
+    keyId: Uuid,
+    signingAlg: z.enum(['ES256', 'EdDSA']),
+  }),
+  envelopeDigestVersion: z.literal(CloudInvestSignalEnvelopeDigestVersion),
+  envelopeDigestAlgorithm: z.literal(CloudInvestSignalEnvelopeDigestAlgorithm),
+  envelopeDigest: z.string().regex(/^[0-9a-f]{64}$/),
 });
 const CloudInvestSignalClaim = z.strictObject({
   status: z.literal('claimed'),
@@ -221,6 +233,20 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
       leaseExpiry <= now || leaseExpiry > now + 30_000 ||
       signalExpiry <= now || occurredAt > now + 300_000
     ) return c.json({ code: 'INVEST_SIGNAL_EXPIRED' }, 409);
+    const {
+      envelopeDigest,
+      envelopeDigestAlgorithm: _digestAlgorithm,
+      envelopeDigestVersion: _digestVersion,
+      ...digestInput
+    } = signal;
+    let expectedEnvelopeDigest: string;
+    try {
+      expectedEnvelopeDigest = await cloudInvestSignalEnvelopeDigest(digestInput);
+    } catch {
+      return c.json({ code: 'INVEST_SIGNAL_ENVELOPE_DIGEST_INVALID' }, 400);
+    }
+    if (expectedEnvelopeDigest !== envelopeDigest)
+      return c.json({ code: 'INVEST_SIGNAL_ENVELOPE_DIGEST_MISMATCH' }, 409);
     try {
       const result = await options.acceptCloudInvestSignal(
         { tenantId: principal.tenantId, workspaceId: signal.workspaceId },

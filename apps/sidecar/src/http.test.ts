@@ -1,6 +1,13 @@
 import { expect, test } from 'vitest';
 import { z } from 'zod';
-import { defineCapability, defineModule, Principal } from '@xyra/contracts';
+import {
+  CloudInvestSignalEnvelopeDigestAlgorithm,
+  CloudInvestSignalEnvelopeDigestVersion,
+  cloudInvestSignalEnvelopeDigest,
+  defineCapability,
+  defineModule,
+  Principal,
+} from '@xyra/contracts';
 import { CapabilityBus } from './bus';
 import { createSidecarApp } from './http';
 
@@ -207,11 +214,32 @@ test('Cloud sync result callback requires a separate native-only token and valid
   expect(recorded).toBe(1);
 });
 
-test('Cloud Invest signal handoff is native-only, scope-bound, and returns only a durable decision id', async () => {
+test('Cloud Invest signal handoff is native-only, digest-bound, and returns only a durable decision id', async () => {
   const path = '/internal/native/invest/signals/consume';
   const decisionId = '019a0000-0000-7000-8000-000000000081';
   const now = Date.now();
   const iso = (milliseconds: number) => new Date(milliseconds).toISOString();
+  const signal = {
+    protocol: 'xyra.invest.signal.v1' as const,
+    eventId: 'feed:event-1',
+    sourceId: '019a0000-0000-7000-8000-000000000083',
+    tenantId: principal.tenantId,
+    workspaceId: WORKSPACE,
+    receivedAt: iso(now),
+    occurredAt: iso(now - 1_000),
+    expiresAt: iso(now + 60_000),
+    algorithmId: 'momentum-v1',
+    signalId: '019a0000-0000-7000-8000-000000000085',
+    symbol: 'XYRA',
+    side: 'buy' as const,
+    quantity: '2.5',
+    payloadDigest: 'a'.repeat(64),
+    verification: {
+      signature: 'verified' as const,
+      keyId: '019a0000-0000-7000-8000-000000000084',
+      signingAlg: 'ES256' as const,
+    },
+  };
   const claim = {
     status: 'claimed',
     lease: {
@@ -220,24 +248,10 @@ test('Cloud Invest signal handoff is native-only, scope-bound, and returns only 
       expiresAt: iso(now + 20_000),
     },
     signal: {
-      protocol: 'xyra.invest.signal.v1',
-      eventId: 'feed:event-1',
-      sourceId: '019a0000-0000-7000-8000-000000000083',
-      tenantId: principal.tenantId,
-      workspaceId: WORKSPACE,
-      receivedAt: iso(now),
-      occurredAt: iso(now - 1_000),
-      expiresAt: iso(now + 60_000),
-      algorithmId: 'momentum-v1',
-      signalId: 'sig-1',
-      symbol: 'XYRA',
-      side: 'buy',
-      quantity: '2.5',
-      payloadDigest: 'a'.repeat(64),
-      verification: {
-        signature: 'verified',
-        keyId: '019a0000-0000-7000-8000-000000000084',
-      },
+      ...signal,
+      envelopeDigestVersion: CloudInvestSignalEnvelopeDigestVersion,
+      envelopeDigestAlgorithm: CloudInvestSignalEnvelopeDigestAlgorithm,
+      envelopeDigest: await cloudInvestSignalEnvelopeDigest(signal),
     },
   };
   let accepted = 0;
@@ -281,6 +295,16 @@ test('Cloud Invest signal handoff is native-only, scope-bound, and returns only 
   });
   expect(valid.status).toBe(200);
   expect(await valid.json()).toEqual({ decisionId });
+  expect(accepted).toBe(1);
+
+  const changedClaim = { ...claim, signal: { ...claim.signal, quantity: '3.5' } };
+  const digestMismatch = await nativeApp.request(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(changedClaim),
+  });
+  expect(digestMismatch.status).toBe(409);
+  expect(await digestMismatch.json()).toEqual({ code: 'INVEST_SIGNAL_ENVELOPE_DIGEST_MISMATCH' });
   expect(accepted).toBe(1);
 
   const badVerification = {

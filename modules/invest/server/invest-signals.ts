@@ -1,26 +1,30 @@
+import {
+  CloudInvestSignalEnvelopeDigestAlgorithm,
+  CloudInvestSignalEnvelopeDigestVersion,
+  cloudInvestSignalEnvelopeDigest,
+  type CloudInvestSignalEnvelopeDigestInput,
+} from '@xyra/contracts';
+
 export const INVEST_SIGNAL_PROTOCOL = 'xyra.invest.signal.v1' as const;
 export const INVEST_SIGNAL_CONSUME_PROTOCOL = 'xyra.invest.signal.consume.v1' as const;
+export const INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION = CloudInvestSignalEnvelopeDigestVersion;
+export const INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM = CloudInvestSignalEnvelopeDigestAlgorithm;
 
 /** Private Cloud claim envelope delivered only to the trusted sidecar host. */
-export interface VerifiedInvestSignalV1 {
-  readonly protocol: typeof INVEST_SIGNAL_PROTOCOL;
-  readonly eventId: string;
-  readonly sourceId: string;
-  readonly tenantId: string;
-  readonly workspaceId: string;
-  readonly receivedAt: string;
-  readonly occurredAt: string;
-  readonly expiresAt: string;
-  readonly algorithmId: string;
-  readonly signalId: string;
-  readonly symbol: string;
-  readonly side: 'buy' | 'sell';
-  readonly quantity: string;
-  readonly payloadDigest: string;
+export interface VerifiedInvestSignalV1 extends CloudInvestSignalEnvelopeDigestInput {
+  readonly envelopeDigestVersion: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION;
+  readonly envelopeDigestAlgorithm: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM;
+  readonly envelopeDigest: string;
   readonly verification: {
     readonly signature: 'verified';
     readonly keyId: string;
+    readonly signingAlg: 'ES256' | 'EdDSA';
   };
+}
+
+export async function investSignalEnvelopeDigest(envelope: VerifiedInvestSignalV1): Promise<string> {
+  const { envelopeDigestVersion: _version, envelopeDigestAlgorithm: _algorithm, envelopeDigest: _digest, ...normalizedFields } = envelope;
+  return cloudInvestSignalEnvelopeDigest(normalizedFields);
 }
 
 export interface InvestSignalLease {
@@ -39,6 +43,9 @@ export interface InvestSignalAckRequest {
   readonly protocol: typeof INVEST_SIGNAL_CONSUME_PROTOCOL;
   readonly eventId: string;
   readonly payloadDigest: string;
+  readonly envelopeDigestVersion: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION;
+  readonly envelopeDigestAlgorithm: typeof INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM;
+  readonly envelopeDigest: string;
   readonly leaseId: string;
   readonly decisionId: string;
   readonly idempotencyKey: string;

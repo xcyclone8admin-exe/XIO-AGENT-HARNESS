@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   CLOUD_INGESTION_V2_TEST_VECTORS as vector,
+  CLOUD_INVEST_SIGNAL_ENVELOPE_DIGEST_TEST_VECTOR as signalVector,
   CloudBrainIngestionBeginRequest,
   CloudBrainIngestionFinalizationReceipt,
   CloudBlobReferenceIssueRequest,
+  CloudInvestSignalEnvelopeDigestInputSchema,
   canonicalCloudIngestionJson,
   cloudBrainContentDigest,
   cloudBrainSourceVersion,
+  cloudInvestSignalEnvelopeDigest,
   cloudReferenceSetDigest,
   normalizeCloudBrainContent,
 } from './erasure';
@@ -33,6 +36,38 @@ describe('cloud ingestion v2 canonical contract', () => {
         referenceStateVersion: vector.referenceStateVersion,
       }),
     ).toBe(vector.sourceVersion);
+  });
+
+  it('binds the normalized Cloud Invest claim, scope, digest, and enrolled signing key', async () => {
+    const envelope = {
+      protocol: 'xyra.invest.signal.v1',
+      eventId: 'feed:event-1',
+      occurredAt: '2026-09-30T12:00:00.000Z',
+      expiresAt: '2026-09-30T12:05:00.000Z',
+      algorithmId: 'momentum-v1',
+      signalId: '00000000-0000-4000-8000-000000000001',
+      symbol: 'XYRA',
+      side: 'buy' as const,
+      quantity: '2.5',
+      sourceId: '00000000-0000-4000-8000-000000000002',
+      tenantId: '00000000-0000-4000-8000-000000000003',
+      workspaceId: '00000000-0000-4000-8000-000000000004',
+      receivedAt: '2026-09-30T12:00:01.000Z',
+      payloadDigest: 'a'.repeat(64),
+      verification: {
+        signature: 'verified' as const,
+        keyId: '00000000-0000-4000-8000-000000000005',
+        signingAlg: 'ES256' as const,
+      },
+    } as const;
+    const digest = await cloudInvestSignalEnvelopeDigest(envelope);
+    expect(digest).toBe(signalVector.digest);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(await cloudInvestSignalEnvelopeDigest({ ...envelope, quantity: '2.50' })).not.toBe(digest);
+    expect(
+      await cloudInvestSignalEnvelopeDigest({ ...envelope, verification: { ...envelope.verification, signingAlg: 'EdDSA' } }),
+    ).not.toBe(digest);
+    expect(CloudInvestSignalEnvelopeDigestInputSchema.safeParse({ ...envelope, callerClaimed: true }).success).toBe(false);
   });
 
   it('rejects uppercase UUID spellings and mixed-case duplicate aliases', () => {

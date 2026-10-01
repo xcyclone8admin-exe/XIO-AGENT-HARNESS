@@ -1,10 +1,15 @@
 import { withNeonTransaction, type NeonQueryClient } from './neon';
-import { canonicalCloudIngestionJson } from '@xyra/contracts';
+import {
+  CloudInvestSignalEnvelopeDigestAlgorithm,
+  CloudInvestSignalEnvelopeDigestVersion,
+  cloudInvestSignalEnvelopeDigest as sharedInvestSignalEnvelopeDigest,
+  type CloudInvestSignalEnvelopeDigestInput,
+} from '@xyra/contracts';
 
 export const INVEST_SIGNAL_PROTOCOL = 'xyra.invest.signal.v1';
 export const INVEST_SIGNAL_CONSUME_PROTOCOL = 'xyra.invest.signal.consume.v1';
-export const INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION = 'xyra.invest.envelope.digest.v1';
-export const INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM = 'SHA-256';
+export const INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION = CloudInvestSignalEnvelopeDigestVersion;
+export const INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM = CloudInvestSignalEnvelopeDigestAlgorithm;
 export const MAX_INVEST_SIGNAL_BODY_BYTES = 32 * 1024;
 export const INVEST_SIGNAL_LEASE_MS = 30_000;
 
@@ -58,10 +63,7 @@ export interface VerifiedInvestSignalEnvelope extends InvestSignalBody {
   readonly envelopeDigest: string;
 }
 
-export type InvestSignalEnvelopeDigestInput = Omit<
-  VerifiedInvestSignalEnvelope,
-  'envelopeDigestVersion' | 'envelopeDigestAlgorithm' | 'envelopeDigest'
->;
+export type InvestSignalEnvelopeDigestInput = CloudInvestSignalEnvelopeDigestInput;
 
 /**
  * Hashes the exact normalized claim payload, scope, receipt time, raw-body digest and
@@ -69,12 +71,7 @@ export type InvestSignalEnvelopeDigestInput = Omit<
  * of the signed request bytes; this separate digest binds the typed envelope sent to Invest.
  */
 export async function investSignalEnvelopeDigest(input: InvestSignalEnvelopeDigestInput): Promise<string> {
-  const canonical = canonicalCloudIngestionJson({
-    digestAlgorithm: INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM,
-    digestVersion: INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION,
-    envelope: input,
-  });
-  return sha256Hex(new TextEncoder().encode(canonical));
+  return sharedInvestSignalEnvelopeDigest(input);
 }
 
 export async function verifyInvestSignalEnvelopeDigest(
