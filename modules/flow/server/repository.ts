@@ -20,8 +20,8 @@ interface WorkflowRow extends Record<string, unknown> {
   missed_job_policy: string;
   enabled: boolean;
   created_by: string;
-  created_at: string;
-  updated_at: string;
+  created_at: string | Date;
+  updated_at: string | Date;
 }
 
 interface ApprovalRow extends Record<string, unknown> {
@@ -41,8 +41,8 @@ interface RunRow extends Record<string, unknown> {
   attempt: number;
   detail: unknown;
   created_by: string;
-  created_at: string;
-  ended_at: string | null;
+  created_at: string | Date;
+  ended_at: string | Date | null;
 }
 
 interface CheckpointRow extends Record<string, unknown> {
@@ -54,7 +54,20 @@ interface CheckpointRow extends Record<string, unknown> {
   attempt: number;
   output: unknown;
   error: string | null;
-  created_at: string;
+  created_at: string | Date;
+}
+
+/**
+ * PGlite (like node-postgres) returns `timestamptz` columns as JS Date objects, not strings, even
+ * though every row type here is declared as `string` for query-site convenience. Every date field
+ * leaving this module for a zod-validated boundary (a capability output, a test assertion against
+ * WorkflowDefinition/RunStatus) MUST go through this so it is never handed out as a raw Date.
+ */
+function toIso(value: string | Date): string {
+  return value instanceof Date ? value.toISOString() : value;
+}
+function toIsoNullable(value: string | Date | null): string | null {
+  return value === null ? null : toIso(value);
 }
 
 function toWorkflow(row: WorkflowRow): WorkflowDefinition {
@@ -67,8 +80,8 @@ function toWorkflow(row: WorkflowRow): WorkflowDefinition {
     missedJobPolicy: row.missed_job_policy as MissedJobPolicy,
     enabled: row.enabled,
     createdBy: row.created_by,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: toIso(row.created_at),
+    updatedAt: toIso(row.updated_at),
   };
 }
 
@@ -82,8 +95,8 @@ function toRunStatus(row: RunRow): RunStatus {
     attempt: row.attempt,
     detail: (row.detail as Record<string, unknown>) ?? {},
     createdBy: row.created_by,
-    createdAt: row.created_at,
-    endedAt: row.ended_at,
+    createdAt: toIso(row.created_at),
+    endedAt: toIsoNullable(row.ended_at),
   };
 }
 

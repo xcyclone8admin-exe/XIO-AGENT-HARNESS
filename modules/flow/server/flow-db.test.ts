@@ -4,6 +4,7 @@ import { applyPGliteMigrations, LocalScopedStore, migration, prepareLocalAppRole
 import { openLocalStore } from '@xyra/db/pglite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import manifest from '../manifest';
+import { WorkflowDefinition, RunStatus } from '../contracts';
 import { FlowRepository } from './repository';
 import { StepHandlerRegistry } from './handlers';
 
@@ -146,6 +147,17 @@ describe('FLOW durable run execution', () => {
     const workflowB = await flow.createWorkflow(actorB, { name: 'tenant-b-only', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
     expect(await flow.listWorkflows(actorB)).toHaveLength(1);
     await expect(flow.requireWorkflow(actorA, workflowB.id)).rejects.toThrow('FLOW_WORKFLOW_NOT_FOUND');
+  });
+
+  it('returns WorkflowDefinition and RunStatus that validate as the wire contract (regression: PGlite timestamptz is a Date, not a string)', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'contract-shape', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    expect(() => WorkflowDefinition.parse(workflow)).not.toThrow();
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual');
+    expect(() => RunStatus.parse(started)).not.toThrow();
+    const completed = await flow.advanceRun(actorA, started.runId);
+    expect(() => RunStatus.parse(completed)).not.toThrow();
+    const [listedRun] = await flow.listRuns(actorA, workflow.id);
+    expect(() => RunStatus.parse(listedRun)).not.toThrow();
   });
 
   it('resolves a declared step DAG into topological execution order regardless of declaration order', async () => {
