@@ -26,6 +26,13 @@ pub const NATIVE_BRIDGE_SCRIPT: &str = r#"(function () {
       }
       return internals.invoke('sidecar_endpoint');
     },
+    consumeAdvisorySignal: function () {
+      var internals = window.__TAURI_INTERNALS__;
+      if (!internals || typeof internals.invoke !== 'function') {
+        return Promise.reject(new Error('NATIVE_BRIDGE_UNAVAILABLE'));
+      }
+      return internals.invoke('cloud_invest_signal_consume');
+    },
     invoke: function (command, args) {
       if (command !== 'cloud_authenticated_request' && command !== 'cloud_blob_upload' &&
           command !== 'cloud_sync_push_to_sidecar') {
@@ -225,6 +232,8 @@ mod tests {
     fn bridge_script_never_embeds_a_session() {
         assert!(!NATIVE_BRIDGE_SCRIPT.contains("token"));
         assert!(NATIVE_BRIDGE_SCRIPT.contains("invoke('sidecar_endpoint')"));
+        assert!(NATIVE_BRIDGE_SCRIPT.contains("consumeAdvisorySignal: function ()"));
+        assert!(NATIVE_BRIDGE_SCRIPT.contains("internals.invoke('cloud_invest_signal_consume')"));
         assert!(NATIVE_BRIDGE_SCRIPT.contains("command !== 'cloud_authenticated_request'"));
         assert!(NATIVE_BRIDGE_SCRIPT.contains("command !== 'cloud_blob_upload'"));
         assert!(NATIVE_BRIDGE_SCRIPT.contains("{ request: safeRequest }"));

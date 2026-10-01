@@ -444,6 +444,7 @@ impl Supervisor {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use crate::cloud_service::SidecarTransport;
 
     fn cmd_exe() -> PathBuf {
         let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
@@ -651,7 +652,8 @@ mod tests {
             }
         };
         assert_eq!(ready.port, port);
-        let response = reqwest::blocking::Client::new()
+        let client = reqwest::blocking::Client::new();
+        let response = client
             .get(format!("http://127.0.0.1:{port}/api/v1/session"))
             .header("authorization", format!("Bearer {}", ready.token))
             .header("origin", "http://tauri.localhost")
@@ -659,6 +661,88 @@ mod tests {
             .expect("staged sidecar health request");
         let body: serde_json::Value = response.json().expect("session response JSON");
         assert_eq!(body["workspaces"].as_array().map(Vec::len), Some(2));
+
+        let callback = format!("http://127.0.0.1:{port}/internal/native/cloud-sync/push");
+        let malformed_envelope = r#"{"request":{},"response":{}}"#;
+        let forged = client
+            .post(&callback)
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", random_token())
+            .body(malformed_envelope)
+            .send()
+            .expect("forged native sync callback request");
+        assert_eq!(forged.status(), reqwest::StatusCode::FORBIDDEN);
+        let forged_body: serde_json::Value = forged.json().expect("forgery refusal JSON");
+        assert_eq!(forged_body["code"], "NATIVE_SYNC_ONLY");
+
+        let webview_origin = client
+            .post(&callback)
+            .header("origin", "http://tauri.localhost")
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", &ready.native_sync_token)
+            .body(malformed_envelope)
+            .send()
+            .expect("renderer-origin native sync callback request");
+        assert_eq!(webview_origin.status(), reqwest::StatusCode::FORBIDDEN);
+        let origin_body: serde_json::Value = webview_origin.json().expect("origin refusal JSON");
+        assert_eq!(origin_body["code"], "NATIVE_SYNC_ONLY");
+
+        let native_authenticated = client
+            .post(&callback)
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", &ready.native_sync_token)
+            .body(malformed_envelope)
+            .send()
+            .expect("authenticated native sync callback request");
+        assert_eq!(
+            native_authenticated.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let native_body: serde_json::Value = native_authenticated
+            .json()
+            .expect("strict envelope refusal JSON");
+        assert_eq!(native_body["code"], "SYNC_ACK_INVALID");
+        let native_sender = crate::cloud_service::ReqwestSidecarTransport::new().unwrap();
+        assert_eq!(
+            native_sender.record_cloud_push(
+                port,
+                &ready.native_sync_token,
+                &serde_json::json!({ "request": {}, "response": {} }),
+            ),
+            Err("CLOUD_SYNC_ACK_RECORD_FAILED".into())
+        );
+        // Exercise the real native sender against the staged sidecar's native-only Invest route.
+        // A malformed claim is rejected before principal resolution or durable decision writes.
+        let signal_callback =
+            format!("http://127.0.0.1:{port}/internal/native/invest/signals/consume");
+        let forged_signal = client
+            .post(&signal_callback)
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", random_token())
+            .body(r#"{"status":"claimed"}"#)
+            .send()
+            .expect("forged native Invest callback request");
+        assert_eq!(forged_signal.status(), reqwest::StatusCode::FORBIDDEN);
+        let forged_signal_body: serde_json::Value =
+            forged_signal.json().expect("forgery refusal JSON");
+        assert_eq!(forged_signal_body["code"], "NATIVE_SYNC_ONLY");
+
+        let renderer_signal = client
+            .post(&signal_callback)
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", &ready.native_sync_token)
+            .header("origin", "http://tauri.localhost")
+            .body(r#"{"status":"claimed"}"#)
+            .send()
+            .expect("renderer-origin native Invest callback request");
+        assert_eq!(renderer_signal.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let native_signal = native_sender.process_advisory_signal(
+            port,
+            &ready.native_sync_token,
+            &serde_json::json!({ "status": "claimed" }),
+        );
+        assert_eq!(native_signal, Err("INVEST_SIGNAL_PROCESS_FAILED".into()));
         sup.shutdown();
         let _ = std::fs::remove_dir_all(log_dir);
     }

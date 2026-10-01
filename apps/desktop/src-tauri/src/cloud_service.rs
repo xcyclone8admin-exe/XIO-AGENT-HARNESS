@@ -7,7 +7,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -31,6 +31,11 @@ const MAX_CREDENTIAL_BYTES: usize = 256 * 1024;
 const REFRESH_SKEW_MS: u64 = 60_000;
 const AUTH_TTL_MS: u64 = 10 * 60_000;
 const MAX_SYNC_PUSH_BYTES: usize = 1_000_000;
+const MAX_SIGNAL_RESPONSE_BYTES: usize = 64 * 1024;
+const SIGNAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const INVEST_SIGNAL_CONSUME_PROTOCOL: &str = "xyra.invest.signal.consume.v1";
+const INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION: &str = "xyra.invest.envelope.digest.v1";
+const INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM: &str = "SHA-256";
 
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -38,6 +43,8 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub timeout: Option<Duration>,
+    pub max_response_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +60,12 @@ pub trait HttpTransport: Send + Sync {
 
 pub trait SidecarTransport: Send + Sync {
     fn record_cloud_push(&self, port: u16, token: &str, envelope: &Value) -> Result<(), String>;
+    fn process_advisory_signal(
+        &self,
+        port: u16,
+        token: &str,
+        claim: &Value,
+    ) -> Result<String, String>;
 }
 
 pub struct ReqwestTransport {
@@ -109,6 +122,47 @@ impl SidecarTransport for ReqwestSidecarTransport {
             Err("CLOUD_SYNC_ACK_RECORD_FAILED".into())
         }
     }
+
+    fn process_advisory_signal(
+        &self,
+        port: u16,
+        token: &str,
+        claim: &Value,
+    ) -> Result<String, String> {
+        if port == 0 || token.len() != 43 || !token.bytes().all(is_base64url_byte) {
+            return Err("LOCAL_SERVICE_UNAVAILABLE".into());
+        }
+        let response = self
+            .client
+            .post(format!(
+                "http://127.0.0.1:{port}/internal/native/invest/signals/consume"
+            ))
+            .header("x-xyra-native-sync-token", token)
+            .json(claim)
+            .send()
+            .map_err(|_| "LOCAL_SERVICE_UNAVAILABLE")?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err("INVEST_SIGNAL_PROCESS_FAILED".into());
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(257)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "INVEST_SIGNAL_PROCESS_FAILED")?;
+        if bytes.len() > 256 {
+            return Err("INVEST_SIGNAL_PROCESS_FAILED".into());
+        }
+        let body: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "INVEST_SIGNAL_PROCESS_FAILED")?;
+        if !has_exact_keys(&body, &["decisionId"], &[])
+            || body["decisionId"]
+                .as_str()
+                .is_none_or(|id| !is_canonical_uuid(id))
+        {
+            return Err("INVEST_SIGNAL_PROCESS_FAILED".into());
+        }
+        Ok(body["decisionId"].as_str().unwrap().to_owned())
+    }
 }
 
 impl ReqwestTransport {
@@ -128,6 +182,9 @@ impl HttpTransport for ReqwestTransport {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| "CLOUD_HTTP_REQUEST_INVALID")?;
         let mut builder = self.client.request(method, &request.url);
+        if let Some(timeout) = request.timeout {
+            builder = builder.timeout(timeout);
+        }
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
         }
@@ -146,13 +203,17 @@ impl HttpTransport for ReqwestTransport {
                     .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
             })
             .collect();
+        let response_limit = request
+            .max_response_bytes
+            .unwrap_or(MAX_RESPONSE_BYTES)
+            .min(MAX_RESPONSE_BYTES);
         let mut body = Vec::new();
         response
             .by_ref()
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
+            .take((response_limit + 1) as u64)
             .read_to_end(&mut body)
             .map_err(|_| "CLOUD_RESPONSE_READ_FAILED")?;
-        if body.len() > MAX_RESPONSE_BYTES {
+        if body.len() > response_limit {
             return Err("CLOUD_RESPONSE_TOO_LARGE".into());
         }
         Ok(HttpResponse {
@@ -203,6 +264,18 @@ struct BlobRefResponse {
     mode: String,
     #[serde(default)]
     key: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SignalConsumeResponse {
+    pub status: SignalConsumeStatus,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SignalConsumeStatus {
+    Empty,
+    Processed,
 }
 
 pub struct CloudAuthService {
@@ -291,7 +364,30 @@ impl CloudAuthService {
         method: &str,
         path: &str,
         body: Option<&Value>,
+        headers: Vec<(String, String)>,
+    ) -> Result<HttpResponse, String> {
+        self.send_json_with_timeout(method, path, body, headers, None)
+    }
+
+    fn send_json_with_timeout(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        headers: Vec<(String, String)>,
+        timeout: Option<Duration>,
+    ) -> Result<HttpResponse, String> {
+        self.send_json_with_limits(method, path, body, headers, timeout, None)
+    }
+
+    fn send_json_with_limits(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
         mut headers: Vec<(String, String)>,
+        timeout: Option<Duration>,
+        max_response_bytes: Option<usize>,
     ) -> Result<HttpResponse, String> {
         let body = match body {
             Some(value) => serde_json::to_vec(value).map_err(|_| "CLOUD_REQUEST_ENCODE_FAILED")?,
@@ -305,6 +401,8 @@ impl CloudAuthService {
             url: self.url(path)?,
             headers,
             body,
+            timeout,
+            max_response_bytes,
         })
     }
 
@@ -325,6 +423,18 @@ impl CloudAuthService {
             .fill(&mut random)
             .map_err(|_| "CLOUD_RANDOM_UNAVAILABLE")?;
         Ok(URL_SAFE_NO_PAD.encode(random))
+    }
+
+    fn random_uuid() -> Result<String, String> {
+        let mut bytes = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| "CLOUD_RANDOM_UNAVAILABLE")?;
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Ok(format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
     }
 
     fn callback_listener() -> Result<(TcpListener, String), String> {
@@ -623,6 +733,113 @@ impl CloudAuthService {
         )
     }
 
+    /// Claims and consumes one Cloud advisory signal entirely inside the native process.
+    /// Neither the verified signal nor the Invest decision id is returned to WebView JS.
+    pub fn consume_advisory_signal(
+        &self,
+        sidecar_port: u16,
+        native_sync_token: &str,
+    ) -> Result<SignalConsumeResponse, String> {
+        self.origin()?;
+        if sidecar_port == 0
+            || native_sync_token.len() != 43
+            || !native_sync_token.bytes().all(is_base64url_byte)
+        {
+            return Err("LOCAL_SERVICE_UNAVAILABLE".into());
+        }
+        let claim_key = Self::random_uuid()?;
+        let claim_request = serde_json::json!({
+            "protocol": INVEST_SIGNAL_CONSUME_PROTOCOL,
+            "idempotencyKey": claim_key,
+        });
+        let claim_response = self.signal_request("/v1/invest/signals/claim", &claim_request)?;
+        let claim = parse_signal_claim(&claim_response.body)?;
+        if claim["status"] == "empty" {
+            return Ok(SignalConsumeResponse {
+                status: SignalConsumeStatus::Empty,
+            });
+        }
+
+        let event_id = claim["signal"]["eventId"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let payload_digest = claim["signal"]["payloadDigest"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let envelope_digest_version = claim["signal"]["envelopeDigestVersion"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let envelope_digest_algorithm = claim["signal"]["envelopeDigestAlgorithm"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let envelope_digest = claim["signal"]["envelopeDigest"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let lease_id = claim["lease"]["leaseId"]
+            .as_str()
+            .ok_or("CLOUD_SIGNAL_RESPONSE_INVALID")?
+            .to_owned();
+        let decision_id = self.sidecar_transport.process_advisory_signal(
+            sidecar_port,
+            native_sync_token,
+            &claim,
+        )?;
+        let ack_request = serde_json::json!({
+            "protocol": INVEST_SIGNAL_CONSUME_PROTOCOL,
+            "eventId": event_id,
+            "payloadDigest": payload_digest,
+            "envelopeDigestVersion": envelope_digest_version,
+            "envelopeDigestAlgorithm": envelope_digest_algorithm,
+            "envelopeDigest": envelope_digest,
+            "leaseId": lease_id,
+            "decisionId": decision_id,
+            "idempotencyKey": claim_key,
+        });
+        let ack_response = self.signal_request("/v1/invest/signals/ack", &ack_request)?;
+        validate_signal_ack(&ack_response.body, &ack_request)?;
+        Ok(SignalConsumeResponse {
+            status: SignalConsumeStatus::Processed,
+        })
+    }
+
+    fn signal_request(&self, path: &str, body: &Value) -> Result<HttpResponse, String> {
+        let allowed = matches!(path, "/v1/invest/signals/claim" | "/v1/invest/signals/ack");
+        if !allowed {
+            return Err("CLOUD_ROUTE_NOT_ALLOWED".into());
+        }
+        let session = self.ensure_session()?;
+        let url = self.url(path)?;
+        let proof = self.device_key.dpop_proof(
+            "POST",
+            &url,
+            Some(&session.access_token),
+            Self::now_seconds()?,
+        )?;
+        let response = self.send_json_with_limits(
+            "POST",
+            path,
+            Some(body),
+            vec![
+                (
+                    "authorization".into(),
+                    format!("Bearer {}", session.access_token),
+                ),
+                ("dpop".into(), proof),
+            ],
+            Some(SIGNAL_REQUEST_TIMEOUT),
+            Some(MAX_SIGNAL_RESPONSE_BYTES),
+        )?;
+        if response.status != 200 {
+            return Err(format!("CLOUD_HTTP_STATUS_{}", response.status));
+        }
+        Ok(response)
+    }
+
     fn perform_authenticated_request(
         &self,
         request: AuthenticatedRequest,
@@ -701,6 +918,8 @@ impl CloudAuthService {
             url: upload_url,
             headers: vec![("content-length".into(), request.bytes.len().to_string())],
             body: request.bytes,
+            timeout: None,
+            max_response_bytes: None,
         })?;
         let _internal_key = reference.key;
         if !(200..300).contains(&uploaded.status) {
@@ -1078,6 +1297,183 @@ fn is_canonical_uuid(value: &str) -> bool {
         && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
 }
 
+fn parse_signal_claim(bytes: &[u8]) -> Result<Value, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| "CLOUD_SIGNAL_RESPONSE_INVALID")?;
+    if has_exact_keys(&value, &["status"], &[]) && value["status"] == "empty" {
+        return Ok(value);
+    }
+    if !has_exact_keys(&value, &["status", "lease", "signal"], &[])
+        || value["status"] != "claimed"
+        || !has_exact_keys(&value["lease"], &["leaseId", "fence", "expiresAt"], &[])
+        || !has_exact_keys(
+            &value["signal"],
+            &[
+                "protocol",
+                "eventId",
+                "occurredAt",
+                "expiresAt",
+                "algorithmId",
+                "signalId",
+                "symbol",
+                "side",
+                "quantity",
+                "sourceId",
+                "tenantId",
+                "workspaceId",
+                "receivedAt",
+                "payloadDigest",
+                "envelopeDigestVersion",
+                "envelopeDigestAlgorithm",
+                "envelopeDigest",
+                "verification",
+            ],
+            &[],
+        )
+        || !has_exact_keys(
+            &value["signal"]["verification"],
+            &["signature", "keyId", "signingAlg"],
+            &[],
+        )
+    {
+        return Err("CLOUD_SIGNAL_RESPONSE_INVALID".into());
+    }
+    let lease = &value["lease"];
+    let signal = &value["signal"];
+    fn string<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+        v.get(key).and_then(Value::as_str)
+    }
+    let event_id = string(signal, "eventId").unwrap_or_default();
+    let digest = string(signal, "payloadDigest").unwrap_or_default();
+    let algorithm = string(signal, "algorithmId").unwrap_or_default();
+    let symbol = string(signal, "symbol").unwrap_or_default();
+    let quantity = string(signal, "quantity").unwrap_or_default();
+    let valid_id = |v: &str| {
+        (1..=128).contains(&v.len())
+            && v.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'))
+    };
+    if string(lease, "leaseId").is_none_or(|v| !is_canonical_uuid(v))
+        || lease["fence"].as_u64().is_none_or(|v| v == 0)
+        || string(lease, "expiresAt").is_none_or(|v| !is_iso_utc_timestamp(v))
+        || signal["protocol"] != "xyra.invest.signal.v1"
+        || !valid_id(event_id)
+        || !is_canonical_uuid(string(signal, "signalId").unwrap_or_default())
+        || !is_canonical_uuid(string(signal, "sourceId").unwrap_or_default())
+        || !is_canonical_uuid(string(signal, "tenantId").unwrap_or_default())
+        || !is_canonical_uuid(string(signal, "workspaceId").unwrap_or_default())
+        || !is_canonical_uuid(string(&signal["verification"], "keyId").unwrap_or_default())
+        || signal["verification"]["signature"] != "verified"
+        || !matches!(
+            signal["verification"]["signingAlg"].as_str(),
+            Some("ES256" | "EdDSA")
+        )
+        || signal["envelopeDigestVersion"] != INVEST_SIGNAL_ENVELOPE_DIGEST_VERSION
+        || signal["envelopeDigestAlgorithm"] != INVEST_SIGNAL_ENVELOPE_DIGEST_ALGORITHM
+        || !string(signal, "envelopeDigest").is_some_and(is_sha256_hex)
+        || !is_iso_utc_timestamp(string(signal, "occurredAt").unwrap_or_default())
+        || !is_iso_utc_timestamp(string(signal, "expiresAt").unwrap_or_default())
+        || !is_iso_utc_timestamp(string(signal, "receivedAt").unwrap_or_default())
+        || !(1..=64).contains(&algorithm.len())
+        || !algorithm.bytes().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b':' | b'-')
+        })
+        || !(1..=32).contains(&symbol.len())
+        || !symbol.as_bytes()[0].is_ascii_uppercase() && !symbol.as_bytes()[0].is_ascii_digit()
+        || !symbol.bytes().all(|c| {
+            c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'/' | b'-')
+        })
+        || !matches!(string(signal, "side"), Some("buy" | "sell"))
+        || !is_positive_signal_quantity(quantity)
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err("CLOUD_SIGNAL_RESPONSE_INVALID".into());
+    }
+    Ok(value)
+}
+
+fn is_positive_signal_quantity(value: &str) -> bool {
+    let (whole, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(whole, fraction)| (whole, Some(fraction)));
+    if !(1..=18).contains(&whole.len())
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || (whole.len() > 1 && whole.starts_with('0'))
+        || fraction.is_some_and(|part| {
+            !(1..=12).contains(&part.len()) || !part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+    whole.bytes().any(|byte| byte != b'0')
+        || fraction.is_some_and(|part| part.bytes().any(|byte| byte != b'0'))
+}
+
+fn validate_signal_ack(bytes: &[u8], request: &Value) -> Result<(), String> {
+    let response: Value = serde_json::from_slice(bytes).map_err(|_| "CLOUD_SIGNAL_ACK_INVALID")?;
+    if has_exact_keys(
+        &response,
+        &[
+            "status",
+            "eventId",
+            "payloadDigest",
+            "envelopeDigestVersion",
+            "envelopeDigestAlgorithm",
+            "envelopeDigest",
+            "decisionId",
+            "acknowledgedAt",
+            "replayed",
+        ],
+        &[],
+    ) && response["status"] == "acked"
+        && response["eventId"] == request["eventId"]
+        && response["payloadDigest"] == request["payloadDigest"]
+        && response["envelopeDigestVersion"] == request["envelopeDigestVersion"]
+        && response["envelopeDigestAlgorithm"] == request["envelopeDigestAlgorithm"]
+        && response["envelopeDigest"] == request["envelopeDigest"]
+        && response["decisionId"] == request["decisionId"]
+        && response["decisionId"]
+            .as_str()
+            .is_some_and(is_canonical_uuid)
+        && response["acknowledgedAt"]
+            .as_str()
+            .is_some_and(is_iso_utc_timestamp)
+        && response["replayed"].is_boolean()
+    {
+        Ok(())
+    } else {
+        Err("CLOUD_SIGNAL_ACK_INVALID".into())
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_iso_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (value.len() == 20
+        || (value.len() >= 22
+            && value.len() <= 30
+            && bytes.get(19) == Some(&b'.')
+            && bytes[value.len() - 1] == b'Z'))
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b'T')
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
+        && bytes.last() == Some(&b'Z')
+        && bytes.iter().enumerate().all(|(i, b)| {
+            [4, 7, 10, 13, 16, 19].contains(&i) || (i == value.len() - 1) || b.is_ascii_digit()
+        })
+}
+
 fn jwt_claim_string(token: &str, claim: &str) -> Option<String> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
@@ -1196,6 +1592,19 @@ mod tests {
                 .push((port, token.into(), envelope.clone()));
             Ok(())
         }
+
+        fn process_advisory_signal(
+            &self,
+            port: u16,
+            token: &str,
+            claim: &Value,
+        ) -> Result<String, String> {
+            self.records
+                .lock()
+                .unwrap()
+                .push((port, token.into(), claim.clone()));
+            Ok("018f47a1-7b2c-7d0a-8d11-123456789abc".into())
+        }
     }
 
     fn response(status: u16, body: Value) -> HttpResponse {
@@ -1254,6 +1663,42 @@ mod tests {
         })
     }
 
+    fn signal_claim_response() -> Value {
+        serde_json::json!({
+            "status":"claimed",
+            "lease":{"leaseId":"018f47a1-7b2c-7d0a-8d11-123456789abe","fence":2,"expiresAt":"2099-01-01T00:00:30Z"},
+            "signal":{
+                "protocol":"xyra.invest.signal.v1","eventId":"event-1","occurredAt":"2026-01-01T00:00:00Z","expiresAt":"2099-01-01T00:00:00Z",
+                "algorithmId":"strategy.alpha","signalId":"018f47a1-7b2c-7d0a-8d11-123456789abd","symbol":"ACME","side":"buy","quantity":"1.25",
+                "sourceId":"018f47a1-7b2c-7d0a-8d11-123456789aba","tenantId":"018f47a1-7b2c-7d0a-8d11-123456789abb","workspaceId":"018f47a1-7b2c-7d0a-8d11-123456789abc",
+                "receivedAt":"2026-01-01T00:00:01Z","payloadDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "envelopeDigestVersion":"xyra.invest.envelope.digest.v1","envelopeDigestAlgorithm":"SHA-256",
+                "envelopeDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "verification":{"signature":"verified","keyId":"018f47a1-7b2c-7d0a-8d11-123456789ac0","signingAlg":"ES256"}
+            }
+        })
+    }
+
+    fn authenticated_signal_service(
+        fake: Arc<FakeTransport>,
+        sidecar: Arc<FakeSidecarTransport>,
+    ) -> CloudAuthService {
+        let store = Arc::new(MemoryStore::default());
+        let client =
+            CloudAuthService::build(Some("https://cloud.test".into()), fake, sidecar, store)
+                .unwrap();
+        client
+            .device_key
+            .store_session(&SessionTokens {
+                access_token: "signal-access".into(),
+                refresh_token: "signal-refresh".into(),
+                expires_at_ms: u64::MAX,
+                sid: Some("signal-session".into()),
+            })
+            .unwrap();
+        client
+    }
+
     fn service(transport: Arc<FakeTransport>, store: Arc<MemoryStore>) -> CloudAuthService {
         CloudAuthService::for_test(
             Some("https://cloud.test".into()),
@@ -1262,6 +1707,224 @@ mod tests {
             store,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn advisory_signal_empty_claim_is_private_and_uses_fixed_dpop_route() {
+        let fake = Arc::new(FakeTransport::with_responses(vec![response(
+            200,
+            serde_json::json!({"status":"empty"}),
+        )]));
+        let sidecar = Arc::new(FakeSidecarTransport::default());
+        let client = authenticated_signal_service(fake.clone(), sidecar.clone());
+        let result = client
+            .consume_advisory_signal(43123, &"A".repeat(43))
+            .unwrap();
+        assert_eq!(
+            result,
+            SignalConsumeResponse {
+                status: SignalConsumeStatus::Empty
+            }
+        );
+        assert!(sidecar.records.lock().unwrap().is_empty());
+        let requests = fake.take_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(
+            requests[0].url,
+            "https://cloud.test/v1/invest/signals/claim"
+        );
+        assert_eq!(requests[0].timeout, Some(SIGNAL_REQUEST_TIMEOUT));
+        assert!(requests[0]
+            .headers
+            .iter()
+            .any(|(n, v)| n == "authorization" && v == "Bearer signal-access"));
+        let proof = requests[0]
+            .headers
+            .iter()
+            .find(|(n, _)| n == "dpop")
+            .unwrap()
+            .1
+            .split('.')
+            .nth(1)
+            .unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(proof).unwrap()).unwrap();
+        assert_eq!(claims["htu"], "https://cloud.test/v1/invest/signals/claim");
+        assert_eq!(claims["htm"], "POST");
+        assert_eq!(
+            claims["ath"],
+            URL_SAFE_NO_PAD.encode(digest(&SHA256, b"signal-access").as_ref())
+        );
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["protocol"], INVEST_SIGNAL_CONSUME_PROTOCOL);
+        assert!(is_canonical_uuid(body["idempotencyKey"].as_str().unwrap()));
+        assert!(fake.take_requests().is_empty());
+    }
+
+    #[test]
+    fn advisory_signal_processes_natively_then_acks_exact_claim_binding() {
+        let claim = signal_claim_response();
+        let ack = serde_json::json!({
+            "status":"acked","eventId":"event-1","payloadDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "envelopeDigestVersion":"xyra.invest.envelope.digest.v1","envelopeDigestAlgorithm":"SHA-256",
+            "envelopeDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "decisionId":"018f47a1-7b2c-7d0a-8d11-123456789abc","acknowledgedAt":"2026-09-30T00:00:00Z","replayed":false
+        });
+        let fake = Arc::new(FakeTransport::with_responses(vec![
+            response(200, claim.clone()),
+            response(200, ack),
+        ]));
+        let sidecar = Arc::new(FakeSidecarTransport::default());
+        let client = authenticated_signal_service(fake.clone(), sidecar.clone());
+        let result = client
+            .consume_advisory_signal(43123, &"B".repeat(43))
+            .unwrap();
+        assert_eq!(
+            result,
+            SignalConsumeResponse {
+                status: SignalConsumeStatus::Processed
+            }
+        );
+        let records = sidecar.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, 43123);
+        assert_eq!(records[0].1, "B".repeat(43));
+        assert_eq!(records[0].2, claim);
+        drop(records);
+        let requests = fake.take_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].url,
+            "https://cloud.test/v1/invest/signals/claim"
+        );
+        assert_eq!(requests[1].url, "https://cloud.test/v1/invest/signals/ack");
+        let claim_body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let ack_body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(ack_body["eventId"], "event-1");
+        assert_eq!(ack_body["payloadDigest"], claim["signal"]["payloadDigest"]);
+        assert_eq!(
+            ack_body["envelopeDigestVersion"],
+            claim["signal"]["envelopeDigestVersion"]
+        );
+        assert_eq!(
+            ack_body["envelopeDigestAlgorithm"],
+            claim["signal"]["envelopeDigestAlgorithm"]
+        );
+        assert_eq!(
+            ack_body["envelopeDigest"],
+            claim["signal"]["envelopeDigest"]
+        );
+        assert_eq!(ack_body["leaseId"], claim["lease"]["leaseId"]);
+        assert_eq!(ack_body["idempotencyKey"], claim_body["idempotencyKey"]);
+        assert_eq!(
+            ack_body["decisionId"],
+            "018f47a1-7b2c-7d0a-8d11-123456789abc"
+        );
+        assert_eq!(requests[0].timeout, Some(SIGNAL_REQUEST_TIMEOUT));
+        assert_eq!(requests[1].timeout, Some(SIGNAL_REQUEST_TIMEOUT));
+    }
+
+    #[test]
+    fn advisory_signal_rejects_invalid_claim_before_sidecar_and_ack_mismatch() {
+        let bad_claim =
+            serde_json::json!({"status":"claimed","lease":{},"signal":{},"private":"unexpected"});
+        let sidecar = Arc::new(FakeSidecarTransport::default());
+        let client = authenticated_signal_service(
+            Arc::new(FakeTransport::with_responses(vec![response(
+                200, bad_claim,
+            )])),
+            sidecar.clone(),
+        );
+        assert_eq!(
+            client
+                .consume_advisory_signal(43123, &"C".repeat(43))
+                .unwrap_err(),
+            "CLOUD_SIGNAL_RESPONSE_INVALID"
+        );
+        assert!(sidecar.records.lock().unwrap().is_empty());
+
+        let claim = signal_claim_response();
+        let mut mismatched_ack = serde_json::json!({
+            "status":"acked","eventId":"other-event","payloadDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "envelopeDigestVersion":"xyra.invest.envelope.digest.v1","envelopeDigestAlgorithm":"SHA-256",
+            "envelopeDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "decisionId":"018f47a1-7b2c-7d0a-8d11-123456789abc","acknowledgedAt":"2026-09-30T00:00:00Z","replayed":false
+        });
+        let client = authenticated_signal_service(
+            Arc::new(FakeTransport::with_responses(vec![
+                response(200, claim),
+                response(200, mismatched_ack.clone()),
+            ])),
+            Arc::new(FakeSidecarTransport::default()),
+        );
+        mismatched_ack["eventId"] = Value::String("other-event".into());
+        assert_eq!(
+            client
+                .consume_advisory_signal(43123, &"D".repeat(43))
+                .unwrap_err(),
+            "CLOUD_SIGNAL_ACK_INVALID"
+        );
+    }
+
+    #[test]
+    fn advisory_signal_claim_requires_and_preserves_envelope_digest_metadata() {
+        let claim = signal_claim_response();
+        let encoded = serde_json::to_vec(&claim).unwrap();
+        assert_eq!(parse_signal_claim(&encoded).unwrap(), claim);
+
+        for (field, bad_value) in [
+            (
+                "envelopeDigestVersion",
+                Value::String("wrong-version".into()),
+            ),
+            ("envelopeDigestAlgorithm", Value::String("SHA1".into())),
+            ("envelopeDigest", Value::String("not-lowercase-hex".into())),
+        ] {
+            let mut mutated = claim.clone();
+            mutated["signal"][field] = bad_value;
+            assert_eq!(
+                parse_signal_claim(&serde_json::to_vec(&mutated).unwrap()).unwrap_err(),
+                "CLOUD_SIGNAL_RESPONSE_INVALID"
+            );
+        }
+        for bad_alg in ["none", "ES384"] {
+            let mut mutated = claim.clone();
+            mutated["signal"]["verification"]["signingAlg"] = Value::String(bad_alg.into());
+            assert_eq!(
+                parse_signal_claim(&serde_json::to_vec(&mutated).unwrap()).unwrap_err(),
+                "CLOUD_SIGNAL_RESPONSE_INVALID"
+            );
+        }
+        let mut missing = claim;
+        missing["signal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("envelopeDigest");
+        assert_eq!(
+            parse_signal_claim(&serde_json::to_vec(&missing).unwrap()).unwrap_err(),
+            "CLOUD_SIGNAL_RESPONSE_INVALID"
+        );
+    }
+
+    #[test]
+    fn advisory_signal_is_fail_closed_without_origin() {
+        let store = Arc::new(MemoryStore::default());
+        let fake = Arc::new(FakeTransport::default());
+        let client = CloudAuthService::build(
+            None,
+            fake.clone(),
+            Arc::new(FakeSidecarTransport::default()),
+            store,
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .consume_advisory_signal(43123, &"E".repeat(43))
+                .unwrap_err(),
+            "CLOUD_ORIGIN_NOT_CONFIGURED"
+        );
+        assert!(fake.take_requests().is_empty());
     }
 
     #[test]
@@ -1320,6 +1983,55 @@ mod tests {
                 .unwrap()
                 .to_ascii_lowercase()
         ));
+    }
+
+    #[test]
+    fn advisory_signal_sidecar_sender_uses_fixed_path_and_returns_only_decision_uuid() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..split]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= split + 4 + length {
+                    break;
+                }
+            }
+            let body = r#"{"decisionId":"018f47a1-7b2c-7d0a-8d11-123456789abc"}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let claim = signal_claim_response();
+        let decision_id = ReqwestSidecarTransport::new()
+            .unwrap()
+            .process_advisory_signal(port, &"f".repeat(43), &claim)
+            .unwrap();
+        assert_eq!(decision_id, "018f47a1-7b2c-7d0a-8d11-123456789abc");
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("post /internal/native/invest/signals/consume http/1.1\r\n"));
+        assert!(request.contains(&("x-xyra-native-sync-token: ".to_owned() + &"f".repeat(43))));
+        assert!(request.contains(&serde_json::to_string(&claim).unwrap().to_ascii_lowercase()));
+        assert!(!request.contains("authorization:"));
+        assert!(!request.contains("origin:"));
     }
 
     #[test]

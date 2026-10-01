@@ -54,6 +54,7 @@ pub fn run() {
             cloud_auth::cloud_authenticated_request,
             cloud_auth::cloud_blob_upload,
             cloud_auth::cloud_sync_push_to_sidecar,
+            cloud_auth::cloud_invest_signal_consume,
             updater::update_status,
         ])
         .setup(move |app| {

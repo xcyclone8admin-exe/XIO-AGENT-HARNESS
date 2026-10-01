@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
 
+use crate::cloud_service::SignalConsumeResponse;
 use crate::commands::AppState;
 
 /// These slots are deliberately unset until the execution lead approves an account-level
@@ -212,6 +213,21 @@ pub async fn cloud_sync_push_to_sidecar(
     })
     .await
     .map_err(|_| "CLOUD_AUTH_WORKER_FAILED".to_string())?
+}
+
+/// Delivers advisory signals through a native-only Cloud → sidecar → Cloud flow.
+/// No event, scope, decision, or Cloud response is accepted from or returned to WebView.
+#[tauri::command]
+pub async fn cloud_invest_signal_consume(
+    state: State<'_, AppState>,
+) -> Result<SignalConsumeResponse, String> {
+    let service = Arc::clone(&state.cloud_auth);
+    let supervisor = Arc::clone(&state.supervisor);
+    let port = supervisor.port();
+    let token = supervisor.native_sync_token().to_owned();
+    tauri::async_runtime::spawn_blocking(move || service.consume_advisory_signal(port, &token))
+        .await
+        .map_err(|_| "CLOUD_AUTH_WORKER_FAILED".to_string())?
 }
 
 pub(crate) fn validate_blob_upload(request: &BlobUploadRequest) -> Result<(), String> {
