@@ -24,7 +24,6 @@ import {
   decideDelegation,
   regressionReasons,
   parseReviewResultDraft,
-  ReviewResultDraft,
   resolveRuntimeConfiguration,
   type AgentProfile as AgentProfileType,
   type AgentRunInput,

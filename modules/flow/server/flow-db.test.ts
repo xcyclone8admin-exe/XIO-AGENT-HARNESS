@@ -301,6 +301,19 @@ describe('FLOW durable run execution', () => {
     expect(started.detail).toMatchObject({ scheduledFor });
     expect(started.detail.scheduledFor).not.toBe(started.createdAt);
   });
+
+  it('refuses a scheduled trigger with no scheduledFor, and with a malformed one', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'scheduled-fail-closed', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    await expect(flow.triggerRun(actorA, workflow.id, 'schedule')).rejects.toThrow('FLOW_SCHEDULED_RUN_REQUIRES_SCHEDULED_FOR');
+    await expect(flow.triggerRun(actorA, workflow.id, 'schedule', { scheduledFor: 'not-a-date' })).rejects.toThrow('FLOW_SCHEDULED_RUN_REQUIRES_SCHEDULED_FOR');
+    await expect(flow.triggerRun(actorA, workflow.id, 'schedule', { scheduledFor: '2026-03-01' })).rejects.toThrow('FLOW_SCHEDULED_RUN_REQUIRES_SCHEDULED_FOR');
+  });
+
+  it('never requires or persists scheduledFor for a manual trigger, even if one is passed', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'manual-ignores-scheduled-for', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 1 });
+    const started = await flow.triggerRun(actorA, workflow.id, 'manual', { scheduledFor: '2026-03-01T09:00:00.000Z' });
+    expect(started.detail.scheduledFor).toBeUndefined();
+  });
 });
 
 describe('FLOW concurrent step claims', () => {
@@ -390,6 +403,18 @@ describe('FLOW concurrent step claims', () => {
     const started = await flow.triggerRun(actorA, workflow.id, 'manual');
     await flow.cancelRun(actorA, started.runId);
     await expect(flow.claimStep(actorA, started.runId)).rejects.toThrow('FLOW_RUN_NOT_RUNNING');
+  });
+
+  it('carries the run\'s persisted scheduledFor into a scheduled claim\'s context, and null for a manual one', async () => {
+    const workflow = await flow.createWorkflow(actorA, { name: 'claim-schedule-context', steps: [{ id: 'only', handler: 'noop', input: {} }], maxAttempts: 3, maxConcurrentRuns: 2 });
+    const scheduledFor = '2026-03-01T09:00:00.000Z';
+    const scheduledRun = await flow.triggerRun(actorA, workflow.id, 'schedule', { scheduledFor });
+    const scheduledClaim = await flow.claimStep(actorA, scheduledRun.runId);
+    expect(scheduledClaim.context.scheduledFor).toBe(scheduledFor);
+
+    const manualRun = await flow.triggerRun(actorA, workflow.id, 'manual');
+    const manualClaim = await flow.claimStep(actorA, manualRun.runId);
+    expect(manualClaim.context.scheduledFor).toBeNull();
   });
 });
 
