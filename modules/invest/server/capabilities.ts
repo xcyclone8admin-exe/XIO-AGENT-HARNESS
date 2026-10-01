@@ -53,6 +53,8 @@ export const investCapabilities = {
       positions: z.array(z.object({ symbol: z.string().trim().toUpperCase().min(1).max(32), units: Units.refine((value) => BigInt(value) >= 0n) })).max(500) }).strict()
       .superRefine((value, ctx) => { if (new Set(value.positions.map((position) => position.symbol)).size !== value.positions.length) ctx.addIssue({ code: 'custom', path: ['positions'], message: 'Statement must contain at most one row per instrument symbol' }); }),
     output: z.object({ runId: Uuid, status: z.enum(['matched','needs_review']), discrepancyCount: z.number().int().min(0), idempotent: z.boolean() }) }),
+  reconciliationQueue: defineCapability({ id: 'invest.reconciliation.queue', title: 'PAPER reconciliation queue', description: 'List immutable statement discrepancies and their assigned owner', kind: 'read', permission: 'invest:breach:manage', input: Empty,
+    output: z.array(z.object({ id: Uuid, run_id: Uuid, portfolio_id: Uuid, source_name: z.string(), source_ref: z.string(), statement_date: z.string(), discrepancy_key: z.string(), kind: z.enum(['cash_mismatch','position_mismatch','unknown_position']), expected_units: Units, observed_units: Units, difference_units: Units, owner_id: Uuid, created_at: z.string() })) }),
   instruments: defineCapability({ id: 'invest.instruments.list', title: 'Instruments', description: 'List active investment instruments',
     kind: 'read', permission: 'invest:market:read', input: Empty, output: z.array(InstrumentView) }),
   orders: defineCapability({ id: 'invest.orders.list', title: 'Paper orders', description: 'List PAPER orders and their fills',

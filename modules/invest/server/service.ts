@@ -41,6 +41,7 @@ export class InvestService {
     reg(investCapabilities.breaches, (_input, call) => this.breaches(this.scope(call)));
     reg(investCapabilities.manageBreach, (input, call) => this.manageBreach(this.scope(call), call, input as { breachId: string; action: 'assign'|'acknowledge'|'resolve'; reason: string }));
     reg(investCapabilities.reconcileStatement, (input, call) => this.reconcileStatement(this.scope(call), call, input as { portfolioId:string;sourceName:string;sourceRef:string;statementDate:string;statementHash:string;cashUnits:string;positions:Array<{symbol:string;units:string}> }));
+    reg(investCapabilities.reconciliationQueue, (_input, call) => this.reconciliationQueue(this.scope(call)));
     reg(investCapabilities.instruments, (_input, call) => this.instruments(this.scope(call)));
     reg(investCapabilities.orders, (input, call) => this.orders(this.scope(call), input as { portfolioId?: string }));
     reg(investCapabilities.taxLots, (input, call) => this.taxLots(this.scope(call), input as { portfolioId: string }));
@@ -224,6 +225,15 @@ export class InvestService {
       }
     });
     return { runId, status, discrepancyCount:mismatches.length, idempotent:false };
+  }
+
+  async reconciliationQueue(scope: InvestScope): Promise<Array<{id:string;run_id:string;portfolio_id:string;source_name:string;source_ref:string;statement_date:string;discrepancy_key:string;kind:'cash_mismatch'|'position_mismatch'|'unknown_position';expected_units:string;observed_units:string;difference_units:string;owner_id:string;created_at:string}>> {
+    return (await this.scoped.query<{id:string;run_id:string;portfolio_id:string;source_name:string;source_ref:string;statement_date:string;discrepancy_key:string;kind:'cash_mismatch'|'position_mismatch'|'unknown_position';expected_units:string;observed_units:string;difference_units:string;owner_id:string;created_at:string}>(scope,`SELECT d.id,d.run_id,r.portfolio_id,r.source_name,r.source_ref,r.statement_date::text,d.discrepancy_key,d.kind,
+        d.expected_units::text,d.observed_units::text,d.difference_units::text,d.owner_id,d.created_at::text
+      FROM invest_reconciliation_discrepancies d
+      JOIN invest_reconciliation_runs r ON r.tenant_id=d.tenant_id AND r.workspace_id=d.workspace_id AND r.id=d.run_id
+      WHERE d.tenant_id=$1 AND d.workspace_id=$2
+      ORDER BY d.created_at DESC,d.id`,[scope.tenantId,scope.workspaceId])).rows;
   }
 
   async instruments(scope: InvestScope): Promise<Array<{id:string;symbol:string;asset_class:string;quantity_scale:number;exchange_code:string|null}>> {

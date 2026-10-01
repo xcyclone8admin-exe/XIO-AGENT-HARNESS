@@ -175,6 +175,10 @@ test('trusted service creates, risk-sizes, approves and atomically fills a PAPER
   expect(mismatched).toMatchObject({status:'needs_review',discrepancyCount:2});
   const diffs = await db.query<{kind:string;expected_units:string;observed_units:string;owner_id:string}>(`SELECT kind,expected_units::text,observed_units::text,owner_id FROM invest_reconciliation_discrepancies WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 ORDER BY kind`, [tenantId,workspaceId,mismatched.runId]);
   expect(diffs.rows).toEqual([{kind:'cash_mismatch',expected_units:'100000',observed_units:'99000',owner_id:userId},{kind:'unknown_position',expected_units:'0',observed_units:'20',owner_id:userId}]);
+  await expect(service.reconciliationQueue(scope)).resolves.toEqual(expect.arrayContaining([
+    expect.objectContaining({run_id:mismatched.runId,kind:'cash_mismatch',expected_units:'100000',observed_units:'99000',difference_units:'-1000',owner_id:userId}),
+    expect.objectContaining({run_id:mismatched.runId,kind:'unknown_position',expected_units:'0',observed_units:'20',difference_units:'20',owner_id:userId}),
+  ]));
   await db.query(`UPDATE invest_portfolio_risk_state SET risk_date=risk_date-1,kill_switch=true,kill_reason='prior day halt'
     WHERE tenant_id=$1 AND workspace_id=$2 AND portfolio_id=$3 AND risk_date=invest_utc_risk_date()`,[tenantId,workspaceId,portfolio.id]);
   await service.fundPortfolio(scope,userId,{portfolioId:portfolio.id,units:'1000',reference:'post-midnight PAPER capital contribution'});
