@@ -720,4 +720,17 @@ describe('in-process agent runner seam', () => {
     expect(runner.activeRunIds).toEqual([]);
     expect(runner.cancel(IDS.run)).toBe(false);
   });
+
+  it('prepares runs only from host-resolved scope, profile, route and spawn contract', async () => {
+    const runner = new AgentRunner({ router: routerWith([provider('primary', async () => response())]), capabilities: [], capabilityCaller: { call: async () => [] } });
+    const input = runInput();
+    const prepared = runner.prepare({ ...input, verifiedApproval: null });
+    expect(prepared.authority).toMatchObject({ principalId: IDS.agent, tenantId: IDS.tenant, workspaceId: IDS.workspace, verifiedApproval: null });
+    await expect(runner.runPrepared(prepared)).resolves.toMatchObject({ termination: 'COMPLETED' });
+
+    expect(() => runner.prepare({ ...input, verifiedApproval: null, principal: { ...principal, workspaces: [] } })).toThrow('RUN_WORKSPACE_OUT_OF_SCOPE');
+    expect(() => runner.prepare({ ...input, verifiedApproval: null, spawn: { ...input.spawn, budgets: { ...input.spawn.budgets, maxActions: 4 } } })).toThrow('RUN_BUDGET_ESCALATION');
+    expect(() => runner.prepare({ ...input, verifiedApproval: null, route: undefined as never })).toThrow();
+    expect(() => new AgentRunner({ router: routerWith([provider('primary', async () => response())]), capabilities: [], capabilityCaller: undefined as never })).toThrow('AGENT_RUNNER_HOST_DEPENDENCIES_REQUIRED');
+  });
 });
