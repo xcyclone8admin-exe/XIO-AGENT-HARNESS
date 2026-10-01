@@ -20,6 +20,8 @@ const migrations = [
   migration('core/0002_cloud_sync', sql('../../../modules/core/migrations/0002_cloud_sync.sql')),
   migration('core/0003_cloud_erasure', sql('../../../modules/core/migrations/0003_cloud_erasure.sql')),
   migration('core/0004_cloud_blob_reference_sets', sql('../../../modules/core/migrations/0004_cloud_blob_reference_sets.sql')),
+  migration('core/0005_cloud_ingestion_finalization', sql('../../../modules/core/migrations/0005_cloud_ingestion_finalization.sql')),
+  migration('core/0006_cloud_ingestion_v2_hashes', sql('../../../modules/core/migrations/0006_cloud_ingestion_v2_hashes.sql')),
 ];
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
@@ -275,13 +277,15 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     `);
     expect(rls.rows[0]).toEqual({ total: 8, forced: 8 });
     const order = await db.query<{ version: string }>(
-      `SELECT id AS version FROM schema_migrations WHERE id IN ('core/0001_cloud_auth','core/0002_cloud_sync','core/0003_cloud_erasure','core/0004_cloud_blob_reference_sets') ORDER BY id`,
+      `SELECT id AS version FROM schema_migrations WHERE id IN ('core/0001_cloud_auth','core/0002_cloud_sync','core/0003_cloud_erasure','core/0004_cloud_blob_reference_sets','core/0005_cloud_ingestion_finalization','core/0006_cloud_ingestion_v2_hashes') ORDER BY id`,
     );
     expect(order.rows.map((row) => row.version)).toEqual([
       'core/0001_cloud_auth',
       'core/0002_cloud_sync',
       'core/0003_cloud_erasure',
       'core/0004_cloud_blob_reference_sets',
+      'core/0005_cloud_ingestion_finalization',
+      'core/0006_cloud_ingestion_v2_hashes',
     ]);
   });
 

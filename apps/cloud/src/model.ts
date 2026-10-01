@@ -24,6 +24,8 @@ export interface CandidateClaims {
   readonly deviceThumbprint: string;
   /** Authenticated device (issuer-bound); required for execution leases. */
   readonly deviceId?: string;
+  /** Refresh-token family that issued this access token; used for device-bound logout. */
+  readonly sessionFamilyId?: string;
   /** Agents only: the delegating user; must match the Hub's current record. */
   readonly delegatedBy?: string;
   readonly runId?: string;

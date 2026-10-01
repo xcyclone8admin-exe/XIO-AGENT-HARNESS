@@ -20,7 +20,7 @@ const encoder = new TextEncoder();
 export class AuthFlowError extends Error {
   constructor(
     readonly code: string,
-    readonly status: 400 | 401 | 403 | 503 = 400,
+    readonly status: 400 | 401 | 403 | 409 | 503 = 400,
   ) {
     super(code);
   }
@@ -526,6 +526,7 @@ export async function exchangeAuthorizationCode(
         activeWorkspaceId: claims.activeWorkspaceId,
         autonomy: 0,
         deviceId: code.device_id,
+        sessionFamilyId: familyId,
         deviceThumbprint: claims.deviceThumbprint,
       },
       { privateJwk: config.privateJwk, audience: config.audience, issuer: config.issuer },
@@ -659,6 +660,7 @@ export async function rotateRefreshToken(
           activeWorkspaceId: claims.activeWorkspaceId,
           autonomy: 0,
           deviceId: old.device_id,
+          sessionFamilyId: old.family_id,
           deviceThumbprint: claims.deviceThumbprint,
         },
         { privateJwk: config.privateJwk, audience: config.audience, issuer: config.issuer },
@@ -679,4 +681,33 @@ export async function rotateRefreshToken(
   if (result.kind === 'membership') throw new AuthFlowError('CURRENT_MEMBERSHIP_REQUIRED', 403);
   if (result.kind === 'dpop') throw new AuthFlowError('DPOP_INVALID', 401);
   throw new AuthFlowError('INVALID_REFRESH_TOKEN', 401);
+}
+
+/** Revoke only the refresh family named by the verified device-bound access token. */
+export async function revokeCurrentRefreshFamily(
+  connectionString: string,
+  claims: CandidateClaims,
+): Promise<boolean> {
+  if (claims.kind !== 'user' || !claims.deviceId || !claims.sessionFamilyId)
+    throw new AuthFlowError('SESSION_NOT_FOUND', 409);
+  return withNeonTransaction(connectionString,
+    { tenantId: claims.tenantId, workspaceId: claims.activeWorkspaceId },
+    async (client) => {
+      const authority = await readCurrentAuthority(client, claims);
+      if (!authority) throw new AuthFlowError('CURRENT_MEMBERSHIP_REQUIRED', 403);
+      const found = await client.query<{ id: string }>(
+        `SELECT id FROM cloud_refresh_families
+          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND user_id=$4 AND device_id=$5
+          FOR UPDATE`,
+        [claims.sessionFamilyId, claims.tenantId, claims.activeWorkspaceId, claims.principalId, claims.deviceId],
+      );
+      if (!found.rows.length) return false;
+      await client.query(
+        `UPDATE cloud_refresh_families SET revoked_at=COALESCE(revoked_at,now()),
+           revoke_reason=COALESCE(revoke_reason,'user_logout')
+          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND user_id=$4 AND device_id=$5`,
+        [claims.sessionFamilyId, claims.tenantId, claims.activeWorkspaceId, claims.principalId, claims.deviceId],
+      );
+      return true;
+    });
 }

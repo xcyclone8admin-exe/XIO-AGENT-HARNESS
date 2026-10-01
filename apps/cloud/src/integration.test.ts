@@ -411,6 +411,18 @@ describe('auth on the real Worker', () => {
       await call('POST', '/v1/auth/passkey/begin', null, { ignored: 'x'.repeat(600_000) }),
     ).toMatchObject({ status: 413, json: { code: 'AUTH_BODY_TOO_LARGE' } });
   });
+  it('requires a DPoP-authenticated refresh-family session to logout and fails closed without Neon', async () => {
+    await seed(U1, { role: 'owner' });
+    expect((await call('POST', '/v1/auth/logout', null)).status).toBe(401);
+    const noSession = await mint(U1);
+    expect(await call('POST', '/v1/auth/logout', noSession)).toMatchObject({
+      status: 409, json: { code: 'SESSION_NOT_FOUND' },
+    });
+    const withSession = await mint(U1, { sid: uuid(8850) });
+    expect(await call('POST', '/v1/auth/logout', withSession)).toMatchObject({
+      status: 503, json: { code: 'AUTH_NOT_CONFIGURED' },
+    });
+  });
   it('fails closed without or with bad credentials', async () => {
     expect((await call('GET', '/v1/sync/pull', null)).status).toBe(401);
     expect((await call('GET', '/v1/sync/pull', 'a.b.c')).status).toBe(401);
@@ -704,21 +716,17 @@ describe('blob references on workerd', () => {
   it('fails closed on reference-set registration without durable Neon authority', async () => {
     await seed(U1, { role: 'owner' });
     const token = await mint(U1);
-    const response = await call('POST', '/v1/blob-reference-sets', token, {
-      protocolVersion: 'cloud-erasure-v1',
-      sourceId: uuid(8801),
-      sourceVersion: `sha256:${'a'.repeat(64)}`,
-      objectRefIds: [uuid(8802)],
+    const response = await call('POST', '/v2/brain/ingestions', token, {
+      protocolVersion: 'cloud-ingest-v2', sourceId: uuid(8801), mode: 'text_only',
     });
     expect(response).toMatchObject({
       status: 503,
-      json: { code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' },
+      json: { code: 'INGESTION_STORAGE_UNAVAILABLE' },
     });
-    const empty = await call('POST', '/v1/blob-reference-sets', token, {
-      protocolVersion: 'cloud-erasure-v1', sourceId: uuid(8801),
-      sourceVersion: `sha256:${'a'.repeat(64)}`, objectRefIds: [],
+    const obsolete = await call('POST', '/v1/blob-reference-sets', token, {
+      protocolVersion: 'cloud-erasure-v1', sourceId: uuid(8801), objectRefIds: [],
     });
-    expect(empty).toMatchObject({ status: 409, json: { code: 'SOURCE_REFERENCES_UNAVAILABLE' } });
+    expect(obsolete).toMatchObject({ status: 426, json: { code: 'UPDATE_REQUIRED', protocolVersion: 'cloud-ingest-v2' } });
   });
 
   it('enforces TTL cap, length, membership and kill-switch at redemption', async () => {

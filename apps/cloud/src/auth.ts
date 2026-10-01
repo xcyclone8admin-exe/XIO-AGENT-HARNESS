@@ -38,6 +38,7 @@ interface JwtPayload {
   readonly aud?: unknown;
   readonly iss?: unknown;
   readonly cnf?: unknown;
+  readonly sid?: unknown;
 }
 
 function decodeBase64Url(value: string): Uint8Array<ArrayBuffer> | null {
@@ -87,6 +88,7 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
   const deviceId = optionalUuid(payload.device_id);
   const delegatedBy = optionalUuid(payload.delegated_by);
   const runId = optionalUuid(payload.run_id);
+  const sessionFamilyId = optionalUuid(payload.sid);
   const confirmation = payload.cnf;
   const deviceThumbprint =
     confirmation && typeof confirmation === 'object'
@@ -118,6 +120,7 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
     !/^[A-Za-z0-9_-]{43}$/.test(deviceThumbprint) ||
     delegatedBy === null ||
     runId === null ||
+    sessionFamilyId === null ||
     // An agent token must name its delegating user; a user token must not claim one.
     (payload.kind === 'agent') !== (delegatedBy !== undefined) ||
     !validAudience(payload.aud, config.audience) ||
@@ -137,6 +140,7 @@ function toClaims(payload: JwtPayload, config: JwtVerifierConfig): CandidateClai
     ...(deviceId ? { deviceId } : {}),
     ...(delegatedBy ? { delegatedBy } : {}),
     ...(runId ? { runId } : {}),
+    ...(sessionFamilyId ? { sessionFamilyId } : {}),
   };
 }
 
@@ -150,6 +154,7 @@ export interface AccessTokenInput {
   readonly deviceId: string;
   readonly delegatedBy?: string;
   readonly runId?: string;
+  readonly sessionFamilyId?: string;
   readonly deviceThumbprint: string;
 }
 
@@ -173,6 +178,7 @@ export async function issueAccessToken(
     !workspaceIds.includes(input.activeWorkspaceId) ||
     ![0, 1, 2, 3, 4].includes(input.autonomy) ||
     !agentIdentityValid ||
+    (input.sessionFamilyId !== undefined && !UUID.test(input.sessionFamilyId)) ||
     !/^[A-Za-z0-9_-]{43}$/.test(input.deviceThumbprint) ||
     !config.audience ||
     !config.issuer
@@ -192,6 +198,7 @@ export async function issueAccessToken(
         device_id: input.deviceId,
         ...(input.delegatedBy ? { delegated_by: input.delegatedBy } : {}),
         ...(input.runId ? { run_id: input.runId } : {}),
+        ...(input.sessionFamilyId ? { sid: input.sessionFamilyId } : {}),
         cnf: { jkt: input.deviceThumbprint },
         iat: now,
         exp: now + 15 * 60,

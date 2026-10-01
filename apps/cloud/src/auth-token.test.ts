@@ -20,6 +20,7 @@ describe('device-bound access token issuance', () => {
         activeWorkspaceId: WORKSPACE,
         autonomy: 0,
         deviceId: DEVICE,
+        sessionFamilyId: '55555555-5555-4555-8555-555555555555',
         deviceThumbprint: thumbprint,
       },
       {
@@ -36,6 +37,7 @@ describe('device-bound access token issuance', () => {
     if (result.ok) {
       expect(result.claims.principalId).toBe(USER);
       expect(result.claims.deviceThumbprint).toBe(thumbprint);
+      expect(result.claims.sessionFamilyId).toBe('55555555-5555-4555-8555-555555555555');
     }
     const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString('utf8')) as {
       iat: number;

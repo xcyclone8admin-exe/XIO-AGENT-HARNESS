@@ -21,7 +21,7 @@ export const BeginErasureRequest = z.object({
   attemptId: z.uuid(),
   approvalId: z.uuid(),
   source: ErasureSource,
-  sourceVersion: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  sourceVersion: z.string().regex(/^cloud-ingest-v2:sha256:[0-9a-f]{64}$/),
 }).strict();
 
 export const ClaimLocalPurgeRequest = z.object({
@@ -37,7 +37,7 @@ export const LocalPurgeAckRequest = z.object({
   claimGeneration: z.number().int().positive(),
   localPurgeReceiptId: z.uuid(),
   localPurgeReceiptDigest: z.string().regex(/^[0-9a-f]{64}$/),
-  sourceVersion: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  sourceVersion: z.string().regex(/^cloud-ingest-v2:sha256:[0-9a-f]{64}$/),
 }).strict();
 
 export const AbortErasureRequest = z.object({
@@ -48,14 +48,54 @@ export const AbortErasureRequest = z.object({
   abortReceiptDigest: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
 
-export const BlobReferenceSetRequest = z.object({
-  protocolVersion: z.literal(ERASURE_PROTOCOL_VERSION),
-  sourceId: z.uuid(),
-  sourceVersion: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-  // Empty snapshots require a trusted ingestion completeness attestation which the current
-  // user-authenticated wire does not yet carry. Until that typed adapter exists, fail closed.
-  objectRefIds: z.array(z.uuid()).min(1).max(10000),
+export const CloudIngestionStartRequest = z.object({
+  protocolVersion: z.literal('cloud-ingest-v2'),
+  sourceId: z.uuid().transform((id) => id.toLowerCase()),
+  mode: z.enum(['with_objects', 'text_only']),
 }).strict();
+
+export const CloudIngestionFinalizeRequest = z.object({
+  protocolVersion: z.literal('cloud-ingest-v2'),
+  sourceVersionId: z.uuid().transform((id) => id.toLowerCase()),
+  contentDigest: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+export const CloudIngestionFinalizationReceipt = z.object({
+  protocolVersion: z.literal('cloud-ingest-v2'),
+  ingestionId: z.uuid(),
+  tenantId: z.uuid(),
+  workspaceId: z.uuid(),
+  sourceId: z.uuid(),
+  sourceVersionId: z.uuid(),
+  contentDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  sourceVersion: z.string().regex(/^cloud-ingest-v2:sha256:[0-9a-f]{64}$/),
+  referenceState: z.enum(['verified_empty', 'verified_nonempty']),
+  objectRefIds: z.array(z.uuid()),
+  referenceSetDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  referenceStateVersion: z.number().int().positive(),
+  finalizedAt: z.string().datetime(),
+  status: z.literal('finalized'),
+}).strict().superRefine((receipt, ctx) => {
+  const normalized = receipt.objectRefIds.map((id) => id.toLowerCase());
+  if (normalized.some((id, index) => id !== receipt.objectRefIds[index]) ||
+      new Set(normalized).size !== normalized.length ||
+      normalized.some((id, index) => index > 0 && normalized[index - 1]! > id)) {
+    ctx.addIssue({ code: 'custom', message: 'objectRefIds must be sorted, unique, lowercase UUIDs', path: ['objectRefIds'] });
+  }
+  if ((receipt.referenceState === 'verified_empty') !== (receipt.objectRefIds.length === 0)) {
+    ctx.addIssue({ code: 'custom', message: 'referenceState must match objectRefIds', path: ['referenceState'] });
+  }
+});
+
+export const CloudIngestionStatus = z.discriminatedUnion('status', [
+  z.object({ protocolVersion: z.literal('cloud-ingest-v2'), status: z.literal('pending'), ingestionId: z.uuid(),
+    sourceId: z.uuid(), tenantId: z.uuid(), workspaceId: z.uuid(), mode: z.enum(['with_objects','text_only']),
+    startedAt: z.string().datetime() }).strict(),
+  z.object({ protocolVersion: z.literal('cloud-ingest-v2'), status: z.literal('finalized'),
+    receipt: CloudIngestionFinalizationReceipt }).strict(),
+  z.object({ protocolVersion: z.literal('cloud-ingest-v2'), status: z.literal('invalidated'), ingestionId: z.uuid(),
+    sourceId: z.uuid(), sourceVersionId: z.uuid(), invalidatedAt: z.string().datetime() }).strict(),
+]);
 
 export type ErasureStatus =
   | 'eligible'
@@ -105,25 +145,58 @@ export async function sourceVersionDigest(snapshot: SourceVersionSnapshot): Prom
   return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
-export async function blobReferenceSnapshotDigest(sourceId: string, sourceVersion: string, objectRefIds: readonly string[]): Promise<string> {
-  const ids = [...new Set(objectRefIds)].sort();
+export async function blobReferenceSnapshotDigest(sourceId: string, sourceVersionId: string, objectRefIds: readonly string[]): Promise<string> {
+  const normalized = objectRefIds.map((id) => id.toLowerCase());
+  const ids = [...new Set(normalized)].sort();
   if (ids.length !== objectRefIds.length) throw new Error('DUPLICATE_OBJECT_REFERENCE');
+  if (normalized.some((id, index) => id !== objectRefIds[index])) throw new Error('NON_CANONICAL_OBJECT_REFERENCE');
   const digest = await crypto.subtle.digest(
     'SHA-256',
-    new TextEncoder().encode(canonical({ sourceId, sourceVersion, objectRefIds: ids })),
+    new TextEncoder().encode(canonical({ sourceId, sourceVersionId, objectRefIds: ids })),
   );
-  return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** v2 destructive precondition: synced content/version, normalized refs, and Cloud's state fence. */
+export async function erasureSourceSnapshotVersion(
+  sourceId: string,
+  sourceVersionId: string,
+  tenantId: string,
+  workspaceId: string,
+  contentDigest: string,
+  objectRefIds: readonly string[],
+  referenceStateVersion: number,
+): Promise<string> {
+  if (!Number.isSafeInteger(referenceStateVersion) || referenceStateVersion < 1)
+    throw new Error('INVALID_REFERENCE_STATE_VERSION');
+  if (!/^[0-9a-f]{64}$/.test(contentDigest)) throw new Error('INVALID_CONTENT_DIGEST');
+  const normalized = objectRefIds.map((id) => id.toLowerCase());
+  const ids = [...new Set(normalized)].sort();
+  if (ids.length !== objectRefIds.length) throw new Error('DUPLICATE_OBJECT_REFERENCE');
+  if (normalized.some((id, index) => id !== objectRefIds[index])) throw new Error('NON_CANONICAL_OBJECT_REFERENCE');
+  const body = canonical({
+    protocolVersion: 'cloud-ingest-v2',
+    sourceId,
+    sourceVersionId,
+    tenantId,
+    workspaceId,
+    contentDigest,
+    objectRefIds: ids,
+    referenceStateVersion,
+  });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
+  return `cloud-ingest-v2:sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
 export type SyncedField = { readonly value: unknown };
 export type SyncedFields = Readonly<Record<string, SyncedField>>;
 
 /** Extracts only a live, server-synced BRAIN source/version snapshot. Missing state is an error. */
-export async function sourceVersionFromSyncedRows(
+export function sourceVersionSnapshotFromSyncedRows(
   sourceId: string,
   sourceRow: { readonly fields: SyncedFields; readonly deleted: boolean } | undefined,
   versionRows: readonly { readonly id: string; readonly fields: SyncedFields; readonly deleted: boolean }[],
-): Promise<string> {
+): SourceVersionSnapshot {
   // The source identity is the cloud_sync_rows.row_id; only a present, live row is needed here.
   if (!sourceRow || sourceRow.deleted) throw new Error('SOURCE_STATE_UNAVAILABLE');
   if (versionRows.length === 0 || versionRows.some((row) => row.deleted))
@@ -142,7 +215,15 @@ export async function sourceVersionFromSyncedRows(
     return { id, version: Number(version), contentHash };
   });
 
-  return sourceVersionDigest({ sourceId, versions });
+  return { sourceId, versions };
+}
+
+export async function sourceVersionFromSyncedRows(
+  sourceId: string,
+  sourceRow: { readonly fields: SyncedFields; readonly deleted: boolean } | undefined,
+  versionRows: readonly { readonly id: string; readonly fields: SyncedFields; readonly deleted: boolean }[],
+): Promise<string> {
+  return sourceVersionDigest(sourceVersionSnapshotFromSyncedRows(sourceId, sourceRow, versionRows));
 }
 
 /** True when any incoming row is permanently fenced by a completed Cloud erasure. */
