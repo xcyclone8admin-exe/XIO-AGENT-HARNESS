@@ -134,5 +134,11 @@ export default defineModule({
     { name: 'cloud_sync_idempotency', class: 'lww', authority: 'server' },
     { name: 'cloud_sync_refs', class: 'lww', authority: 'server' },
     { name: 'cloud_sync_outbox', class: 'lww', authority: 'server' },
+    { name: 'cloud_erasure_objects', class: 'lww', authority: 'server' },
+    { name: 'cloud_erasure_refs', class: 'lww', authority: 'server' },
+    { name: 'cloud_erasure_operations', class: 'lww', authority: 'server' },
+    { name: 'cloud_erasure_attempts', class: 'lww', authority: 'server' },
+    { name: 'cloud_erasure_events', class: 'lww', authority: 'server' },
+    { name: 'cloud_erasure_source_fences', class: 'lww', authority: 'server' },
   ],
 });

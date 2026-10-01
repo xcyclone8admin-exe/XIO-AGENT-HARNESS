@@ -8,6 +8,7 @@ import type { NeonQueryClient } from './neon';
 import { lockWorkspaceSequence, NeonSyncStore } from './neon-sync-store';
 import { SyncAuthorityEngine, hashRequest, parseSyncPush } from './sync';
 import { drainSyncOutbox } from './sync-outbox';
+import { hasErasureFence } from './erasures';
 
 const sql = (relative: string) => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
 const migrations = [
@@ -17,6 +18,7 @@ const migrations = [
   migration('platform/0004_receipt_time', sql('../../../packages/db/migrations/0004_receipt_time.sql')),
   migration('core/0001_cloud_auth', sql('../../../modules/core/migrations/0001_cloud_auth.sql')),
   migration('core/0002_cloud_sync', sql('../../../modules/core/migrations/0002_cloud_sync.sql')),
+  migration('core/0003_cloud_erasure', sql('../../../modules/core/migrations/0003_cloud_erasure.sql')),
 ];
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
@@ -25,6 +27,7 @@ const WORKSPACE_A = '33333333-3333-4333-8333-333333333333';
 const WORKSPACE_B = '44444444-4444-4444-8444-444444444444';
 const USER_A = '55555555-5555-4555-8555-555555555555';
 const ROW = '66666666-6666-4666-8666-666666666666';
+const TEST_APPROVAL = '77777777-7777-4777-8777-777777777777';
 let db: PGlite;
 
 function access(tenantId: string, workspaceId: string): AccessContext {
@@ -109,6 +112,33 @@ beforeAll(async () => {
 afterAll(async () => db?.close());
 
 describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
+  it('keeps content-free erasure fences scoped and rejects stale row replay', async () => {
+    const erasedSource = '99999999-9999-4999-8999-999999999999';
+    const operationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const digest = `sha256:${'f'.repeat(64)}`;
+    const requestDigest = 'e'.repeat(64);
+    const rowId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    await scoped(TENANT_A, WORKSPACE_A, async (client) => {
+      await client.query(
+        `INSERT INTO cloud_erasure_operations(tenant_id,workspace_id,id,erasure_id,source_kind,source_id,
+          source_version,request_digest,actor_id,capability_id,approval_id,status,receipt_id)
+         VALUES ($1,$2,$3,$4,'brain_source',$5,$6,$7,$8,'brain.sources.erase',$9,'completed',$10)`,
+        [TENANT_A, WORKSPACE_A, operationId, operationId, erasedSource, digest, requestDigest, USER_A, TEST_APPROVAL, operationId],
+      );
+      await client.query(
+        `INSERT INTO cloud_erasure_source_fences(tenant_id,workspace_id,source_kind,source_id,
+          table_name,row_id,operation_id,erased_source_version)
+         VALUES ($1,$2,'brain_source',$3,'brain_sources',$4,$5,$6)`,
+        [TENANT_A, WORKSPACE_A, erasedSource, rowId, operationId, digest],
+      );
+      expect(await hasErasureFence(client, TENANT_A, WORKSPACE_A, [{ table: 'brain_sources', id: rowId }])).toBe(true);
+      expect(await hasErasureFence(client, TENANT_A, WORKSPACE_A, [{ table: 'brain_sources', id: ROW }])).toBe(false);
+    });
+    await scoped(TENANT_B, WORKSPACE_B, async (client) => {
+      expect(await hasErasureFence(client, TENANT_B, WORKSPACE_B, [{ table: 'brain_sources', id: rowId }])).toBe(false);
+    });
+  });
+
   it('creates only a restricted NOLOGIN runtime placeholder when no credential is provisioned', async () => {
     const isolated = new PGlite();
     try {
@@ -244,9 +274,13 @@ describe('Neon canonical sync store (PGlite role/RLS contract)', () => {
     `);
     expect(rls.rows[0]).toEqual({ total: 8, forced: 8 });
     const order = await db.query<{ version: string }>(
-      `SELECT id AS version FROM schema_migrations WHERE id IN ('core/0001_cloud_auth','core/0002_cloud_sync') ORDER BY id`,
+      `SELECT id AS version FROM schema_migrations WHERE id IN ('core/0001_cloud_auth','core/0002_cloud_sync','core/0003_cloud_erasure') ORDER BY id`,
     );
-    expect(order.rows.map((row) => row.version)).toEqual(['core/0001_cloud_auth', 'core/0002_cloud_sync']);
+    expect(order.rows.map((row) => row.version)).toEqual([
+      'core/0001_cloud_auth',
+      'core/0002_cloud_sync',
+      'core/0003_cloud_erasure',
+    ]);
   });
 
   it('atomically commits row state, per-field sequence, compacted pull log, conflict and cache outbox', async () => {

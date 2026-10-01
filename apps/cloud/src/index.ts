@@ -20,6 +20,7 @@ import { verifyDpopProof } from './dpop';
 import { consumeQueueBatch } from './jobs';
 import { runScheduledMaintenance } from './cron';
 import { drainSyncOutbox } from './sync-outbox';
+import { hasErasureFence } from './erasures';
 import { acceptMembershipRevokedWebhook, parseAndVerifyMembershipWebhook, WebhookError } from './webhooks';
 import {
   AuthFlowError,
@@ -59,6 +60,8 @@ export interface Env {
   readonly CLOUD_TEST_AUTHORITY?: Fetcher;
   /** Miniflare-only sync adapter; production sync always commits to Neon. */
   readonly CLOUD_TEST_SYNC?: Fetcher;
+  /** Miniflare-only durable erasure-fence fixture; never configured in Wrangler. */
+  readonly CLOUD_TEST_ERASURE?: Fetcher;
   readonly BLOB_MAX_BYTES?: string;
   readonly QUOTA_PRINCIPAL_RPM?: string;
   readonly QUOTA_PRINCIPAL_BYTES?: string;
@@ -348,6 +351,20 @@ app.post('/v1/sync/push', async (c) => {
   const access = accessContext(current);
   try {
     if (c.env.CLOUD_TEST_SYNC) {
+      if (c.env.CLOUD_TEST_ERASURE) {
+        const fence = await c.env.CLOUD_TEST_ERASURE.fetch('https://erasure.test/fence/check', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            tenantId: current.claims.tenantId,
+            workspaceId: current.claims.activeWorkspaceId,
+            changes: request.changes.map(({ table, id }) => ({ table, id })),
+          }),
+        });
+        if (!fence.ok) return c.json({ code: 'ERASURE_FENCE_UNAVAILABLE' }, 503);
+        const result = (await fence.json()) as { fenced?: unknown };
+        if (result.fenced === true) return c.json({ code: 'ERASURE_SOURCE_FENCED' }, 409);
+      }
       return c.env.CLOUD_TEST_SYNC.fetch('https://sync.test/push', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -363,15 +380,18 @@ app.post('/v1/sync/push', async (c) => {
         const trusted = await recheckedAccess(client, current);
         if (!trusted) return null;
         await lockWorkspaceSequence(client, current.claims.tenantId, current.claims.activeWorkspaceId);
+        if (await hasErasureFence(client, current.claims.tenantId, current.claims.activeWorkspaceId, request.changes))
+          return { kind: 'fenced' as const };
         const engine = new SyncAuthorityEngine(
           new NeonSyncStore(client, current.claims.tenantId, current.claims.activeWorkspaceId),
         );
-        return engine.push(trusted, request, Date.now(), await hashRequest(request));
+        return { kind: 'accepted' as const, response: await engine.push(trusted, request, Date.now(), await hashRequest(request)) };
       },
     );
     if (!outcome) return c.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
-    await publishSyncCache(c.env, current, outcome.serverSeq);
-    return c.json(outcome);
+    if (outcome.kind === 'fenced') return c.json({ code: 'ERASURE_SOURCE_FENCED' }, 409);
+    await publishSyncCache(c.env, current, outcome.response.serverSeq);
+    return c.json(outcome.response);
   } catch (cause) {
     if (cause instanceof IdempotencyKeyReusedError) return c.json({ code: 'IDEMPOTENCY_KEY_REUSED' }, 409);
     return c.json({ code: 'SYNC_STORAGE_UNAVAILABLE' }, 503);

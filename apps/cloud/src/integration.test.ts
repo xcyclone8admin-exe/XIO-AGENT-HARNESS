@@ -37,6 +37,7 @@ const fixtureMemberships = new Map<string, Record<string, any>>();
 const fixtureDpopReplays = new Set<string>();
 const deviceKeyPairs = new Map<string, CryptoKeyPair>();
 const fixtureSyncStores = new Map<string, MemorySyncStore>();
+const fixtureErasureFences = new Set<string>();
 
 const b64 = (bytes: Uint8Array | string) => Buffer.from(bytes).toString('base64url');
 async function deviceKey(deviceId: string): Promise<CryptoKeyPair> {
@@ -269,6 +270,17 @@ beforeAll(async () => {
       kvNamespaces: ['CACHE'],
       queueProducers: { JOBS: 'jobs' },
       serviceBindings: {
+        CLOUD_TEST_ERASURE: async (request: Request) => {
+          const body = (await request.json()) as {
+            tenantId: string;
+            workspaceId: string;
+            changes: readonly { table: string; id: string }[];
+          };
+          const fenced = body.changes.some((change) =>
+            fixtureErasureFences.has(`${body.tenantId}:${body.workspaceId}:${change.table}:${change.id}`),
+          );
+          return Response.json({ fenced });
+        },
         CLOUD_TEST_SYNC: async (request: Request) => {
           const route = new URL(request.url).pathname;
           const body = (await request.json()) as Record<string, any>;
@@ -456,6 +468,25 @@ describe('auth on the real Worker', () => {
 });
 
 describe('sync on workerd', () => {
+  it('rejects a stale row replay after Cloud erasure fencing', async () => {
+    const id = uuid(891);
+    const token = await mint(U1);
+    const initial = await call('POST', '/v1/sync/push', token, pushBody([task(id)], 'erasure-seed-0001'));
+    expect(initial.status).toBe(200);
+    expect(initial.json?.['accepted']).toBe(1);
+    fixtureErasureFences.add(`${T1}:${W1}:ops_tasks:${id}`);
+
+    const replay = await call(
+      'POST',
+      '/v1/sync/push',
+      token,
+      pushBody([task(id, { fields: { title: { value: 'stale-resurrection', hlc: hlc(Date.now() + 1), baseHlc: null } } })], 'erasure-stale-0001'),
+    );
+    expect(replay.status).toBe(409);
+    expect(replay.json?.['code']).toBe('ERASURE_SOURCE_FENCED');
+    fixtureErasureFences.delete(`${T1}:${W1}:ops_tasks:${id}`);
+  });
+
   it('round-trips push/pull, replays idempotently and rejects payload mismatch', async () => {
     await seed(U1);
     const token = await mint(U1);
