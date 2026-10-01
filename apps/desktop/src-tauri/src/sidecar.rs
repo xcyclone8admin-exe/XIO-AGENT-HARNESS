@@ -711,6 +711,38 @@ mod tests {
             ),
             Err("CLOUD_SYNC_ACK_RECORD_FAILED".into())
         );
+        // Exercise the real native sender against the staged sidecar's native-only Invest route.
+        // A malformed claim is rejected before principal resolution or durable decision writes.
+        let signal_callback =
+            format!("http://127.0.0.1:{port}/internal/native/invest/signals/consume");
+        let forged_signal = client
+            .post(&signal_callback)
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", random_token())
+            .body(r#"{"status":"claimed"}"#)
+            .send()
+            .expect("forged native Invest callback request");
+        assert_eq!(forged_signal.status(), reqwest::StatusCode::FORBIDDEN);
+        let forged_signal_body: serde_json::Value =
+            forged_signal.json().expect("forgery refusal JSON");
+        assert_eq!(forged_signal_body["code"], "NATIVE_SYNC_ONLY");
+
+        let renderer_signal = client
+            .post(&signal_callback)
+            .header("content-type", "application/json")
+            .header("x-xyra-native-sync-token", &ready.native_sync_token)
+            .header("origin", "http://tauri.localhost")
+            .body(r#"{"status":"claimed"}"#)
+            .send()
+            .expect("renderer-origin native Invest callback request");
+        assert_eq!(renderer_signal.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let native_signal = native_sender.process_advisory_signal(
+            port,
+            &ready.native_sync_token,
+            &serde_json::json!({ "status": "claimed" }),
+        );
+        assert_eq!(native_signal, Err("INVEST_SIGNAL_PROCESS_FAILED".into()));
         sup.shutdown();
         let _ = std::fs::remove_dir_all(log_dir);
     }
