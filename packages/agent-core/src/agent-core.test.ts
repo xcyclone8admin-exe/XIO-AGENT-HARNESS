@@ -23,6 +23,8 @@ import {
   decideRunAccess,
   decideDelegation,
   regressionReasons,
+  parseReviewResultDraft,
+  ReviewResultDraft,
   resolveRuntimeConfiguration,
   type AgentProfile as AgentProfileType,
   type AgentRunInput,
@@ -225,6 +227,32 @@ describe('AgentProfile and delegation contracts', () => {
 });
 
 describe('provider routing and bounded loop', () => {
+  it('parses typed review drafts only against immutable bound artifact references', () => {
+    const binding = {
+      councilId: IDS.profile,
+      assignmentId: IDS.run,
+      targetId: IDS.user,
+      repositoryId: 'repo/example',
+      reviewContractId: 'review-v1',
+      reviewContractSha256: 'a'.repeat(64),
+      role: 'security',
+      reviewerPrincipalId: IDS.agent,
+      subjectCommitSha: 'b'.repeat(40),
+      artifacts: [{ id: IDS.profile, sha256: 'c'.repeat(64) }],
+    };
+    const noFindings = { schemaVersion: 1, decision: 'no-findings', summary: 'No issues found in the reviewed material.', findings: [] };
+    expect(parseReviewResultDraft(noFindings, binding)).toEqual(noFindings);
+    const finding = {
+      severity: 'high', title: 'Authorization can be bypassed', affectedRequirements: ['REQ-SEC-1'], confidence: 0.94,
+      reproduction: 'Call the endpoint without the required role.', remediation: 'Enforce the role check before reading state.',
+      revalidation: 'Repeat the request with and without the role.', evidenceArtifactIds: [IDS.profile],
+    };
+    expect(parseReviewResultDraft({ ...noFindings, decision: 'findings', findings: [finding] }, binding).findings).toEqual([finding]);
+    expect(() => parseReviewResultDraft({ ...noFindings, decision: 'findings', findings: [] }, binding)).toThrow();
+    expect(() => parseReviewResultDraft({ ...noFindings, findings: [finding] }, binding)).toThrow();
+    expect(() => parseReviewResultDraft({ ...noFindings, decision: 'findings', findings: [{ ...finding, evidenceArtifactIds: [IDS.agent] }] }, binding)).toThrow('REVIEW_RESULT_ARTIFACT_OUTSIDE_BINDING');
+  });
+
   it('retries a transient failure twice before selecting a compatible fallback', async () => {
     let primaryCalls = 0;
     let fallbackCalls = 0;
