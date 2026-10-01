@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   AbortErasureRequest,
+  blobReferenceSnapshotDigest,
+  BlobReferenceSetRequest,
   BeginErasureRequest,
   ClaimLocalPurgeRequest,
   LocalPurgeAckRequest,
@@ -95,5 +97,18 @@ describe('Cloud/BRAIN erasure wire and source snapshot', () => {
         abortReceiptDigest: 'b'.repeat(64),
       }).success,
     ).toBe(true);
+  });
+
+  it('canonicalizes complete Cloud object snapshots and rejects duplicate object identities', async () => {
+    const one = '66666666-6666-4666-8666-666666666666';
+    const two = '77777777-7777-4777-8777-777777777777';
+    expect(await blobReferenceSnapshotDigest(SOURCE, `sha256:${'a'.repeat(64)}`, [one, two]))
+      .toBe(await blobReferenceSnapshotDigest(SOURCE, `sha256:${'a'.repeat(64)}`, [two, one]));
+    await expect(blobReferenceSnapshotDigest(SOURCE, `sha256:${'a'.repeat(64)}`, [one, one]))
+      .rejects.toThrow('DUPLICATE_OBJECT_REFERENCE');
+    expect(BlobReferenceSetRequest.safeParse({
+      protocolVersion: 'cloud-erasure-v1', sourceId: SOURCE, sourceVersion: `sha256:${'a'.repeat(64)}`,
+      objectRefIds: [one], storageKey: 'tenant/workspace/object', complete: true,
+    }).success).toBe(false);
   });
 });

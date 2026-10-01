@@ -23,6 +23,45 @@ with the request precondition. Missing, deleted, stale, or unavailable source st
 `SOURCE_STATE_UNAVAILABLE` or an invalidated operation; Cloud never treats the posted digest as
 proof of current state. BRAIN also rechecks it inside the local purge transaction.
 
+## Authoritative blob reference registration
+
+`POST /v1/blobs/ref` in `PUT` mode issues a Cloud-owned opaque `objectRefId` when the Neon registry
+is available. The id is scoped to the current authenticated tenant/workspace and maps to a
+server-derived storage key. It is returned as `objectRefId`; the key remains an upload transport
+detail and is never accepted by the registration API. After successful upload, Cloud marks the
+registry object `available`. If registry persistence is not configured, the response explicitly
+reports `references_unknown` and has no usable object id. Existing caller-supplied
+`externalBlobRefs: UUID[]` have no defined mapping and remain unknown; Cloud never interprets them
+as object IDs or R2 keys.
+
+After source and version rows are durably synced, the authenticated source writer registers a full
+snapshot with `POST /v1/blob-reference-sets`:
+
+```json
+{
+  "protocolVersion": "cloud-erasure-v1",
+  "sourceId": "<brain_sources UUID>",
+  "sourceVersion": "sha256:<64 lowercase hex>",
+  "objectRefIds": ["<Cloud-issued objectRefId>"]
+}
+```
+
+Cloud re-derives sourceVersion from Neon, requires current membership and `brain:source:write`,
+and requires the submitted list to exactly equal `cloud_object_ref_ids` in the current synced source
+row; every id must be known, uploaded, and in that tenant/workspace. The field is not in the current
+BRAIN manifest yet, so registration fails closed until BRAIN adds and populates that synced field.
+Legacy `external_blob_refs` is never read as Cloud object identity. Cloud serializes the complete
+replacement with sync and erasure state under the workspace sequence lock. It returns
+`{protocolVersion,snapshotId,sourceId,sourceVersion,referenceStateVersion,snapshotDigest,status}`.
+Snapshot digest is `sha256:` plus lowercase SHA-256 of canonical JSON
+`{sourceId,sourceVersion,objectRefIds}` with UUIDs sorted lexicographically. Exact replay returns
+the same durable snapshot. The list must be non-empty for now: an empty list is rejected as
+`SOURCE_REFERENCES_UNAVAILABLE` because no trusted completeness attestation currently distinguishes
+a truly empty source from unmapped legacy refs. Cloud never infers an empty set from a missing
+registry entry. Any source/version update invalidates the current snapshot until a matching full
+snapshot is registered. Erasure begin requires such a current snapshot; otherwise it returns
+`SOURCE_REFERENCES_UNAVAILABLE`.
+
 ## Wire shapes
 
 All requests and responses carry `protocolVersion: "cloud-erasure-v1"`.

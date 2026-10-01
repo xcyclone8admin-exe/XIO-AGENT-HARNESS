@@ -1,5 +1,12 @@
 import { z } from 'zod';
+import {
+  hashApprovalInput,
+  hashApprovalScope,
+  VerifiedCapabilityApproval,
+  type VerifiedCapabilityApproval as VerifiedCapabilityApprovalType,
+} from '@xyra/contracts';
 import type { NeonQueryClient } from './neon';
+import type { CandidateClaims } from './model';
 
 export const ERASURE_PROTOCOL_VERSION = 'cloud-erasure-v1' as const;
 
@@ -39,6 +46,15 @@ export const AbortErasureRequest = z.object({
   claimId: z.uuid(),
   abortReceiptId: z.uuid(),
   abortReceiptDigest: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
+
+export const BlobReferenceSetRequest = z.object({
+  protocolVersion: z.literal(ERASURE_PROTOCOL_VERSION),
+  sourceId: z.uuid(),
+  sourceVersion: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  // Empty snapshots require a trusted ingestion completeness attestation which the current
+  // user-authenticated wire does not yet carry. Until that typed adapter exists, fail closed.
+  objectRefIds: z.array(z.uuid()).min(1).max(10000),
 }).strict();
 
 export type ErasureStatus =
@@ -89,6 +105,16 @@ export async function sourceVersionDigest(snapshot: SourceVersionSnapshot): Prom
   return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
+export async function blobReferenceSnapshotDigest(sourceId: string, sourceVersion: string, objectRefIds: readonly string[]): Promise<string> {
+  const ids = [...new Set(objectRefIds)].sort();
+  if (ids.length !== objectRefIds.length) throw new Error('DUPLICATE_OBJECT_REFERENCE');
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(canonical({ sourceId, sourceVersion, objectRefIds: ids })),
+  );
+  return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
 export type SyncedField = { readonly value: unknown };
 export type SyncedFields = Readonly<Record<string, SyncedField>>;
 
@@ -135,4 +161,70 @@ export async function hasErasureFence(
     if (result.rows.length > 0) return true;
   }
   return false;
+}
+
+interface ApprovalRow extends Record<string, unknown> {
+  approval_id: string;
+  decision_id: string;
+  tenant_id: string;
+  workspace_id: string;
+  capability_id: string;
+  input_hash: string;
+  requested_by: string;
+  approver_id: string;
+  issued_at: string | Date;
+  expires_at: string | Date;
+}
+
+/**
+ * Reconstructs the same typed proof as CapabilityBus from trusted identity and durable approval
+ * rows. This object is internal to the Worker and is never read from request JSON.
+ */
+export async function verifyCloudCapabilityApproval(
+  client: NeonQueryClient,
+  claims: CandidateClaims,
+  approvalId: string,
+  capabilityId: 'brain.sources.erase' | 'brain.sources.erase.retry',
+  capabilityInput: unknown,
+): Promise<VerifiedCapabilityApprovalType | null> {
+  // BRAIN erasure capabilities are explicitly non-agent-callable.
+  if (claims.kind !== 'user') return null;
+  const inputDigest = await hashApprovalInput(capabilityInput);
+  const result = await client.query<ApprovalRow>(
+    `SELECT r.id AS approval_id,d.id AS decision_id,r.tenant_id,r.workspace_id,
+        r.capability_id,r.input_hash,r.requested_by,d.decided_by AS approver_id,
+        d.created_at AS issued_at,r.expires_at
+       FROM approval_requests r
+       JOIN approval_decisions d
+         ON (d.tenant_id,d.workspace_id,d.request_id)=(r.tenant_id,r.workspace_id,r.id)
+       JOIN memberships m
+         ON (m.tenant_id,m.workspace_id,m.user_id)=(d.tenant_id,d.workspace_id,d.decided_by)
+      WHERE r.id=$1 AND r.tenant_id=$2 AND r.workspace_id=$3
+        AND r.capability_id=$4 AND r.input_hash=$5 AND r.requested_by=$6
+        AND r.expires_at>now() AND d.decision='approved' AND d.valid=true
+        AND d.decided_by<>r.requested_by AND m.active=true AND m.role IN ('owner','admin')
+      LIMIT 1`,
+    [approvalId, claims.tenantId, claims.activeWorkspaceId, capabilityId, inputDigest, claims.principalId],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+
+  const proof = {
+    version: 1 as const,
+    approvalId: row.approval_id,
+    decisionId: row.decision_id,
+    tenantId: row.tenant_id,
+    workspaceId: row.workspace_id,
+    principalId: claims.principalId,
+    requestedBy: row.requested_by,
+    approverId: row.approver_id,
+    capabilityId: row.capability_id,
+    inputDigest: row.input_hash,
+    issuedAt: new Date(row.issued_at).toISOString(),
+    expiresAt: new Date(row.expires_at).toISOString(),
+  };
+  return VerifiedCapabilityApproval.parse({
+    ...proof,
+    scopeHash: await hashApprovalScope(proof),
+  });
 }

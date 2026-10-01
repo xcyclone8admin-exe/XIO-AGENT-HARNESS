@@ -701,6 +701,26 @@ describe('leases and kill switch on workerd', () => {
 
 describe('blob references on workerd', () => {
   const ref = (token: string, body: Record<string, unknown>) => call('POST', '/v1/blobs/ref', token, body);
+  it('fails closed on reference-set registration without durable Neon authority', async () => {
+    await seed(U1, { role: 'owner' });
+    const token = await mint(U1);
+    const response = await call('POST', '/v1/blob-reference-sets', token, {
+      protocolVersion: 'cloud-erasure-v1',
+      sourceId: uuid(8801),
+      sourceVersion: `sha256:${'a'.repeat(64)}`,
+      objectRefIds: [uuid(8802)],
+    });
+    expect(response).toMatchObject({
+      status: 503,
+      json: { code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' },
+    });
+    const empty = await call('POST', '/v1/blob-reference-sets', token, {
+      protocolVersion: 'cloud-erasure-v1', sourceId: uuid(8801),
+      sourceVersion: `sha256:${'a'.repeat(64)}`, objectRefIds: [],
+    });
+    expect(empty).toMatchObject({ status: 409, json: { code: 'SOURCE_REFERENCES_UNAVAILABLE' } });
+  });
+
   it('enforces TTL cap, length, membership and kill-switch at redemption', async () => {
     await setKill(false);
     await seed(U1);

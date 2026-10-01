@@ -15,12 +15,13 @@ import {
 } from './neon';
 import { lockWorkspaceSequence, NeonSyncStore } from './neon-sync-store';
 import { IdempotencyKeyReusedError, SyncAuthorityEngine, hashRequest, parseSyncPush } from './sync';
-import type { AccessContext } from './access';
+import { decideAccess, type AccessContext } from './access';
+import { TABLE_RULES } from './tables';
 import { verifyDpopProof } from './dpop';
 import { consumeQueueBatch } from './jobs';
 import { runScheduledMaintenance } from './cron';
 import { drainSyncOutbox } from './sync-outbox';
-import { hasErasureFence } from './erasures';
+import { blobReferenceSnapshotDigest, BlobReferenceSetRequest, hasErasureFence, sourceVersionFromSyncedRows } from './erasures';
 import { acceptMembershipRevokedWebhook, parseAndVerifyMembershipWebhook, WebhookError } from './webhooks';
 import {
   AuthFlowError,
@@ -382,14 +383,62 @@ app.post('/v1/sync/push', async (c) => {
         await lockWorkspaceSequence(client, current.claims.tenantId, current.claims.activeWorkspaceId);
         if (await hasErasureFence(client, current.claims.tenantId, current.claims.activeWorkspaceId, request.changes))
           return { kind: 'fenced' as const };
+        const brainChanges = request.changes.filter((change) =>
+          change.table === 'brain_sources' || change.table === 'brain_source_versions');
+        const touchedSources = new Set<string>();
+        for (const change of brainChanges) {
+          if (change.table === 'brain_sources') touchedSources.add(change.id);
+          else {
+            const sourceId = change.op === 'delete' ? undefined : change.fields['source_id']?.value;
+            if (typeof sourceId === 'string') touchedSources.add(sourceId);
+            else {
+              const existing = await client.query<{ source_id: string | undefined }>(
+                `SELECT fields->'source_id'->>'value' AS source_id FROM cloud_sync_rows
+                  WHERE tenant_id=$1 AND workspace_id=$2 AND table_name='brain_source_versions' AND row_id=$3`,
+                [current.claims.tenantId, current.claims.activeWorkspaceId, change.id],
+              );
+              if (existing.rows[0]?.source_id) touchedSources.add(existing.rows[0].source_id);
+            }
+          }
+        }
+        const sourceIds = [...touchedSources];
+        if (sourceIds.length) {
+          const claimed = await client.query(
+            `SELECT 1 FROM cloud_erasure_operations WHERE tenant_id=$1 AND workspace_id=$2
+              AND source_kind='brain_source' AND source_id=ANY($3::uuid[])
+              AND status IN ('purge_claimed','local_purge_acknowledged','delete_pending') LIMIT 1`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, sourceIds],
+          );
+          if (claimed.rows.length) return { kind: 'claim-active' as const };
+        }
         const engine = new SyncAuthorityEngine(
           new NeonSyncStore(client, current.claims.tenantId, current.claims.activeWorkspaceId),
         );
-        return { kind: 'accepted' as const, response: await engine.push(trusted, request, Date.now(), await hashRequest(request)) };
+        const response = await engine.push(trusted, request, Date.now(), await hashRequest(request));
+        if (sourceIds.length && response.accepted > 0 && !response.replayed) {
+          await client.query(`UPDATE cloud_erasure_reference_sets SET current=false,invalidated_at=now()
+            WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source'
+              AND source_id=ANY($3::uuid[]) AND current=true`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, sourceIds]);
+          const invalidated = await client.query<{ id: string }>(
+            `UPDATE cloud_erasure_operations SET status='eligibility_invalidated',reservation_id=NULL,
+                reservation_expires_at=NULL,updated_at=now()
+              WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source'
+                AND source_id=ANY($3::uuid[]) AND status='eligible' RETURNING id`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, sourceIds],
+          );
+          for (const operation of invalidated.rows) {
+            await client.query(`INSERT INTO cloud_erasure_events(tenant_id,workspace_id,operation_id,event_id,status,detail)
+              VALUES ($1,$2,$3,$4,'eligibility_invalidated','{"reason":"source_state_changed"}'::jsonb)`,
+              [current.claims.tenantId, current.claims.activeWorkspaceId, operation.id, crypto.randomUUID()]);
+          }
+        }
+        return { kind: 'accepted' as const, response };
       },
     );
     if (!outcome) return c.json({ code: 'CURRENT_MEMBERSHIP_REQUIRED' }, 403);
     if (outcome.kind === 'fenced') return c.json({ code: 'ERASURE_SOURCE_FENCED' }, 409);
+    if (outcome.kind === 'claim-active') return c.json({ code: 'ERASURE_CLAIM_ACTIVE' }, 423);
     await publishSyncCache(c.env, current, outcome.response.serverSeq);
     return c.json(outcome.response);
   } catch (cause) {
@@ -507,6 +556,115 @@ app.get('/v1/sync/conflicts', async (c) => {
   }
 });
 
+app.post('/v1/blob-reference-sets', async (c) => {
+  const incoming = await boundedJson(c.req.raw, 256 * 1024, 'BLOB_REFERENCE_SET_TOO_LARGE');
+  if (incoming instanceof Response) return incoming;
+  const parsed = BlobReferenceSetRequest.safeParse(incoming.value);
+  if (!parsed.success && incoming.value && typeof incoming.value === 'object' &&
+      Array.isArray((incoming.value as Record<string, unknown>)['objectRefIds']) &&
+      ((incoming.value as Record<string, unknown>)['objectRefIds'] as unknown[]).length === 0)
+    return c.json({ code: 'SOURCE_REFERENCES_UNAVAILABLE' }, 409);
+  if (!parsed.success) return c.json({ code: 'INVALID_BLOB_REFERENCE_SET' }, 400);
+  const current = await currentHub(c, incoming.bytes);
+  if ('response' in current) return current.response;
+  if (current.claims.kind !== 'user') return c.json({ code: 'PERMISSION_DENIED' }, 403);
+  const rule = TABLE_RULES.get('brain_sources');
+  if (!rule || !decideAccess(accessContext(current), rule.manifest, 'brain:source:write', 'write').ok)
+    return c.json({ code: 'PERMISSION_DENIED' }, 403);
+  const connectionString = databaseUrl(c.env);
+  if (!connectionString) return c.json({ code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' }, 503);
+  const { sourceId, sourceVersion, objectRefIds } = parsed.data;
+  try {
+    const result = await withNeonTransaction(connectionString,
+      { tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId },
+      async (client) => {
+        const trusted = await recheckedAccess(client, current);
+        if (!trusted || !decideAccess(trusted, rule.manifest, 'brain:source:write', 'write').ok) return { error: 'CURRENT_MEMBERSHIP_REQUIRED' as const };
+        await lockWorkspaceSequence(client, current.claims.tenantId, current.claims.activeWorkspaceId);
+        const activeClaim = await client.query(
+          `SELECT 1 FROM cloud_erasure_operations WHERE tenant_id=$1 AND workspace_id=$2
+            AND source_kind='brain_source' AND source_id=$3
+            AND status IN ('purge_claimed','local_purge_acknowledged','delete_pending') LIMIT 1`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId],
+        );
+        if (activeClaim.rows.length) return { error: 'ERASURE_CLAIM_ACTIVE' as const };
+        const source = await client.query<{ fields: unknown; deleted_hlc: string | null }>(
+          `SELECT fields,deleted_hlc FROM cloud_sync_rows WHERE tenant_id=$1 AND workspace_id=$2
+            AND table_name='brain_sources' AND row_id=$3 FOR UPDATE`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId],
+        );
+        const versions = await client.query<{ row_id: string; fields: unknown; deleted_hlc: string | null }>(
+          `SELECT row_id,fields,deleted_hlc FROM cloud_sync_rows WHERE tenant_id=$1 AND workspace_id=$2
+            AND table_name='brain_source_versions' AND fields->'source_id'->>'value'=$3
+            ORDER BY row_id FOR UPDATE`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId],
+        );
+        let actual: string;
+        try {
+          actual = await sourceVersionFromSyncedRows(sourceId,
+            source.rows[0] ? { fields: typeof source.rows[0].fields === 'string' ? JSON.parse(source.rows[0].fields) : source.rows[0].fields as any, deleted: !!source.rows[0].deleted_hlc } : undefined,
+            versions.rows.map((row) => ({ id: row.row_id, fields: typeof row.fields === 'string' ? JSON.parse(row.fields) : row.fields as any, deleted: !!row.deleted_hlc })),
+          );
+        } catch { return { error: 'SOURCE_STATE_UNAVAILABLE' as const }; }
+        if (actual !== sourceVersion) return { error: 'SOURCE_VERSION_STALE' as const };
+        const sourceFields = source.rows[0]?.fields;
+        const parsedSourceFields = typeof sourceFields === 'string' ? JSON.parse(sourceFields) as Record<string, unknown> : sourceFields as Record<string, unknown> | undefined;
+        const syncedRefs = (parsedSourceFields?.['cloud_object_ref_ids'] as { value?: unknown } | undefined)?.value;
+        if (!Array.isArray(syncedRefs) || syncedRefs.length === 0 ||
+            !syncedRefs.every((value) => typeof value === 'string') ||
+            [...syncedRefs as string[]].sort().join(',') !== [...objectRefIds].sort().join(','))
+          return { error: 'SOURCE_REFERENCES_UNAVAILABLE' as const };
+        const objects = await client.query<{ id: string; storage_state: string }>(
+          `SELECT id,storage_state FROM cloud_erasure_objects WHERE tenant_id=$1 AND workspace_id=$2
+            AND id=ANY($3::uuid[]) ORDER BY id FOR UPDATE`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, objectRefIds],
+        );
+        if (objects.rows.length !== objectRefIds.length || objects.rows.some((o) => o.storage_state !== 'available'))
+          return { error: 'OBJECT_REFERENCE_UNAVAILABLE' as const };
+        const digest = await blobReferenceSnapshotDigest(sourceId, sourceVersion, objectRefIds);
+        const replay = await client.query<{ snapshot_id: string; reference_state_version: string }>(
+          `SELECT snapshot_id,reference_state_version FROM cloud_erasure_reference_sets
+            WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source' AND source_id=$3
+              AND source_version=$4 AND snapshot_digest=$5 AND current=true`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId, sourceVersion, digest],
+        );
+        if (replay.rows[0]) return { snapshotId: replay.rows[0].snapshot_id, digest, version: Number(replay.rows[0].reference_state_version), replay: true };
+        const nextVersion = await client.query<{ version: string | number }>(
+          `SELECT COALESCE(MAX(reference_state_version),0)+1 AS version FROM cloud_erasure_reference_sets
+            WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source' AND source_id=$3`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId],
+        );
+        await client.query(`UPDATE cloud_erasure_reference_sets SET current=false,invalidated_at=now()
+          WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source' AND source_id=$3 AND current=true`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId]);
+        await client.query(`UPDATE cloud_erasure_refs SET active=false,retired_at=now()
+          WHERE tenant_id=$1 AND workspace_id=$2 AND source_kind='brain_source' AND source_id=$3 AND active=true`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, sourceId]);
+        for (const objectId of objectRefIds) {
+          await client.query(`INSERT INTO cloud_erasure_refs(tenant_id,workspace_id,object_id,source_kind,source_id)
+            VALUES ($1,$2,$3,'brain_source',$4) ON CONFLICT (tenant_id,workspace_id,object_id,source_kind,source_id)
+            DO UPDATE SET active=true,retired_at=NULL`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, objectId, sourceId]);
+          await client.query(`UPDATE cloud_erasure_objects SET reference_state_version=reference_state_version+1
+            WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, objectId]);
+        }
+        const snapshotId = crypto.randomUUID();
+        const version = Number(nextVersion.rows[0]?.version ?? 1);
+        await client.query(`INSERT INTO cloud_erasure_reference_sets
+          (tenant_id,workspace_id,snapshot_id,source_kind,source_id,source_version,snapshot_digest,reference_state_version,object_ids)
+          VALUES ($1,$2,$3,'brain_source',$4,$5,$6,$7,$8::uuid[])`,
+          [current.claims.tenantId, current.claims.activeWorkspaceId, snapshotId, sourceId, sourceVersion, digest, version, objectRefIds]);
+        return { snapshotId, digest, version, replay: false };
+      });
+    if ('error' in result) return c.json({ code: result.error }, result.error === 'ERASURE_CLAIM_ACTIVE' ? 423 : result.error === 'CURRENT_MEMBERSHIP_REQUIRED' ? 403 : 409);
+    return c.json({ protocolVersion: 'cloud-erasure-v1', snapshotId: result.snapshotId, sourceId, sourceVersion,
+      referenceStateVersion: result.version, snapshotDigest: result.digest, status: 'registered', replay: result.replay });
+  } catch {
+    return c.json({ code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' }, 503);
+  }
+});
+
 /** Kill-switch fan-out channel. Clients send the bearer JWT in the Authorization header. */
 app.get('/v1/workspace/events', async (c) => {
   if (c.req.header('upgrade') !== 'websocket') return c.json({ code: 'UPGRADE_REQUIRED' }, 426);
@@ -566,12 +724,72 @@ app.post('/v1/blobs/ref', async (c) => {
   if (!allowed.ok) return c.json({ code: 'BLOB_ACCESS_DENIED' }, 403);
   const key = tenantWorkspaceKey(current.claims.tenantId, current.claims.activeWorkspaceId, name);
   if (!key) return c.json({ code: 'INVALID_BLOB_NAME' }, 400);
+  let objectRefId: string | null = null;
+  const registryDatabase = databaseUrl(c.env);
+  if (mode === 'PUT' && registryDatabase) {
+    try {
+      const registration = await withNeonTransaction(registryDatabase,
+        { tenantId: current.claims.tenantId, workspaceId: current.claims.activeWorkspaceId },
+        async (client) => {
+          await lockWorkspaceSequence(client, current.claims.tenantId, current.claims.activeWorkspaceId);
+          const existing = await client.query<{ id: string }>(
+            `SELECT id FROM cloud_erasure_objects WHERE tenant_id=$1 AND workspace_id=$2 AND storage_key=$3 FOR UPDATE`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, key],
+          );
+          if (existing.rows[0]) {
+            const objectId = existing.rows[0].id;
+            const claimed = await client.query(
+              `SELECT 1 FROM cloud_erasure_refs r JOIN cloud_erasure_operations o
+                ON (o.tenant_id,o.workspace_id,o.source_kind,o.source_id)=(r.tenant_id,r.workspace_id,r.source_kind,r.source_id)
+                WHERE r.tenant_id=$1 AND r.workspace_id=$2 AND r.object_id=$3 AND r.active=true
+                  AND o.status IN ('purge_claimed','local_purge_acknowledged','delete_pending') LIMIT 1`,
+              [current.claims.tenantId, current.claims.activeWorkspaceId, objectId],
+            );
+            if (claimed.rows.length) return { error: 'ERASURE_CLAIM_ACTIVE' as const };
+            await client.query(`UPDATE cloud_erasure_objects SET storage_state='unknown',size_bytes=NULL,
+                reference_state_version=reference_state_version+1 WHERE tenant_id=$1 AND workspace_id=$2 AND id=$3`,
+              [current.claims.tenantId, current.claims.activeWorkspaceId, objectId]);
+            const stale = await client.query<{ snapshot_id: string; source_id: string }>(
+              `UPDATE cloud_erasure_reference_sets SET current=false,invalidated_at=now()
+                WHERE tenant_id=$1 AND workspace_id=$2 AND current=true AND object_ids @> ARRAY[$3::uuid]
+                RETURNING snapshot_id,source_id`,
+              [current.claims.tenantId, current.claims.activeWorkspaceId, objectId],
+            );
+            for (const snapshot of stale.rows) {
+              const operations = await client.query<{ id: string }>(
+                `UPDATE cloud_erasure_operations SET status='eligibility_invalidated',reservation_id=NULL,
+                    reservation_expires_at=NULL,updated_at=now()
+                  WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND status='eligible' RETURNING id`,
+                [current.claims.tenantId, current.claims.activeWorkspaceId, snapshot.source_id],
+              );
+              for (const operation of operations.rows) await client.query(
+                `INSERT INTO cloud_erasure_events(tenant_id,workspace_id,operation_id,event_id,status,detail)
+                  VALUES ($1,$2,$3,$4,'eligibility_invalidated','{"reason":"object_reissued"}'::jsonb)`,
+                [current.claims.tenantId, current.claims.activeWorkspaceId, operation.id, crypto.randomUUID()],
+              );
+            }
+            return { id: objectId };
+          }
+          const result = await client.query<{ id: string }>(
+            `INSERT INTO cloud_erasure_objects(tenant_id,workspace_id,id,storage_key,storage_state)
+             VALUES ($1,$2,$3,$4,'unknown') RETURNING id`,
+            [current.claims.tenantId, current.claims.activeWorkspaceId, crypto.randomUUID(), key],
+          );
+          return { id: result.rows[0]?.id ?? null };
+        });
+      if ('error' in registration) return c.json({ code: registration.error }, 423);
+      objectRefId = registration.id;
+    } catch {
+      return c.json({ code: 'BLOB_REFERENCE_REGISTRY_UNAVAILABLE' }, 503);
+    }
+  }
   const expiresAtMs = Date.now() + expiresInSec * 1000;
   const token = await signBlobAccess(
     { key, principalId: current.claims.principalId, mode, expiresAtMs },
     c.env.BLOB_ACCESS_SECRET,
   );
-  return c.json({ key, mode, expiresAtMs, url: `/v1/blobs/access/${token}` });
+  return c.json({ key, mode, expiresAtMs, url: `/v1/blobs/access/${token}`,
+    ...(mode === 'PUT' ? { objectRefId, referenceStatus: objectRefId ? 'registration_required' : 'references_unknown' } : {}) });
 });
 
 app.all('/v1/blobs/access/:token', async (c) => {
@@ -613,6 +831,27 @@ app.all('/v1/blobs/access/:token', async (c) => {
     await c.env.BLOBS.put(access.key, c.req.raw.body ?? new Uint8Array(), {
       httpMetadata: { contentType: c.req.header('content-type') ?? 'application/octet-stream' },
     });
+    const connectionString = databaseUrl(c.env);
+    if (connectionString) {
+      try {
+        const [tenantId, workspaceId] = access.key.split('/');
+        if (!tenantId || !workspaceId) throw new Error('INVALID_SIGNED_BLOB_SCOPE');
+        await withNeonTransaction(connectionString,
+          { tenantId, workspaceId },
+          async (client) => {
+            await lockWorkspaceSequence(client, tenantId, workspaceId);
+            const updated = await client.query(`UPDATE cloud_erasure_objects SET storage_state='available',size_bytes=$4
+              WHERE tenant_id=$1 AND workspace_id=$2 AND storage_key=$3 RETURNING id`,
+              [tenantId, workspaceId, access.key, declaredBytes]);
+            if (updated.rows.length !== 1) throw new Error('BLOB_REGISTRY_ROW_MISSING');
+          },
+        );
+      } catch {
+        // R2 has accepted the body but durable registry state did not commit. Force the uploader
+        // to retry; the object remains unknown and cannot enter a reference snapshot meanwhile.
+        return c.json({ code: 'BLOB_REGISTRY_UPDATE_FAILED' }, 503);
+      }
+    }
     return new Response(null, { status: 204 });
   }
   const object = await c.env.BLOBS.get(access.key);
