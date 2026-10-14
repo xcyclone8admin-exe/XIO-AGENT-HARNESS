@@ -31,6 +31,10 @@ import { registerBrainCapabilities } from './brain';
 import { registerFoundationCapabilities } from './foundation';
 import { createSidecarApp, type CloudInvestSignalClaim } from './http';
 import type { PushRequest as PushRequestValue, PushResponse as PushResponseValue } from '@xyra/contracts';
+import type { TaskModelPort } from '@xyra/contracts';
+import { HOST_TABLES, TaskStore } from './task-store';
+import { TaskService } from './tasks';
+import { OllamaTaskModels } from './task-models';
 
 export interface LocalSidecarOptions {
   readonly dataDir: string;
@@ -43,6 +47,8 @@ export interface LocalSidecarOptions {
   readonly launchToken?: string;
   /** Private native→sidecar callback token; must never be returned through LocalSidecarSession. */
   readonly nativeSyncToken?: string;
+  /** Trusted provider adapter, never created from a renderer request. Defaults to local Ollama discovery. */
+  readonly taskModels?: TaskModelPort;
   /** Optional override for the trusted native acknowledgement adapter, primarily for tests. */
   readonly acceptCloudSyncPush?: (
     scope: { readonly tenantId: string; readonly workspaceId: string },
@@ -72,7 +78,7 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
     await applyPGliteMigrations(db, MIGRATIONS);
     await prepareLocalAppRole(
       db,
-      MANIFESTS.flatMap((manifest) => manifest.tables),
+      [...MANIFESTS.flatMap((manifest) => manifest.tables), ...HOST_TABLES],
     );
     const principal = await bootstrapLocalIdentity(db, options.osSubject, options.displayName);
     const scoped = new LocalScopedStore(db);
@@ -103,6 +109,9 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
         bus.register(manifest, descriptor, (input, call) => handler(input, call)),
     };
     createForgeServer(forgeRepository).register(forgeBus, forgeManifest);
+    const taskStore = new TaskStore(scoped);
+    await taskStore.recover(principal);
+    const tasks = new TaskService(taskStore, bus, options.taskModels ?? new OllamaTaskModels());
     const launchToken = options.launchToken ?? randomBytes(32).toString('base64url');
     const app = createSidecarApp({
       port: options.port,
@@ -110,6 +119,7 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       allowedOrigins: options.allowedOrigins,
       resolvePrincipal: async () => principal,
       bus,
+      tasks,
       ...(options.nativeSyncToken === undefined ? {} : { nativeSyncToken: options.nativeSyncToken }),
       acceptCloudSyncPush: options.acceptCloudSyncPush ?? ((scope, request, response) =>
         brain.acceptCloudReferenceSync(scope, request, response).then(() => undefined)),
@@ -121,6 +131,7 @@ export async function startLocalSidecar(options: LocalSidecarOptions): Promise<L
       port: options.port,
       launchToken,
       close: async () => {
+        await tasks.close();
         await new Promise<void>((resolve, reject) =>
           server.close((error) => (error ? reject(error) : resolve())),
         );

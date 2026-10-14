@@ -15,6 +15,8 @@ import {
   type PushResponse as PushResponseValue,
 } from '@xyra/contracts';
 import { BusFault, type CapabilityBus } from './bus';
+import { registerTaskRoutes } from './task-http';
+import type { TaskService } from './tasks';
 
 const CallBody = z.object({ workspaceId: z.uuid(), input: z.unknown(), approvalId: z.uuid().optional() });
 
@@ -27,6 +29,7 @@ export interface SidecarHttpOptions {
   readonly allowedOrigins: readonly string[];
   readonly resolvePrincipal: () => Promise<Principal>;
   readonly bus: CapabilityBus;
+  readonly tasks?: TaskService;
   /** Records a validated Cloud response. Must be wired to a trusted server-side service only. */
   readonly acceptCloudSyncPush?: (
     scope: { readonly tenantId: string; readonly workspaceId: string },
@@ -313,5 +316,6 @@ export function createSidecarApp(options: SidecarHttpOptions): Hono {
       return c.json({ code: 'INTERNAL', detail: 'Capability failed' }, 500);
     }
   });
+  if (options.tasks) registerTaskRoutes(app, options.tasks, options.resolvePrincipal);
   return app;
 }

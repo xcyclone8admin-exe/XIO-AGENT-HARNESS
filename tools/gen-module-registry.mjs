@@ -60,6 +60,7 @@ export function topoSort(mods) {
 export function collectMigrations(orderedMods) {
   const sources = [{ module: 'platform', dir: path.join(root, 'packages/db/migrations') }];
   for (const m of orderedMods) if (m.hasMigrations) sources.push({ module: m.id, dir: path.join(modulesDir, m.id, 'migrations') });
+  sources.push({ module: 'host', dir: path.join(root, 'apps/sidecar/migrations') });
   const out = [];
   for (const { module, dir } of sources) {
     if (!fs.existsSync(dir)) continue;

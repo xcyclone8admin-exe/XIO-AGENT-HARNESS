@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ModelConnection, TaskSnapshot, type TaskAdmission, type TaskApproval, type TaskControl } from '@xyra/contracts';
 
 export const LocalSession = z.object({
   user: z.object({ id: z.uuid(), displayName: z.string() }),
@@ -35,6 +36,31 @@ export class LocalApiClient implements ModuleApi {
 
   async session(): Promise<LocalSession> {
     return LocalSession.parse(await this.request('/api/v1/session'));
+  }
+  async models(workspaceId: string): Promise<ModelConnection[]> {
+    return z.array(ModelConnection).parse(await this.request(`/api/v1/models?workspaceId=${encodeURIComponent(workspaceId)}`));
+  }
+  async testModel(workspaceId: string, connectionId: string): Promise<ModelConnection> {
+    return ModelConnection.parse(await this.request('/api/v1/models/test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workspaceId, connectionId }) }));
+  }
+  async tasks(workspaceId: string, chatId: string): Promise<TaskSnapshot[]> {
+    return z.array(TaskSnapshot).parse(await this.request(`/api/v1/tasks?workspaceId=${encodeURIComponent(workspaceId)}&chatId=${encodeURIComponent(chatId)}`));
+  }
+  async task(workspaceId: string, taskId: string): Promise<TaskSnapshot> {
+    return TaskSnapshot.parse(await this.request(`/api/v1/tasks/${encodeURIComponent(taskId)}?workspaceId=${encodeURIComponent(workspaceId)}`));
+  }
+  async admitTask(workspaceId: string, input: TaskAdmission): Promise<TaskSnapshot> {
+    return this.taskMutation('admit', workspaceId, input);
+  }
+  async approveTask(workspaceId: string, input: TaskApproval): Promise<TaskSnapshot> {
+    return this.taskMutation('approve', workspaceId, input);
+  }
+  async controlTask(workspaceId: string, input: TaskControl): Promise<TaskSnapshot> {
+    return this.taskMutation('control', workspaceId, input);
+  }
+  private async taskMutation(operation: string, workspaceId: string, input: unknown): Promise<TaskSnapshot> {
+    return TaskSnapshot.parse(await this.request(`/api/v1/tasks/${operation}`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workspaceId, input }) }));
   }
 
   async read<T>(workspaceId: string, capabilityId: string, input: unknown = {}): Promise<T> {

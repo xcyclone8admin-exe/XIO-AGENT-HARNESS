@@ -105,12 +105,51 @@ test.beforeAll(async () => {
     osSubject: `playwright:${Date.now()}`,
     displayName: 'Browser workflow test',
     allowedOrigins: [origin],
+    taskModels: {
+      list: async () => [{ id: 'controlled:e2e', title: 'Controlled browser model', provider: 'controlled', model: 'test', locality: 'local', available: true, detail: 'Controlled test only' }],
+      test: async () => ({ id: 'controlled:e2e', title: 'Controlled browser model', provider: 'controlled', model: 'test', locality: 'local', available: true, detail: 'Controlled test only' }),
+      plan: async () => ({ summary: 'Read projects, then propose a procedure for review.', actions: [
+        { capabilityId: 'ops.projects.list', input: {} },
+        { capabilityId: 'brain.procedures.propose', input: { title: 'Browser-approved candidate', type: 'sop', body: 'This procedure is a candidate pending independent human review.' } },
+      ] }),
+    },
   });
 });
 
 test.afterAll(async () => {
   if (sidecar) await sidecar.close();
   if (staticServer) await new Promise<void>((resolveClose, reject) => staticServer.close((error) => error ? reject(error) : resolveClose()));
+});
+
+test('chat executes a scoped read and waits for exact preview consent before a durable write', async ({ page }, info) => {
+  await page.addInitScript(({ port, token }) => {
+    window.xyraNative = { getSession: async () => ({ port, token }) };
+  }, { port: sidecar.port, token: sidecar.launchToken });
+  await page.goto(`${origin}/`);
+  await page.getByRole('button', { name: 'New conversation' }).first().click();
+  await expect(page.getByLabel('Task model')).toHaveValue('controlled:e2e');
+  await page.getByLabel('Message').fill('Read projects and draft a procedure candidate.');
+  await page.getByRole('button', { name: 'Run task', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Task · waiting approval' })).toBeVisible();
+  await expect(page.getByText('Read projects, then propose a procedure for review.', { exact: false })).toBeVisible();
+  const before = await fetch(`http://127.0.0.1:${sidecar.port}/api/v1/session`, { headers: { authorization: `Bearer ${sidecar.launchToken}` } });
+  const identity = await before.json() as { workspaces: { id: string; kind: string }[] };
+  const workspaceId = identity.workspaces.find((w) => w.kind === 'standard')!.id;
+  const procedures = async () => {
+    const response = await fetch(`http://127.0.0.1:${sidecar.port}/api/v1/call/brain.procedures.list`, { method: 'POST',
+      headers: { authorization: `Bearer ${sidecar.launchToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId, input: { limit: 50 } }) });
+    return (await response.json() as { data: { title: string; status: string }[] }).data;
+  };
+  expect((await procedures()).some((p) => p.title === 'Browser-approved candidate')).toBe(false);
+  await page.getByRole('button', { name: 'Approve exact action' }).click();
+  await expect(page.getByRole('heading', { name: 'Task · completed' })).toBeVisible();
+  expect((await procedures()).find((p) => p.title === 'Browser-approved candidate')?.status).toBe('candidate');
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Task · completed' })).toBeVisible();
+  await page.screenshot({ path: info.outputPath('governed-task.png'), fullPage: true });
+  const scan = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze();
+  expect(scan.violations.filter((violation) => ['critical', 'serious'].includes(violation.impact ?? ''))).toEqual([]);
 });
 
 test('Forge browser journey creates and edits real workspace records and has no critical accessibility violations', async ({ page }) => {

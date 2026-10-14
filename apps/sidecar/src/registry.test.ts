@@ -39,7 +39,7 @@ test('migrations apply in an alternate valid dependency order', async () => {
     const owner = item.id.split('/')[0] ?? '';
     blocks.set(owner, [...(blocks.get(owner) ?? []), item]);
   }
-  const alternate = [...(blocks.get('platform') ?? []), ...order.flatMap((id) => blocks.get(id) ?? [])];
+  const alternate = [...(blocks.get('platform') ?? []), ...order.flatMap((id) => blocks.get(id) ?? []), ...(blocks.get('host') ?? [])];
   expect(alternate).toHaveLength(MIGRATIONS.length);
   const db = await openLocalStore();
   try {
