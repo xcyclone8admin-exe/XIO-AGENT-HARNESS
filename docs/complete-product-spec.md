@@ -8,7 +8,7 @@ The user wants one locally downloadable application that can form, organize and 
 
 Interpret "one shot app" as one installable, integrated product with guided setup and complete connected workflows. It does not promise arbitrary tasks succeed on the first model response or accounts configure themselves. Ordinary users must not need a developer checkout, npm, Rust or a manually launched sidecar. Provider account authorization and available hardware remain explicit setup steps.
 
-The earlier instruction to create a continuation handoff remains in effect. This specification guides the next implementation cycle. Installer/source `cb0632727fc3422ec63a8773d20bfaa974d20c34` stays frozen; documentation supplements do not install missing features.
+The latest instruction, "get all the new requirements done efficiently with multiple agents & workflows", starts active implementation and supersedes the earlier handoff-only feature freeze. The previous installer/source `cb0632727fc3422ec63a8773d20bfaa974d20c34` remains an unchanged historical partial build. Follow the [implementation wave](implementation-wave.md); documentation and task contracts do not themselves install missing features.
 
 ## Useful editable spaces
 

@@ -4,7 +4,7 @@
 
 ## Latest delivery decision
 
-The user requested: "for now just create the handoff with the last things ive said to add in an additions markdown file for the next traycer to pick up". Package the current implemented build with installer, source/history, installation and architecture documentation. This supersedes the earlier instruction to wait for all additions before making the ZIP. Do not spend the handoff phase silently implementing a different product or claim the remaining work is finished.
+The previous continuation handoff was packaged from `cb06327`. The latest user instruction, "get all the new requirements done efficiently with multiple agents & workflows", now supersedes that handoff-only feature freeze and authorizes active implementation of these additions. Preserve the packaged installer/source as a historical partial build and follow [the implementation wave](docs/implementation-wave.md). Do not represent requested functionality as already delivered.
 
 Repository: https://github.com/xcyclone8admin-exe/XIO-AGENT-HARNESS . It is **public**, explicitly authorized by the user. Default branch: `development`. Normal non-force updates are authorized as work finishes. Preserve Git history, third-party notices and the user's ownership. Public visibility does not introduce a new blanket software license.
 
@@ -14,7 +14,7 @@ The handoff's `MANIFEST.json` identifies the exact source commit, installer prov
 
 The user now explicitly requires a single locally downloadable XIO covering business management, legal drafting, agent teams/swarms, simplified Traycer-like orchestration, browser control, and both local/cloud VMs through a few useful editable tabs and functions. Read [the complete product specification and gap ledger](docs/complete-product-spec.md) first: it consolidates acceptance, legal/document workflows, configurable workspaces, guided setup, missing runtime connections and the next implementation sequence.
 
-The four existing spaces remain configurable defaults with contextual business/legal/editor/computer tabs. "One shot" means one integrated installable experience, not a guarantee of perfect one-prompt execution or access to unconfigured accounts. This preserves the continuation-handoff freeze; the current installer is not feature-complete.
+The four existing spaces remain configurable defaults with contextual business/legal/editor/computer tabs. "One shot" means one integrated installable experience, not a guarantee of perfect one-prompt execution or access to unconfigured accounts. Active implementation has resumed; the existing installer is not feature-complete.
 
 ## Latest business and advertising requirement
 
