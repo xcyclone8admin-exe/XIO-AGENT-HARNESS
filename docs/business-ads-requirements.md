@@ -1,15 +1,16 @@
-# Business operations and advertising: continuation requirements
+# Business, advertising, websites, funnels and email: continuation requirements
 
 Recorded October 14, 2026. **Approved product direction; implementation and acceptance remain pending.** This supplements [ADDITIONS.md](../ADDITIONS.md). The frozen continuation installer and source remain `cb0632727fc3422ec63a8773d20bfaa974d20c34`; this document does not change their functionality.
 
 ## User intent and reference products
 
-The user requires XIO to form, organize and manage a business, connect external website/MCP tools, and provide a chat-based agent workspace. They explicitly added Meta Ads and Google Ads and requested quality comparable to MadeThis and Polsia. The intended outcome is one connected business operating loop with previews, user-controlled autonomy, durable progress and real results.
+The user requires XIO to form, organize and manage a business, connect external website/MCP tools, and provide a chat-based agent workspace. They explicitly added Meta Ads and Google Ads and requested quality comparable to MadeThis and Polsia. They also named **Emergent specifically as the benchmark for website, funnel and email building**. The intended outcome is one connected business operating loop with previews, user-controlled autonomy, durable progress and real results.
 
 Public reference material checked on October 14, 2026:
 
 - [MadeThis](https://www.madethis.com/) advertises business creation and ongoing operations spanning websites, payments, advertising, email and support, with task approval and iterative feedback.
 - [Polsia's product explanation](https://polsia.com/blog/hire-app-developer) describes coordinated planning, product development, Meta advertising, outreach and customer operations.
+- [Emergent's landing-page builder](https://emergent.sh/ai-landing-page-builder) describes prompt-built pages with database-backed forms, domain publishing and connected analytics, CRM/email and checkout/booking. Its [email-marketing builder page](https://emergent.sh/ai-website-builder/email-marketing) provides a further reference for connected email-program websites. These descriptions inform the benchmark; the requirements below are XIO's explicit acceptance targets, not a claim that every listed capability was tested in Emergent.
 
 These are vendor-described benchmarks, not independently tested evidence of reliability or performance. XIO has not achieved parity. Do not infer that either reference supports Google Ads from these sources; Google Ads is the user's explicit XIO requirement. Do not copy proprietary code, artwork, pricing, shared-account arrangements or marketing claims.
 
@@ -45,6 +46,21 @@ Provider billing and reporting can lag. Separate XIO's authorization ceiling, pr
 
 Marketing automation must distinguish pending, paused, under review, active, rejected, failed and unknown outcomes. Persist intent and provider identifiers before retries; on timeout reconcile remote state before recreating an object. Exactly-once claims require provider-supported idempotency or proven reconciliation. An API request being accepted does not mean an ad is serving or producing results.
 
+## Website, funnel and email builder
+
+Emergent is the requested quality reference for this building experience. XIO must create editable, deployable outputs and connected workflows from chat, preserving brand assets and business context. Saving generated HTML or showing a mockup alone does not complete a funnel or an email integration.
+
+| ID | Required behavior | Acceptance evidence |
+|---|---|---|
+| XIO-ADD-WEB-001 | Build and revise responsive websites and landing pages through chat and contextual editing, with reusable sections, brand assets, mobile/desktop previews and owned source export. | Prompt -> editable preview -> targeted revision -> approved deployment on a configured domain -> verified published page. Test keyboard navigation, responsive layout, form behavior, version history and rollback; do not silently publish drafts. |
+| XIO-ADD-FUN-001 | Build connected multistep funnels: opt-in/lead magnet, lead qualification, booking or checkout, optional upsell and thank-you/follow-up routes. | A visitor completes a real configured test flow with persisted lead/customer state, validated forms, CRM routing, deduplication and visible failure recovery. Test payments in the provider's test mode; a preview never charges a customer. |
+| XIO-ADD-FUN-002 | Measure and improve funnels with versioned variants, source/UTM tracking, step conversion and drop-off reporting. | Trace an authorized test visitor through the full funnel, preserve attribution and event IDs, deduplicate retries and report denominators/date ranges. Do not declare a statistically supported winner without sufficient evidence or invent missing conversions. |
+| XIO-ADD-EMAIL-001 | Build branded responsive email templates and campaigns from chat: subject, preheader, content blocks, images, links, personalization and plain-text fallback. | Render and edit the exact proposed email, validate links and missing personalization, inspect representative desktop/mobile email-client rendering and export the template. Website CSS rendering alone does not prove email-client compatibility. |
+| XIO-ADD-EMAIL-002 | Create and manage welcome/nurture, onboarding, transactional and re-engagement sequences with segments, triggers, delays and branches through FLOW/Growth/Comms. | A consented test signup triggers the intended sequence once, updates CRM, supports pause/edit/resume and survives restart. Verify suppression after unsubscribe, bounce or complaint and safe behavior when a provider reply is lost. |
+| XIO-ADD-EMAIL-003 | Connect a configured email delivery provider with verified sender/domain, secure credentials, scheduling and delivery-event reporting. | Distinguish draft, approved, scheduled, submitted, delivered, bounced and failed states using provider evidence. Preview content, sender, recipients/segment version, timing and send limits before approval; verify a test delivery to an authorized inbox. Suppression lists remain enforced in automatic mode. |
+
+Keep the workflow connected: **Meta/Google campaign -> landing page -> consented capture -> CRM -> email follow-up -> booking/checkout -> measured outcome**. Preview each public or recipient-facing change; edits to approved content, audience or schedule invalidate the affected approval. Domain setup and email sender authentication need explicit provider evidence, not a green UI toggle. Track opens/clicks with their measurement limitations and do not equate them with confirmed sales.
+
 ## Chat, approval and execution contract
 
 User flow: describe the business goal -> XYRA context/plan -> resolve account and tools -> generate campaign/operational preview -> approve or evaluate scoped auto-approval -> execute -> verify -> report and checkpoint.
@@ -65,6 +81,7 @@ Required XIO journeys:
 3. **Google campaign:** independently complete the same lifecycle with Google's object model; both integrations must pass.
 4. **Daily operation:** a scheduled run reads results, proposes a justified change, respects budget/approval policy, and writes a traceable business update.
 5. **Recovery/control:** revise during work, revoke a connector or approval, hit quota, simulate lost replies and restart. No duplicate campaign, unapproved activation, false success or cross-business access is permitted.
+6. **Website/funnel/email build:** build and revise a responsive page from chat, publish an approved version, complete a consented test signup, confirm its CRM record and one real authorized test email, then verify booking/test checkout and attribution. Change a funnel/email version, invalidate stale approval, pause a sequence and demonstrate rollback/restart recovery. Score editing and preview usability as well as connected execution against the Emergent reference.
 
 Evaluate task completion, correctness, practical usefulness, time, human interventions, cost, recoverability, transparency and accessibility. Publish measurements rather than an unsupported "as good as" claim. Mock/fixture tests prove local behavior only; real read-back is required for provider integration acceptance. Paid delivery evidence requires an explicitly configured bounded account budget; keep missing external prerequisites separate from code work.
 

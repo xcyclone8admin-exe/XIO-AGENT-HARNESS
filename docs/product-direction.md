@@ -4,7 +4,7 @@ This document records the user's requested product behavior, with business and a
 
 ## Business operator and advertising
 
-XIO must form, organize and manage businesses through chat and connected external website/API/MCP tools. Meta Ads and Google Ads are required integrations. MadeThis and Polsia are user-selected benchmarks for connected business creation, marketing and ongoing operations. See [the detailed requirements and acceptance rubric](business-ads-requirements.md). Those workflows are pending; this direction update does not change the frozen installer.
+XIO must form, organize and manage businesses through chat and connected external website/API/MCP tools. Meta Ads and Google Ads are required integrations. MadeThis and Polsia are user-selected benchmarks for connected business creation, marketing and ongoing operations. Emergent is the benchmark for website, funnel and email building: editable responsive pages, multistep lead/booking/checkout funnels, email design and sequences, with connected CRM and outcome measurement. See [the detailed requirements and acceptance rubric](business-ads-requirements.md). Those workflows are pending; this direction update does not change the frozen installer.
 
 ## Identity and workspaces
 
