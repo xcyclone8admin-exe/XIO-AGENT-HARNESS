@@ -24,6 +24,7 @@ export const TaskActionPreview = z.strictObject({
   approvalRequirement: z.enum(['none', 'confirmation', 'independent']),
   /** A description of proposed effects, never a simulated result. */
   effects: z.string(),
+  expiresAt: z.iso.datetime({ offset: true }),
   state: z.enum(['proposed', 'approved', 'running', 'succeeded', 'failed', 'invalidated']),
   result: z.unknown().optional(), error: z.string().optional(), approvalId: z.uuid().optional(),
 });
@@ -54,7 +55,13 @@ export interface TaskTool {
 export interface TaskModelRequest {
   readonly taskId: string; readonly revision: number; readonly tenantId: string;
   readonly workspaceId: string; readonly actorId: string; readonly instruction: string;
-  readonly connectionId: string; readonly capabilities: readonly TaskTool[]; readonly signal: AbortSignal;
+  readonly connectionId: string; readonly capabilities: readonly TaskTool[]; readonly signal: TaskCancellation;
+}
+/** Structural cancellation port so contracts remain usable without DOM or Node globals. */
+export interface TaskCancellation {
+  readonly aborted: boolean;
+  addEventListener(type: 'abort', listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: 'abort', listener: () => void): void;
 }
 /** Server/native implementations only. No secret occurs in the public contract. */
 export interface TaskModelPort {
