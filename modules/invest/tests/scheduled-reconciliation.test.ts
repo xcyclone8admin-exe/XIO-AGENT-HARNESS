@@ -36,7 +36,7 @@ test('manual, missing, malformed, stale, and untrusted dispatch identities are r
   expect(() => validateScheduledCustodyContext(context({ trigger: 'manual', scheduledFor: null }))).toThrow('INVEST_CUSTODY_SCHEDULE_TRIGGER_REQUIRED');
   expect(() => validateScheduledCustodyContext(context({ scheduledFor: null }))).toThrow('INVEST_CUSTODY_SCHEDULED_FOR_MISSING');
   expect(() => validateScheduledCustodyContext(context({ scheduledFor: 'not-a-schedule-time' }))).toThrow('INVEST_CUSTODY_SCHEDULED_FOR_INVALID');
-  expect(() => validateScheduledCustodyContext(context({ scheduledFor: '2026-09-30T10:00:00-07:00' }))).not.toThrow();
+  expect(() => validateScheduledCustodyContext(context({ scheduledFor: '2026-09-30T10:00:00-07:00' }), Date.parse('2026-09-30T18:00:00Z'))).not.toThrow();
   expect(() => validateScheduledCustodyContext(context({ dispatchId: 'renderer-value' }))).toThrow('INVEST_CUSTODY_FLOW_CONTEXT_INVALID');
   expect(() => validateScheduledCustodyContext(context({ scheduledFor: '2020-01-01T00:00:00.000Z' }))).toThrow('INVEST_CUSTODY_SCHEDULE_OUTSIDE_WINDOW');
 });
