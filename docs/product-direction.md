@@ -1,6 +1,10 @@
 # XIO product direction
 
-This document records the user's requested product behavior on October 1, 2026. It is an implementation target, not a claim that all features are delivered.
+This document records the user's requested product behavior, with business and advertising additions on October 14, 2026. It is an implementation target, not a claim that all features are delivered.
+
+## Business operator and advertising
+
+XIO must form, organize and manage businesses through chat and connected external website/API/MCP tools. Meta Ads and Google Ads are required integrations. MadeThis and Polsia are user-selected benchmarks for connected business creation, marketing and ongoing operations. See [the detailed requirements and acceptance rubric](business-ads-requirements.md). Those workflows are pending; this direction update does not change the frozen installer.
 
 ## Identity and workspaces
 

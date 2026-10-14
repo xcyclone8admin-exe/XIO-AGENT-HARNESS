@@ -1,6 +1,6 @@
 # XIO — additions and next Traycer pickup
 
-**Read this first when continuing the handoff.** Updated October 1, 2026. This file preserves the user's recent requests and unfinished implementation. It is not a list of completed features.
+**Read this first when continuing the handoff.** Requirements updated October 14, 2026. This file preserves the user's recent requests and unfinished implementation. It is not a list of completed features.
 
 ## Latest delivery decision
 
@@ -9,6 +9,14 @@ The user requested: "for now just create the handoff with the last things ive sa
 Repository: https://github.com/xcyclone8admin-exe/XIO-AGENT-HARNESS . It is **public**, explicitly authorized by the user. Default branch: `development`. Normal non-force updates are authorized as work finishes. Preserve Git history, third-party notices and the user's ownership. Public visibility does not introduce a new blanket software license.
 
 The handoff's `MANIFEST.json` identifies the exact source commit, installer provenance and verification evidence. Use that file rather than assuming a later GitHub tip is the installed version.
+
+## Latest business and advertising requirement
+
+XIO must form, organize and manage a business through the chat workspace and connect external website/API/MCP tools. **Meta Ads (Facebook/Instagram) and Google Ads are explicit required integrations.** The user named MadeThis and Polsia as quality benchmarks for a connected business operator: setup, product/site creation, marketing, sales, customer support, finances and ongoing operations.
+
+Implement the complete chat-to-action-to-verified-result journey, including campaign previews, account selection, bounded spend, approval/auto-approval policy, campaign management, conversion reporting and optimization. A catalog entry or saved chat is not completion. Read [Business operations, advertising and benchmark acceptance](docs/business-ads-requirements.md) for stable requirement IDs, provider boundaries and acceptance journeys.
+
+This is a documentation supplement to the frozen `cb0632727fc3422ec63a8773d20bfaa974d20c34` installer/source handoff. It does not add executable functionality to that installer. Continue the previous feature priorities below alongside this business objective; no production campaign or advertising spend was performed by this requirements update.
 
 ## Implemented starting point
 
@@ -120,4 +128,4 @@ Do not report a completion percentage from test counts. The factory requirement 
 
 ## Ready-to-send continuation prompt
 
-> Continue XIO Agent Harness from this handoff. Read ADDITIONS.md and MANIFEST.json first. Preserve the implemented 16-module baseline and current chat/theme/workspace UI. Finish the connected universal agent chat, trusted preview/auto-approval and portable XYRA runtime, then voice/model onboarding, native XIO menus/World, browser automation and both local/cloud VM adapters. Assume the user's existing in-scope approvals, retain security and PAPER-only boundaries, and do not fabricate unavailable infrastructure or completed evidence. Keep GitHub and the status docs updated and rebuild matching installer/source deliverables when verified.
+> Continue XIO Agent Harness from this handoff. Read ADDITIONS.md, docs/business-ads-requirements.md and MANIFEST.json first. Preserve the implemented 16-module baseline and current chat/theme/workspace UI. Finish the connected universal agent chat, trusted preview/auto-approval and portable XYRA runtime. Deliver chat-driven business setup and operations with real external API/MCP tools, Meta Ads and Google Ads; evaluate the connected business journeys against the MadeThis/Polsia benchmark rubric. Continue voice/model onboarding, native XIO menus/World, browser automation and both local/cloud VM adapters. Assume the user's existing in-scope approvals, retain security and PAPER-only boundaries, and do not fabricate unavailable infrastructure or completed evidence. Keep GitHub and the status docs updated and rebuild matching installer/source deliverables when verified.

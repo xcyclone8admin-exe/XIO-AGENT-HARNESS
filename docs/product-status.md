@@ -4,11 +4,15 @@ Updated: 2026-10-01. Latest published UI milestone: **`690e18a240078a5c4c266dc5d
 
 ## Latest UI milestone
 
+October 14 continuation update: [business operations and advertising requirements](business-ads-requirements.md) now explicitly cover chat-driven business setup/management, external API/MCP connections, Meta Ads and Google Ads, using MadeThis/Polsia as benchmark references. **These are pending requirements, not implemented integrations.**
+
+The continuation installer was subsequently rebuilt from frozen source `cb0632727fc3422ec63a8773d20bfaa974d20c34`: unsigned NSIS, 33,630,099 bytes, SHA-256 `9c33714f8be20d42e9f44ca4c3f4616e95b630a8835034efe1cfe22952a6b43d`. Build/package smoke passed; fresh installation/upgrade of that binary was not repeated. Later documentation supplements do not alter its source or functionality.
+
 Delivered: Chat/Projects/World/Library navigation; real persisted conversations/messages; red-default and persistent theme selection; scoped project/source/memory/procedure reads; explicit project-create preview/confirmation; a World graph of registered modules/dependencies linked to Library; frontend menu event handlers; packaged [XYRA process documentation](xyra-process.md).
 
 Evidence at feature commit `cd8a0c1`: root verification passed 430 tests in 64 files, typecheck/lint and checks (577 files); static export passed 66 pages; Playwright passed 2/2 workflows. The tested Forge screen had no critical Axe violations. Browser tests use the real sidecar/database with an injected test native-session bridge.
 
-Limits: stored chat messages do not launch a general agent run. Profile preferences do not provision credentials. Project preview confirmation is a UI flow, not the planned universal server-bound preview policy. World is a module graph, not the completed agent/pixel-world experience. Native menu integration, robust voice, browser/VM adapters and rebuilt installer remain open.
+Limits: stored chat messages do not launch a general agent run. Profile preferences do not provision credentials. Project preview confirmation is a UI flow, not the planned universal server-bound preview policy. World is a module graph, not the completed agent/pixel-world experience. Native menu integration, robust voice, browser/VM adapters and full business/advertising journeys remain open.
 
 ## What the earlier installer baseline establishes
 
