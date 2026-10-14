@@ -4,6 +4,8 @@ Updated: 2026-10-01. Latest published UI milestone: **`690e18a240078a5c4c266dc5d
 
 ## Latest UI milestone
 
+The latest user direction is consolidated in [the complete local product specification](complete-product-spec.md): guided single-install setup, configurable productive tabs, legal drafting/review/export, agent-team orchestration and actual browser/local/cloud VM execution. Its completion inventory is a pending target. Current generic chat and native execution remain unconnected/closed; this update adds documentation only.
+
 October 14 continuation update: [business operations and advertising requirements](business-ads-requirements.md) now explicitly cover chat-driven business setup/management, external API/MCP connections, Meta Ads and Google Ads, using MadeThis/Polsia as benchmark references. Emergent is the additional reference for website, funnel and email building, including the connected lead-to-CRM-to-email journey. **These are pending requirements, not implemented integrations.**
 
 The continuation installer was subsequently rebuilt from frozen source `cb0632727fc3422ec63a8773d20bfaa974d20c34`: unsigned NSIS, 33,630,099 bytes, SHA-256 `9c33714f8be20d42e9f44ca4c3f4616e95b630a8835034efe1cfe22952a6b43d`. Build/package smoke passed; fresh installation/upgrade of that binary was not repeated. Later documentation supplements do not alter its source or functionality.

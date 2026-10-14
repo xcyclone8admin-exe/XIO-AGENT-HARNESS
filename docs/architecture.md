@@ -113,6 +113,8 @@ Privileged process execution stays closed until actual isolation, verifier and w
 
 ## Build and evolution
 
+The [complete product target](complete-product-spec.md) adds a connection/acceptance map for universal tasks, editable workspaces, legal documents and computers. Extend this architecture through existing capability/approval boundaries. Backend/provider selections listed there remain open implementation choices; the current source does not gain those components from documentation.
+
 Next.js exports static pages. Packaging stages a checksum-pinned Node executable, bundled sidecar, runtime dependencies and notices into NSIS. Source, installer and checksums must refer to the same handoff candidate.
 
 The shell now consolidates navigation into Chat, Projects, World and Library while retaining module access. Conversations persist through Command capabilities; project and Library views read scoped services. Themes persist on the device. World renders module dependencies. General chat-to-agent execution is still unconnected. Menus, voice, portable XYRA enforcement, durable preview policies and local/cloud computers remain in [product direction](product-direction.md). Update status from implementation and runtime evidence, not this diagram.

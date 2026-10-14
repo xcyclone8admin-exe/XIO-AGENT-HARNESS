@@ -10,6 +10,12 @@ Repository: https://github.com/xcyclone8admin-exe/XIO-AGENT-HARNESS . It is **pu
 
 The handoff's `MANIFEST.json` identifies the exact source commit, installer provenance and verification evidence. Use that file rather than assuming a later GitHub tip is the installed version.
 
+## Complete local product target
+
+The user now explicitly requires a single locally downloadable XIO covering business management, legal drafting, agent teams/swarms, simplified Traycer-like orchestration, browser control, and both local/cloud VMs through a few useful editable tabs and functions. Read [the complete product specification and gap ledger](docs/complete-product-spec.md) first: it consolidates acceptance, legal/document workflows, configurable workspaces, guided setup, missing runtime connections and the next implementation sequence.
+
+The four existing spaces remain configurable defaults with contextual business/legal/editor/computer tabs. "One shot" means one integrated installable experience, not a guarantee of perfect one-prompt execution or access to unconfigured accounts. This preserves the continuation-handoff freeze; the current installer is not feature-complete.
+
 ## Latest business and advertising requirement
 
 XIO must form, organize and manage a business through the chat workspace and connect external website/API/MCP tools. **Meta Ads (Facebook/Instagram) and Google Ads are explicit required integrations.** The user named MadeThis and Polsia as quality benchmarks for a connected business operator: setup, product/site creation, marketing, sales, customer support, finances and ongoing operations.
@@ -129,5 +135,7 @@ Do not report a completion percentage from test counts. The factory requirement 
 7. Build the next installer/source ZIP from one frozen candidate and record hashes/tests. Call it a release only when its applicable gates pass.
 
 ## Ready-to-send continuation prompt
+
+Start with **docs/complete-product-spec.md**. Complete its single-install onboarding, editable spaces, legal draft/redline/export, bounded multi-agent orchestration and local/cloud VM acceptance alongside the following prior requirements. Treat all completion claims as evidence-bound; the handoff installer is a partial starting point.
 
 > Continue XIO Agent Harness from this handoff. Read ADDITIONS.md, docs/business-ads-requirements.md and MANIFEST.json first. Preserve the implemented 16-module baseline and current chat/theme/workspace UI. Finish the connected universal agent chat, trusted preview/auto-approval and portable XYRA runtime. Deliver chat-driven business setup and operations with real external API/MCP tools, Meta Ads and Google Ads; evaluate the connected business journeys against the MadeThis/Polsia benchmark rubric. Use Emergent as the website, funnel and email-building benchmark, including editable previews, published pages, lead capture/CRM, email sequences and conversion evidence. Continue voice/model onboarding, native XIO menus/World, browser automation and both local/cloud VM adapters. Assume the user's existing in-scope approvals, retain security and PAPER-only boundaries, and do not fabricate unavailable infrastructure or completed evidence. Keep GitHub and the status docs updated and rebuild matching installer/source deliverables when verified.

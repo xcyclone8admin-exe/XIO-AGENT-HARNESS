@@ -4,6 +4,8 @@ Recorded October 14, 2026. **Approved product direction; implementation and acce
 
 ## User intent and reference products
 
+This domain specification sits within [the complete local product target](complete-product-spec.md), which also covers guided installation, editable workspaces, legal drafting, orchestration and computers. Existing capability policy determines whether automatic approval is eligible; this document does not override its consequential/high-risk restrictions.
+
 The user requires XIO to form, organize and manage a business, connect external website/MCP tools, and provide a chat-based agent workspace. They explicitly added Meta Ads and Google Ads and requested quality comparable to MadeThis and Polsia. They also named **Emergent specifically as the benchmark for website, funnel and email building**. The intended outcome is one connected business operating loop with previews, user-controlled autonomy, durable progress and real results.
 
 Public reference material checked on October 14, 2026:

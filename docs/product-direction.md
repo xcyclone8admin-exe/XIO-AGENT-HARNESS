@@ -4,13 +4,15 @@ This document records the user's requested product behavior, with business and a
 
 ## Business operator and advertising
 
+The overall target is one locally installed product with guided setup, useful editable tabs/panels, legal drafting, bounded agent teams, Traycer-like orchestration and real browser/local/cloud VM functions. The [complete product specification](complete-product-spec.md) maps missing functions, legal/document acceptance and the continuation sequence. This broadens the implementation target, not the current installer's capabilities.
+
 XIO must form, organize and manage businesses through chat and connected external website/API/MCP tools. Meta Ads and Google Ads are required integrations. MadeThis and Polsia are user-selected benchmarks for connected business creation, marketing and ongoing operations. Emergent is the benchmark for website, funnel and email building: editable responsive pages, multistep lead/booking/checkout funnels, email design and sequences, with connected CRM and outcome measurement. See [the detailed requirements and acceptance rubric](business-ads-requirements.md). Those workflows are pending; this direction update does not change the frozen installer.
 
 ## Identity and workspaces
 
 The application is **XIO**. XYRA names its underlying operating process. Preserve existing internal identifiers, database paths, credential names and upgrade identity unless a deliberate migration is implemented.
 
-Consolidate navigation into Chat, Projects, World and Library, with Settings as a utility destination. This grouping is the current implementation proposal. Keep existing module deep links and contextual tools. Launch should support starting a task, resuming work, or opening/creating a project.
+Consolidate navigation into Chat, Projects, World and Library, with Settings as a utility destination. These are configurable defaults: users can rename/reorder/pin/hide contextual tabs and panels, save layouts and restore them without changing permissions or deleting data. Keep existing module deep links and contextual tools. Launch should support starting a task, resuming work, or opening/creating a project.
 
 ## Universal text and voice chat
 

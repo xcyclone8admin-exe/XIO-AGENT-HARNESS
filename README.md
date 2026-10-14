@@ -24,6 +24,8 @@ Created and directed by Aaron. Developed with AI-assisted engineering tools. XIO
 
 ## The experience being built
 
+The [complete product specification](docs/complete-product-spec.md) defines the requested single-install business/agent workspace: configurable tabs, legal drafting, bounded orchestration, real browser/local/cloud VM workflows and connected marketing tools. It is the next implementation target, not a claim that this installer already supplies every function.
+
 ```text
 ┌────────────────────────────────────────────────────────────────────┐
 │ XIO    File  Edit  View  Window  Help            Theme   Settings   │
