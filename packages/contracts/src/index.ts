@@ -9,3 +9,4 @@ export * from './sync-ack';
 export * from './fields';
 export * from './erasure';
 export * from './module-server';
+export * from './tasks';
