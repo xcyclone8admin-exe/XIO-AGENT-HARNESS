@@ -1,5 +1,13 @@
 # Product status and remaining work
 
+## October 14 connected task checkpoint
+
+Source **`3f6f9cdeb637f8975bd5585200ed0703864049ba`** adds authenticated durable task admission, an exact selected-model port, current scoped/agent-callable tool discovery, a bounded plan/action batch, server-enforced preview consent for ordinary writes, preserved independent approvals, progress/output records, and pause/cancel/revision/recovery paths. The chat UI calls these APIs. Sidecar-owned host migrations and dedicated scoped writer grants keep task mutation outside app-role writes.
+
+Evidence: full `npm run verify` passed **432 tests / 66 files**, all workspace typechecks/lint and structural checks (597 files); static export passed **66 pages**; **3/3 browser journeys** passed. The new browser task screen had zero serious/critical Axe findings. Bundled sidecar build/smoke passed. Integration checks use real PGlite and capability handlers with a controlled model, including stale/concurrent consent, no mutation before approval, durable procedure-candidate creation, replay and restart. The offset-time INVEST fixture was made deterministic; scheduler product code was unchanged.
+
+This remains PARTIAL: Ollama was absent/not running, so actual local inference is unverified. General iterative tool-result continuation, live remote provider/native setup, scoped auto-approval/revocation, trusted Command result-message delivery, teams, computer tools and full process/release acceptance remain. The first batch is not a complete general agent runner. No installer was rebuilt; `cb06327` HANDOFF remains immutable. See [host behavior/limits](task-host.md) and [exact evidence](evidence/host-task-3f6f9cd.md). Older status below describes its stated checkpoints.
+
 Updated: 2026-10-01. Latest published UI milestone: **`690e18a240078a5c4c266dc5d772e9daf93eadbf`**, merging tested feature commit **`cd8a0c1505e7081fadd444af94b8b4959c841e77`** with documentation. Earlier installer baseline: **`148c6a2e150e0ffd5441c76611c48e91449dd84c`**. This is not a release certificate.
 
 ## Latest UI milestone

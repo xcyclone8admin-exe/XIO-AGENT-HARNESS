@@ -10,6 +10,8 @@ Created and directed by Aaron. Developed with AI-assisted engineering tools. XIO
 
 [Get started](docs/getting-started.md) · [Architecture](docs/architecture.md) · [Feature status](docs/product-status.md) · [Next Traycer: additions](ADDITIONS.md) · [Product direction](docs/product-direction.md) · [Development](CONTRIBUTING.md) · [Security](SECURITY.md)
 
+October 14 host checkpoint **`3f6f9cdeb637f8975bd5585200ed0703864049ba`** connects a bounded chat plan to authorized capability reads and exact-preview-confirmed writes, with durable progress and restart/replay checks. It includes local Ollama discovery/test support. The connected tests use a controlled model; no live model was available on the build machine. Continuing agent execution, remote credential onboarding and the wider product remain unfinished. See [the task host and limits](docs/task-host.md) and [checkpoint evidence](docs/evidence/host-task-3f6f9cd.md).
+
 > This repository contains the integrated source, not a finished implementation of every requested feature. UI milestone `cd8a0c1505e7081fadd444af94b8b4959c841e77`, published with documentation at `690e18a240078a5c4c266dc5d772e9daf93eadbf`, adds persistent conversations, themes, four spaces, project previews and a module-graph World. Universal agent execution, durable approval modes and virtual computers remain unfinished. The earlier installer at `148c6a2` does not contain this redesign.
 
 ## What XIO brings together
