@@ -60,7 +60,7 @@ Models, connections, themes, and other preferences belong in Settings. Black/red
 | Desktop, local service, capability bus, scoped database, ledger | Implemented with integrated tests. |
 | Native signal → durable PAPER decision → restart/replay | Tested with a synthetic local claim; not a live enrolled-device journey. |
 | Development Cloud Worker and Neon migrations | Deployed/applied with scoped live checks; full authenticated product journeys still pending. |
-| Windows installer | Earlier unsigned build passed install, launch, same-version reinstall, and uninstall. New UI installer is pending. |
+| Windows installer | Continuation UI installer built from `cb06327`; package smoke passed. Fresh install/upgrade of that binary remains unverified; earlier lifecycle evidence belongs to `148c6a2`. |
 | Conversations, themes, consolidated spaces | Persistent message storage, red-default theme selection, Chat/Projects/World/Library and scoped data views implemented; browser workflows tested. Saving a message does not yet launch an agent. |
 | Project previews and World | Project creation requires explicit preview confirmation in the UI. World shows registered modules/dependencies linked to Library; this is not a running agent-world simulation. |
 | Universal agent chat, voice and model onboarding | Not connected end to end. Browser speech API support and saved profile preferences are partial foundations. |
